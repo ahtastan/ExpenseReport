@@ -1,0 +1,229 @@
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from difflib import SequenceMatcher
+
+from sqlmodel import Session, select
+
+from app.models import MatchDecision, ReceiptDocument, StatementTransaction
+
+
+@dataclass(frozen=True)
+class MatchScore:
+    transaction: StatementTransaction
+    score: float
+    confidence: str
+    reason: str
+
+
+@dataclass
+class MatchRunStats:
+    receipts_considered: int = 0
+    candidates_created: int = 0
+    high_confidence: int = 0
+    medium_confidence: int = 0
+    low_confidence: int = 0
+    auto_approved: int = 0
+    skipped_receipts: int = 0
+
+
+def normalize_text(value: str | None) -> str:
+    text = (value or "").upper()
+    replacements = {
+        "İ": "I",
+        "İ": "I",
+        "Ş": "S",
+        "Ğ": "G",
+        "Ü": "U",
+        "Ö": "O",
+        "Ç": "C",
+        "ı": "I",
+        "ş": "S",
+        "ğ": "G",
+        "ü": "U",
+        "ö": "O",
+        "ç": "C",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    return " ".join(text.split())
+
+
+def merchant_similarity(a: str | None, b: str | None) -> float:
+    left = normalize_text(a)
+    right = normalize_text(b)
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def _date_gap(receipt_date: date | None, transaction_date: date | None) -> int | None:
+    if not receipt_date or not transaction_date:
+        return None
+    return abs((receipt_date - transaction_date).days)
+
+
+def score_receipt_against_transaction(
+    receipt: ReceiptDocument,
+    transaction: StatementTransaction,
+) -> MatchScore | None:
+    if receipt.extracted_local_amount is None or transaction.local_amount is None:
+        return None
+
+    amount_delta = abs(receipt.extracted_local_amount - transaction.local_amount)
+    if amount_delta > 1.0:
+        return None
+
+    score = 0.0
+    reasons: list[str] = []
+    if amount_delta <= 0.01:
+        score += 55
+        reasons.append("exact local amount")
+    elif amount_delta <= 0.15:
+        score += 45
+        reasons.append(f"near local amount delta={amount_delta:.2f}")
+    else:
+        score += 25
+        reasons.append(f"loose local amount delta={amount_delta:.2f}")
+
+    gap = _date_gap(receipt.extracted_date, transaction.transaction_date)
+    if gap is None:
+        reasons.append("missing receipt or statement date")
+    elif gap == 0:
+        score += 30
+        reasons.append("same transaction date")
+    elif gap <= 1:
+        score += 20
+        reasons.append(f"date within {gap} day")
+    elif gap <= 3:
+        score += 10
+        reasons.append(f"date within {gap} days")
+    else:
+        score -= 15
+        reasons.append(f"date gap {gap} days")
+
+    similarity = merchant_similarity(receipt.extracted_supplier, transaction.supplier_raw)
+    if similarity >= 0.75:
+        score += 15
+        reasons.append(f"strong merchant similarity {similarity:.2f}")
+    elif similarity >= 0.45:
+        score += 8
+        reasons.append(f"merchant similarity {similarity:.2f}")
+    elif receipt.extracted_supplier:
+        score -= 5
+        reasons.append(f"weak merchant similarity {similarity:.2f}")
+
+    if amount_delta <= 0.15 and gap == 0:
+        confidence = "high"
+    elif amount_delta <= 0.15 and gap is not None and gap <= 3:
+        confidence = "medium"
+    elif score >= 90:
+        confidence = "high"
+    elif score >= 70:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    reason = "; ".join(reasons)
+    return MatchScore(transaction=transaction, score=score, confidence=confidence, reason=reason)
+
+
+def _existing_decision(
+    session: Session,
+    receipt_id: int,
+    transaction_id: int,
+) -> MatchDecision | None:
+    return session.exec(
+        select(MatchDecision).where(
+            MatchDecision.receipt_document_id == receipt_id,
+            MatchDecision.statement_transaction_id == transaction_id,
+        )
+    ).first()
+
+
+def run_matching(
+    session: Session,
+    statement_import_id: int | None = None,
+    receipt_id: int | None = None,
+    auto_approve_high_confidence: bool = True,
+) -> MatchRunStats:
+    stats = MatchRunStats()
+    receipt_query = select(ReceiptDocument)
+    if receipt_id is not None:
+        receipt_query = receipt_query.where(ReceiptDocument.id == receipt_id)
+    receipts = session.exec(receipt_query).all()
+
+    transaction_query = select(StatementTransaction)
+    if statement_import_id is not None:
+        transaction_query = transaction_query.where(StatementTransaction.statement_import_id == statement_import_id)
+    transactions = session.exec(transaction_query).all()
+
+    scores_by_receipt_id: dict[int, list[MatchScore]] = {}
+    high_receipt_count_by_transaction_id: dict[int, int] = {}
+    for receipt in receipts:
+        if receipt.id is None or receipt.extracted_local_amount is None:
+            continue
+        scores = [
+            score
+            for transaction in transactions
+            if (score := score_receipt_against_transaction(receipt, transaction)) is not None
+        ]
+        scores.sort(key=lambda item: item.score, reverse=True)
+        scores_by_receipt_id[receipt.id] = scores
+        for score in scores:
+            if score.confidence == "high" and score.transaction.id is not None:
+                high_receipt_count_by_transaction_id[score.transaction.id] = (
+                    high_receipt_count_by_transaction_id.get(score.transaction.id, 0) + 1
+                )
+
+    now = datetime.now(timezone.utc)
+    for receipt in receipts:
+        if receipt.id is None:
+            continue
+        if receipt.extracted_local_amount is None:
+            stats.skipped_receipts += 1
+            continue
+        stats.receipts_considered += 1
+        scores = scores_by_receipt_id.get(receipt.id, [])
+        if not scores:
+            stats.skipped_receipts += 1
+            continue
+
+        high_scores = [score for score in scores if score.confidence == "high"]
+        unique_high = len(high_scores) == 1
+        for score in scores[:5]:
+            transaction = score.transaction
+            if transaction.id is None:
+                continue
+            decision = _existing_decision(session, receipt.id, transaction.id)
+            if decision:
+                decision.confidence = score.confidence
+                decision.reason = score.reason
+                decision.match_method = "date_amount_merchant_v1"
+                decision.updated_at = now
+            else:
+                decision = MatchDecision(
+                    receipt_document_id=receipt.id,
+                    statement_transaction_id=transaction.id,
+                    confidence=score.confidence,
+                    match_method="date_amount_merchant_v1",
+                    reason=score.reason,
+                )
+            unique_transaction_high = (
+                transaction.id is not None
+                and high_receipt_count_by_transaction_id.get(transaction.id, 0) == 1
+            )
+            if auto_approve_high_confidence and score.confidence == "high" and unique_high and unique_transaction_high:
+                decision.approved = True
+                decision.rejected = False
+                stats.auto_approved += 1
+            session.add(decision)
+            stats.candidates_created += 1
+            if score.confidence == "high":
+                stats.high_confidence += 1
+            elif score.confidence == "medium":
+                stats.medium_confidence += 1
+            else:
+                stats.low_confidence += 1
+
+    session.commit()
+    return stats

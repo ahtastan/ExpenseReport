@@ -1,0 +1,19 @@
+[project]
+name = "expense-reporting-app"
+version = "0.1.0"
+description = "Statement-first expense reporting application"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pydantic>=2.8",
+  "sqlmodel>=0.0.22",
+  "openpyxl>=3.1",
+  "pillow>=10.0",
+  "python-multipart>=0.0.9"
+]
+
+[tool.uvicorn]
+factory = false
+host = "127.0.0.1"
+port = 8080

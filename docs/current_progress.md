@@ -77,6 +77,8 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - `/review` now includes a `Validate before generate` button that calls `GET /reports/validate/{statement_import_id}` and displays blocking errors/warnings before package generation. Validation now uses the confirmed review snapshot for generation-facing checks, reports an error when review data is not confirmed, and warns when either week page has more than 3 Air Travel Reconciliation rows, because only 3 detail rows can be written to the template.
 - Air Travel Reconciliation was compacted in `/review` so the detail controls fit on one line with smaller boxes. RT rows now reveal an extra `Return date` field, validation blocks confirmed RT airfare rows without that return date or with a return date before the travel date, and generated workbook travel-date cells write a date range such as `12.03.2026 - 15.03.2026` when RT + return date are present.
 - Report validation issues can now include confirmed-review row context (`review_row_id`, supplier, transaction date, and bucket). `/review` renders that context beside validation messages so Air Travel RT errors point to the exact row that needs correction.
+- Review UI redesigned as a full single-file React 18 SPA (IBM Plex Sans, CDN Babel). Adds login screen, sidebar navigation, dashboard with stat cards and category spend bars, review queue with inline dropdowns and expandable detail rows, workflow bar, validation panel, receipt preview modal, import modal, and client-side audit log. HTML parse verified.
+- Category dropdown bug fixed: selecting a parent category (Hotel & Travel / Meals & Entertainment / Air Travel / Other) now updates local React state only via `handleLocalUpdate`, instead of calling the API with `{report_bucket:null}` and losing the selection. The bucket dropdown repopulates with the correct child options; the API is called only when the user picks a specific bucket.
 
 ## Not Implemented Yet
 - Personal expense report categories, including Personal Car mileage reimbursement, are intentionally out of scope for now.
@@ -87,4 +89,11 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Authentication/admin web UI.
 
 ## Recommended Next Step
-**Live browser validation pass** - open `/review`, intentionally create one RT return-date validation error, click `Validate before generate`, and confirm the message identifies the exact row/date/supplier/bucket to fix.
+**Live browser smoke pass** — start the backend, open `/review`, log in as `ahmet/demo`, and verify:
+1. Review queue loads rows from the latest statement import.
+2. Selecting a parent category repopulates the bucket dropdown without clearing the selection.
+3. Selecting a bucket saves immediately via PATCH and persists on page reload.
+4. An Air Travel row shows the compact reconciliation detail when expanded.
+5. A Meals & Entertainment row shows the detail panel when expanded.
+6. Click `Validate before generate` — confirm messages identify the exact row/date/supplier/bucket.
+If all pass, the next feature step should be re-adding bulk-classify (absent from new SPA) or live-testing the RT return-date validation error flow.

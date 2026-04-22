@@ -822,14 +822,16 @@ function ExpandedRow({ row, onSave }) {
 // grid columns: flag | date | supplier | amount | match | B/P | category | bucket | receipt | status | actions
 const GRID = '24px 100px 1fr 105px 52px 88px 132px 114px 52px 90px 64px';
 
-function ReviewRowItem({ row, categoryMap, onToggleFlag, onSave, onPreview, saving }) {
+function ReviewRowItem({ row, categoryMap, onToggleFlag, onSave, onLocalUpdate, onPreview, saving }) {
   const [expanded, setExpanded] = useState(false);
   const fmtAmt = r => r.localAmount!=null
     ? `${r.localAmount.toLocaleString('tr-TR',{minimumFractionDigits:2})} ${r.localCurrency}`
     : (r.usdAmount!=null ? `$${r.usdAmount.toFixed(2)}` : '—');
 
   function handleBP(val)       { onSave(row.id,{bp:val}); }
-  function handleCategory(val) { onSave(row.id,{category:val, bucket:null}); }
+  // Category is a derived/local-only concept — update local state only, no API call.
+  // The bucket dropdown will repopulate; the user then picks a bucket (which IS persisted).
+  function handleCategory(val) { onLocalUpdate(row.id,{category:val, bucket:null}); }
   function handleBucket(val)   { onSave(row.id,{bucket:val}); }
   function handleDate(val)     { onSave(row.id,{date:val}); }
 
@@ -948,7 +950,7 @@ function WorkflowBar({ sessionStatus, onConfirm, onValidate, hasErrors, download
   );
 }
 
-function ReviewQueue({ session, localRows, categoryMap, onSave, onToggleFlag, onConfirmSession, onValidate, onImported, addAudit, sessionStatus, downloadUrl, reportRunId }) {
+function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, onToggleFlag, onConfirmSession, onValidate, onImported, addAudit, sessionStatus, downloadUrl, reportRunId }) {
   const [filter, setFilter] = useState('all');
   const [showImport, setShowImport] = useState(false);
   const [previewRow, setPreviewRow] = useState(null);
@@ -1041,8 +1043,8 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onToggleFlag, on
           ? <div style={{ padding:36, textAlign:'center', color:'var(--text-3)', fontSize:13 }}>No rows match this filter.</div>
           : filtered.map(row=>(
             <ReviewRowItem key={row.id} row={row} categoryMap={categoryMap}
-              onToggleFlag={onToggleFlag} onSave={handleSave} onPreview={r=>setPreviewRow(r)}
-              saving={savingIds.has(row.id)}/>
+              onToggleFlag={onToggleFlag} onSave={handleSave} onLocalUpdate={onLocalUpdate}
+              onPreview={r=>setPreviewRow(r)} saving={savingIds.has(row.id)}/>
           ))
         }
       </div>
@@ -1300,6 +1302,12 @@ function App() {
       Object.keys(localChanges).join(', '));
   }
 
+  // Local-only state update — no API call. Used for derived UI fields like category
+  // that are not persisted on the backend (category is derived from report_bucket).
+  function handleLocalUpdate(rowId, changes) {
+    setLocalRows(prev => prev.map(r => r.id === rowId ? { ...r, ...changes } : r));
+  }
+
   async function handleToggleFlag(rowId) {
     const row = localRows.find(r=>r.id===rowId);
     if (!row) return;
@@ -1380,7 +1388,7 @@ function App() {
           )}
           {screen==='review' && (
             <ReviewQueue session={session} localRows={localRows} categoryMap={CATEGORY_MAP}
-              onSave={handleSave} onToggleFlag={handleToggleFlag}
+              onSave={handleSave} onLocalUpdate={handleLocalUpdate} onToggleFlag={handleToggleFlag}
               onConfirmSession={handleConfirmSession} onValidate={handleValidate}
               onImported={loadData} addAudit={addAudit}
               sessionStatus={sessionStatus} downloadUrl={downloadUrl} reportRunId={reportRunId}/>

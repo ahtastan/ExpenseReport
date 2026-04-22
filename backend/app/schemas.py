@@ -212,6 +212,9 @@ class ReportValidationIssue(BaseModel):
     supplier: str | None = None
     transaction_date: str | None = None
     report_bucket: str | None = None
+    air_travel_date: str | None = None
+    air_travel_return_date: str | None = None
+    air_travel_rt_or_oneway: str | None = None
 
 
 class ReportValidationResult(BaseModel):

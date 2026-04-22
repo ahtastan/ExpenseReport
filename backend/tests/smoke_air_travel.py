@@ -262,6 +262,8 @@ def main() -> None:
         assert missing_issue.supplier == "ROUNDTRIP AIR"
         assert missing_issue.transaction_date == "2026-03-20"
         assert missing_issue.report_bucket == AIRFARE_BUCKET
+        assert missing_issue.air_travel_date == "2026-03-20"
+        assert missing_issue.air_travel_rt_or_oneway == "RT"
         print("validation: OK  RT air travel requires return date")
 
         early_return_imp = StatementImport(source_filename="air_travel_early_return.xlsx", storage_path="(memory)")
@@ -304,6 +306,9 @@ def main() -> None:
         assert early_issue.supplier == "EARLY RETURN AIR"
         assert early_issue.transaction_date == "2026-03-20"
         assert early_issue.report_bucket == AIRFARE_BUCKET
+        assert early_issue.air_travel_date == "2026-03-20"
+        assert early_issue.air_travel_return_date == "2026-03-19"
+        assert early_issue.air_travel_rt_or_oneway == "RT"
         print("validation: OK  RT return date cannot be before travel date")
 
         print("AIR TRAVEL SMOKE TEST PASSED")

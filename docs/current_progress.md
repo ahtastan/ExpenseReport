@@ -74,11 +74,17 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Meals & Entertainment detail entry added to `/review`. Reason and Attendees were removed from the main table and moved into a hidden detail row for meal/entertainment buckets, alongside Place/Type, Location, and EG/MR toggle buttons. Confirmed meal detail fields now feed Week 1B/2B columns C/D/E/F/H/I on the row matching the transaction date and meal type while preserving the existing amount formula in column J. Selected EG/MR flags write `x` into their cells. Smoke (`backend/tests/smoke_meals_entertainment.py`) verifies a Lunch row writes Week 1A `E31=86.25`, Week 1B `C10:F10`, `H10=x`, `I10=x`, and leaves `J10` as a formula.
 - Review-row saves now reject duplicate business Meals & Entertainment rows with the same transaction date and same meal bucket. If a second receipt exists for the same breakfast/lunch/dinner/etc., the user must classify it under another meal type; the error message suggests only other valid meal buckets and never the duplicate bucket itself.
 - When multiple expenses land in the same A-page template total cell, the workbook now writes an Excel addition formula preserving the individual components, e.g. `=86.25+4.85`, instead of collapsing them to a single summed float. The meal smoke now covers two Lunch expenses on the same transaction date.
+- Live browser smoke is now available and passing through `scripts/run_live_review_smoke.ps1`: it launches isolated Chrome via CDP, logs in, bulk-classifies flagged rows, expands Air Travel, verifies the return-date guard, and reaches Report Validation.
 - `/review` now includes a `Validate before generate` button that calls `GET /reports/validate/{statement_import_id}` and displays blocking errors/warnings before package generation. Validation now uses the confirmed review snapshot for generation-facing checks, reports an error when review data is not confirmed, and warns when either week page has more than 3 Air Travel Reconciliation rows, because only 3 detail rows can be written to the template.
 - Air Travel Reconciliation was compacted in `/review` so the detail controls fit on one line with smaller boxes. RT rows now reveal an extra `Return date` field, validation blocks confirmed RT airfare rows without that return date or with a return date before the travel date, and generated workbook travel-date cells write a date range such as `12.03.2026 - 15.03.2026` when RT + return date are present.
+- React SPA Air Travel Reconciliation now preserves/patches `air_travel_return_date`, shows the `Return date` input whenever Round trip is selected, and keeps the detail controls on one horizontal row with overflow as the narrow-screen fallback.
+- React SPA Air Travel Reconciliation now blocks saving a round-trip row when the return date is earlier than the travel date, showing an inline error before the PATCH request.
 - Report validation issues can now include confirmed-review row context (`review_row_id`, supplier, transaction date, and bucket). `/review` renders that context beside validation messages so Air Travel RT errors point to the exact row that needs correction.
+- Air Travel RT validation issues now also include `air_travel_date`, `air_travel_return_date`, and `air_travel_rt_or_oneway`; `/review` renders those values as chips so the bad date pair is visible directly from Report Validation.
 - Review UI redesigned as a full single-file React 18 SPA (IBM Plex Sans, CDN Babel). Adds login screen, sidebar navigation, dashboard with stat cards and category spend bars, review queue with inline dropdowns and expandable detail rows, workflow bar, validation panel, receipt preview modal, import modal, and client-side audit log. HTML parse verified.
 - Category dropdown bug fixed: selecting a parent category (Hotel & Travel / Meals & Entertainment / Air Travel / Other) now updates local React state only via `handleLocalUpdate`, instead of calling the API with `{report_bucket:null}` and losing the selection. The bucket dropdown repopulates with the correct child options; the API is called only when the user picks a specific bucket.
+- Bulk-classify was re-added to the React SPA review queue. The toolbar can apply B/P and/or a category-filtered bucket to flagged rows or all rows through the existing `POST /reviews/report/{review_session_id}/bulk-update` endpoint, then reloads the current statement/session.
+- Validation issue rows now render API-provided row context chips (`Row #`, supplier, transaction date, and bucket), so Air Travel RT date errors point to the exact review row to fix.
 
 ## Not Implemented Yet
 - Personal expense report categories, including Personal Car mileage reimbursement, are intentionally out of scope for now.
@@ -89,6 +95,8 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Authentication/admin web UI.
 
 ## Recommended Next Step
+Live browser smoke now passes in the isolated test path. The next narrow app/data step is to correct live review row `2`: supplier `Istanbul Oht-4 Dogu Sh`, bucket `Airfare/Bus/Ferry/Other`, `RT`, travel date `2026-05-09`, return date `2026-03-30`. Correct that row's return date or classify it as one-way, then reconfirm and re-run validation.
+
 **Live browser smoke pass** — start the backend, open `/review`, log in as `ahmet/demo`, and verify:
 1. Review queue loads rows from the latest statement import.
 2. Selecting a parent category repopulates the bucket dropdown without clearing the selection.
@@ -96,4 +104,6 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 4. An Air Travel row shows the compact reconciliation detail when expanded.
 5. A Meals & Entertainment row shows the detail panel when expanded.
 6. Click `Validate before generate` — confirm messages identify the exact row/date/supplier/bucket.
-If all pass, the next feature step should be re-adding bulk-classify (absent from new SPA) or live-testing the RT return-date validation error flow.
+7. Use the restored bulk-classify toolbar on flagged rows and verify the page reloads with updated rows.
+Current live validation error: review row `2`, supplier `Istanbul Oht-4 Dogu Sh`, bucket `Airfare/Bus/Ferry/Other`, has `RT`, travel date `2026-05-09`, and return date `2026-03-30`. Correct that row's return date or classify it as one-way, then reconfirm and re-run validation.
+If all pass, the next feature step should be deciding whether the bulk toolbar needs a selected-visible-rows scope.

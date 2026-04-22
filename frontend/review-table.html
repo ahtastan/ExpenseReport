@@ -157,6 +157,7 @@ function apiRowToLocal(apiRow) {
     meReason:    c.business_reason || '',
     meParticipants: c.attendees || '',
     atDate:      c.air_travel_date || '',
+    atReturn:    c.air_travel_return_date || '',
     atFrom:      c.air_travel_from || '',
     atTo:        c.air_travel_to || '',
     atAirline:   c.air_travel_airline || '',
@@ -177,6 +178,7 @@ function buildApiFields(changes) {
     meReason:    v => ({ business_reason: v }),
     meParticipants: v => ({ attendees: v }),
     atDate:      v => ({ air_travel_date: v || null }),
+    atReturn:    v => ({ air_travel_return_date: v || null }),
     atFrom:      v => ({ air_travel_from: v || null }),
     atTo:        v => ({ air_travel_to: v || null }),
     atAirline:   v => ({ air_travel_airline: v || null }),
@@ -716,7 +718,7 @@ function ImportModal({ onClose, onImported }) {
 
 function AirTravelExpanded({ row, onSave }) {
   const [f, setF] = useState({
-    atDate: row.atDate||'', atFrom:row.atFrom||'', atTo:row.atTo||'',
+    atDate: row.atDate||'', atReturn:row.atReturn||'', atFrom:row.atFrom||'', atTo:row.atTo||'',
     atAirline:row.atAirline||'', atRt:row.atRt||'one_way',
     atPaidBy:row.atPaidBy||'DC Card',
     atTotalCost:row.atTotalCost!==''?row.atTotalCost:'',
@@ -725,23 +727,32 @@ function AirTravelExpanded({ row, onSave }) {
   });
   const [err, setErr] = useState('');
   const upd = (k,v) => setF(p=>({...p,[k]:v}));
-  function save() { setErr(''); onSave(row.id, f); }
+  const isRoundTrip = String(f.atRt||'').trim().toLowerCase() === 'rt';
+  function save() {
+    setErr('');
+    if (isRoundTrip && f.atDate && f.atReturn && f.atReturn < f.atDate) {
+      setErr('Return date cannot be before travel date.');
+      return;
+    }
+    onSave(row.id, f);
+  }
   const field = (label, content) => (
-    <div style={{ display:'flex', flexDirection:'column', gap:3 }}>
+    <div style={{ display:'flex', flexDirection:'column', gap:3, flex:'0 0 auto' }}>
       <span style={{ fontSize:10, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'0.04em', fontWeight:600 }}>{label}</span>
       {content}
     </div>
   );
   return (
-    <div style={{ background:'var(--surface-2)', borderTop:'1px solid var(--border)', padding:'12px 16px 12px 44px' }}>
+    <div data-testid="air-travel-panel" style={{ background:'var(--surface-2)', borderTop:'1px solid var(--border)', padding:'12px 16px 12px 44px' }}>
       <div style={{ fontSize:11, fontWeight:700, color:'var(--accent)', textTransform:'uppercase', letterSpacing:'0.06em', marginBottom:10 }}>Air Travel Reconciliation</div>
-      <div style={{ display:'flex', flexWrap:'wrap', gap:'10px 16px', alignItems:'flex-end' }}>
-        {field('Travel date',<input type="date" value={f.atDate} onChange={e=>upd('atDate',e.target.value)} style={inp({width:120})}/>)}
-        {field('From',<input value={f.atFrom} onChange={e=>upd('atFrom',e.target.value)} placeholder="IST" style={inp({width:60})}/>)}
-        {field('To',<input value={f.atTo} onChange={e=>upd('atTo',e.target.value)} placeholder="ESB" style={inp({width:60})}/>)}
-        {field('Airline',<input value={f.atAirline} onChange={e=>upd('atAirline',e.target.value)} placeholder="THY" style={inp({width:130})}/>)}
+      <div style={{ display:'flex', flexWrap:'nowrap', gap:10, alignItems:'flex-end', overflowX:'auto', paddingBottom:2 }}>
+        {field('Travel date',<input type="date" value={f.atDate} onChange={e=>upd('atDate',e.target.value)} style={inp({width:118})}/>)}
+        {isRoundTrip && field('Return date',<input type="date" value={f.atReturn} onChange={e=>upd('atReturn',e.target.value)} style={inp({width:118})}/>)}
+        {field('From',<input value={f.atFrom} onChange={e=>upd('atFrom',e.target.value)} placeholder="IST" style={inp({width:58})}/>)}
+        {field('To',<input value={f.atTo} onChange={e=>upd('atTo',e.target.value)} placeholder="ESB" style={inp({width:58})}/>)}
+        {field('Airline',<input value={f.atAirline} onChange={e=>upd('atAirline',e.target.value)} placeholder="THY" style={inp({width:120})}/>)}
         {field('RT / One way',(
-          <select value={f.atRt} onChange={e=>upd('atRt',e.target.value)} style={inp({width:100})}>
+          <select value={String(f.atRt||'one_way').toLowerCase()} onChange={e=>upd('atRt',e.target.value)} style={inp({width:110})}>
             <option value="one_way">One way</option>
             <option value="rt">Round trip</option>
           </select>
@@ -753,7 +764,7 @@ function AirTravelExpanded({ row, onSave }) {
         ))}
         {field('Total ticket cost',<input type="number" value={f.atTotalCost} onChange={e=>upd('atTotalCost',e.target.value)} placeholder="0.00" style={inp({width:110})}/>)}
         {field('Prior ticket value',<input type="number" value={f.atPriorValue} onChange={e=>upd('atPriorValue',e.target.value)} placeholder="—" style={inp({width:110})}/>)}
-        {field('Comments',<input value={f.atComments} onChange={e=>upd('atComments',e.target.value)} placeholder="Optional" style={inp({width:180})}/>)}
+        {field('Comments',<input value={f.atComments} onChange={e=>upd('atComments',e.target.value)} placeholder="Optional" style={inp({width:160})}/>)}
         <button onClick={save} style={{ padding:'4px 14px', borderRadius:5, border:'none', background:'var(--accent)',
           color:'#fff', fontSize:12, fontWeight:600, cursor:'pointer', alignSelf:'flex-end', marginBottom:1 }}>Save</button>
       </div>
@@ -959,6 +970,11 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, o
   const [previewRow, setPreviewRow] = useState(null);
   const [savingIds, setSavingIds] = useState(new Set());
   const [toast, setToast] = useState(null);
+  const [bulkScope, setBulkScope] = useState('attention_required');
+  const [bulkBp, setBulkBp] = useState('');
+  const [bulkCategory, setBulkCategory] = useState('');
+  const [bulkBucket, setBulkBucket] = useState('');
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   function showToast(msg) { setToast(msg); setTimeout(()=>setToast(null),3500); }
 
@@ -990,6 +1006,31 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, o
     }
   }
 
+  async function handleBulkApply() {
+    if (!session?.id) return;
+    const localChanges = {};
+    if (bulkBp) localChanges.bp = bulkBp;
+    if (bulkBucket) localChanges.bucket = bulkBucket;
+    if (Object.keys(localChanges).length === 0) {
+      showToast('Choose B/P or bucket first');
+      return;
+    }
+    setBulkBusy(true);
+    try {
+      const result = await api(`/reviews/report/${session.id}/bulk-update`, {
+        method:'POST',
+        body:JSON.stringify({ fields:buildApiFields(localChanges), scope:bulkScope }),
+      });
+      addAudit('row_edited', 'Bulk classify', `${result.updated_rows} row${result.updated_rows===1?'':'s'}`);
+      if (onImported) await onImported();
+      showToast(`Bulk updated ${result.updated_rows} row${result.updated_rows===1?'':'s'}`);
+    } catch(e) {
+      showToast('Bulk update failed: '+e.message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   const tabStyle = active => ({
     padding:'5px 11px', borderRadius:5, border:'none', cursor:'pointer', fontSize:12, fontWeight:500,
     background:active?'var(--surface)':'transparent', color:active?'var(--text)':'var(--text-3)',
@@ -1000,6 +1041,9 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, o
     background:active?'var(--accent-subtle)':'var(--border)',
     color:active?'var(--accent)':'var(--text-3)' });
   const colH = (label, extra={}) => <div style={{ fontSize:10, fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'0.05em', ...extra }}>{label}</div>;
+  const bulkCategories = Object.keys(categoryMap||{}).filter(k => (categoryMap[k]||[]).length > 0);
+  const bulkBuckets = bulkCategory ? (categoryMap[bulkCategory]||[]) : [];
+  const bulkDisabled = bulkBusy || (!bulkBp && !bulkBucket);
 
   return (
     <div style={{ display:'flex', flexDirection:'column', height:'100%', position:'relative' }}>
@@ -1024,6 +1068,29 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, o
             </button>
           ))}
         </div>
+      </div>
+      {/* Bulk classify */}
+      <div style={{ padding:'8px 14px', borderBottom:'1px solid var(--border)', background:'var(--surface)',
+        display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', flexShrink:0 }}>
+        <span style={{ fontSize:12, fontWeight:600, color:'var(--text-2)', marginRight:2 }}>Bulk classify</span>
+        <Dropdown value={bulkScope} options={['attention_required','all']} onChange={setBulkScope}
+          placeholder="Scope" width={128}/>
+        <span style={{ fontSize:11, color:'var(--text-3)' }}>
+          {bulkScope==='attention_required'?'Flagged rows':'All rows'}
+        </span>
+        <Dropdown value={bulkBp} options={['business','personal']} onChange={setBulkBp}
+          placeholder="B/P" width={96}/>
+        <Dropdown value={bulkCategory} options={bulkCategories} onChange={val=>{ setBulkCategory(val); setBulkBucket(''); }}
+          placeholder="Category" width={154}/>
+        <Dropdown value={bulkBucket} options={bulkBuckets} onChange={setBulkBucket}
+          placeholder={bulkCategory?'Bucket':'Pick category'} width={176} danger={!!bulkCategory&&!bulkBucket}/>
+        <button onClick={handleBulkApply} disabled={bulkDisabled}
+          style={{ padding:'6px 12px', borderRadius:5, border:'none',
+            background:bulkDisabled?'var(--surface-2)':'var(--accent)',
+            color:bulkDisabled?'var(--text-3)':'#fff', fontSize:12, fontWeight:600,
+            cursor:bulkDisabled?'default':'pointer', opacity:bulkBusy?0.7:1 }}>
+          {bulkBusy?'Applying...':`Apply to ${bulkScope==='attention_required'?'flagged':'all'}`}
+        </button>
       </div>
       {/* Column headers */}
       <div style={{ display:'grid', gridTemplateColumns:GRID, padding:'6px 10px',
@@ -1101,19 +1168,38 @@ function ValidationPanel({ statementId, sessionStatus, onGenerate, onNavigateRev
   const warnings = (result?.issues||[]).filter(i=>i.severity==='warning');
   const ready    = result?.ready;
 
-  const IssueRow = ({ issue }) => (
-    <div style={{ display:'flex', gap:12, padding:'10px 16px', alignItems:'flex-start', borderBottom:'1px solid var(--border)' }}>
-      <span style={{ fontSize:11, fontWeight:700, padding:'2px 7px', borderRadius:99, flexShrink:0, marginTop:1,
-        background:issue.severity==='error'?'var(--danger-subtle)':'var(--warning-subtle)',
-        color:issue.severity==='error'?'var(--danger)':'var(--warning)' }}>
-        {issue.severity.toUpperCase()}
-      </span>
-      <div style={{ flex:1 }}>
-        <div style={{ fontSize:13, fontWeight:500 }}>{issue.message}</div>
-        <div style={{ fontSize:11, color:'var(--text-3)', marginTop:2 }}>Code: {issue.code}</div>
+  const IssueRow = ({ issue }) => {
+    const context = [
+      issue.review_row_id ? `Row #${issue.review_row_id}` : null,
+      issue.supplier || null,
+      issue.transaction_date || null,
+      issue.report_bucket || null,
+      issue.air_travel_date ? `Travel ${issue.air_travel_date}` : null,
+      issue.air_travel_return_date ? `Return ${issue.air_travel_return_date}` : null,
+      issue.air_travel_rt_or_oneway || null,
+    ].filter(Boolean);
+    return (
+      <div style={{ display:'flex', gap:12, padding:'10px 16px', alignItems:'flex-start', borderBottom:'1px solid var(--border)' }}>
+        <span style={{ fontSize:11, fontWeight:700, padding:'2px 7px', borderRadius:99, flexShrink:0, marginTop:1,
+          background:issue.severity==='error'?'var(--danger-subtle)':'var(--warning-subtle)',
+          color:issue.severity==='error'?'var(--danger)':'var(--warning)' }}>
+          {issue.severity.toUpperCase()}
+        </span>
+        <div style={{ flex:1, minWidth:0 }}>
+          <div style={{ fontSize:13, fontWeight:500 }}>{issue.message}</div>
+          {context.length>0 && (
+            <div style={{ display:'flex', flexWrap:'wrap', gap:6, marginTop:6 }}>
+              {context.map(item=>(
+                <span key={item} style={{ fontSize:11, color:'var(--text-2)', background:'var(--surface-2)',
+                  border:'1px solid var(--border)', borderRadius:5, padding:'2px 6px' }}>{item}</span>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize:11, color:'var(--text-3)', marginTop:4 }}>Code: {issue.code}</div>
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   return (
     <div style={{ padding:'28px 32px', maxWidth:780, margin:'0 auto' }}>

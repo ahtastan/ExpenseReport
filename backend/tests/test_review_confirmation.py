@@ -256,7 +256,8 @@ def main() -> None:
     status, headers, body = asyncio.run(asgi_get("/review"))
     assert status == 200
     assert "text/html" in headers["content-type"]
-    assert "Expense Review" in body
+    assert "Review Queue" in body
+    assert "ExpenseReport" in body
     assert "/statements/latest" in body
 
     with Session(engine) as session:

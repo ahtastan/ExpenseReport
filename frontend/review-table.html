@@ -835,7 +835,10 @@ function ReviewRowItem({ row, categoryMap, onToggleFlag, onSave, onLocalUpdate, 
   function handleBucket(val)   { onSave(row.id,{bucket:val}); }
   function handleDate(val)     { onSave(row.id,{date:val}); }
 
-  const categories = Object.keys(categoryMap||{});
+  // Only show categories that have at least one selectable bucket. This hides
+  // "Personal Car" (buckets:[]) from the dropdown while keeping the entry in
+  // CATEGORY_GROUPS for a future personal-expense reinstate.
+  const categories = Object.keys(categoryMap||{}).filter(k => (categoryMap[k]||[]).length > 0);
   const buckets = row.category ? (categoryMap[row.category]||[]) : [];
 
   const rowBg = expanded ? 'var(--surface-2)'

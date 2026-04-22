@@ -56,8 +56,9 @@ The backend now has a local-first foundation for the private-server version:
 - local file storage under `backend/data/` by default
 - Telegram webhook skeleton for receipt photos/PDFs
 - coworker/user capture from Telegram sender metadata
-- receipt records and first clarification questions
-- clarification answer flow for business/personal, business reason, and attendees
+- receipt records, deterministic receipt-field extraction, and targeted clarification questions
+- clarification answer flow for date, amount, merchant, business/personal, business reason, and attendees
+- report review session rows with confirmed snapshot gating before package generation
 - Diners Excel statement import into canonical statement transactions
 - list APIs for receipts, statements, transactions, review questions, and reports
 
@@ -77,10 +78,14 @@ GET  /health
 GET  /telegram/status
 POST /telegram/webhook
 POST /receipts/upload
+POST /receipts/{receipt_id}/extract
 POST /imports/legacy-receipts
 GET  /reviews/questions
 GET  /reviews/summary
 POST /reviews/questions/{question_id}/answer
+GET  /reviews/report/{statement_import_id}
+PATCH /reviews/report/rows/{row_id}
+POST /reviews/report/{review_session_id}/confirm
 POST /statements/import-excel
 GET  /statements/{statement_id}/transactions
 POST /matching/run

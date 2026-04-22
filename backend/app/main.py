@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 
 from app.db import create_db_and_tables
 from app.routes import health, imports, matching, receipts, reports, reviews, statements, telegram, transactions
@@ -22,3 +24,8 @@ app.include_router(matching.router, prefix="/matching", tags=["matching"])
 app.include_router(reviews.router, prefix="/reviews", tags=["reviews"])
 app.include_router(telegram.router, prefix="/telegram", tags=["telegram"])
 app.include_router(reports.router, prefix="/reports", tags=["reports"])
+
+
+@app.get("/review", include_in_schema=False)
+def review_table():
+    return FileResponse(Path(__file__).resolve().parents[2] / "frontend" / "review-table.html")

@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 
+from sqlalchemy import Column, Text
 from sqlmodel import Field, SQLModel
 
 
@@ -108,6 +109,35 @@ class PolicyDecision(SQLModel, table=True):
     include_in_report: bool = Field(default=True, index=True)
     justification: str | None = None
     decided_by_user_id: int | None = Field(default=None, foreign_key="appuser.id")
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ReviewSession(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    statement_import_id: int = Field(foreign_key="statementimport.id", index=True)
+    status: str = Field(default="draft", index=True)
+    snapshot_json: str | None = Field(default=None, sa_column=Column(Text))
+    snapshot_hash: str | None = Field(default=None, index=True)
+    confirmed_by_user_id: int | None = Field(default=None, foreign_key="appuser.id")
+    confirmed_by_label: str | None = None
+    confirmed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ReviewRow(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    review_session_id: int = Field(foreign_key="reviewsession.id", index=True)
+    statement_transaction_id: int = Field(foreign_key="statementtransaction.id", index=True)
+    receipt_document_id: int | None = Field(default=None, foreign_key="receiptdocument.id", index=True)
+    match_decision_id: int | None = Field(default=None, foreign_key="matchdecision.id", index=True)
+    status: str = Field(default="suggested", index=True)
+    attention_required: bool = Field(default=False, index=True)
+    attention_note: str | None = None
+    source_json: str = Field(default="{}", sa_column=Column(Text))
+    suggested_json: str = Field(default="{}", sa_column=Column(Text))
+    confirmed_json: str = Field(default="{}", sa_column=Column(Text))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

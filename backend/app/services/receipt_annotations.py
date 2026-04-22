@@ -3,7 +3,7 @@ from datetime import date
 from pathlib import Path
 from textwrap import shorten
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, JpegImagePlugin  # noqa: F401
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -21,7 +21,7 @@ CELL_HEIGHT = (A4_HEIGHT - 2 * MARGIN_Y - GAP_Y * (ROWS - 1)) // ROWS
 
 @dataclass(frozen=True)
 class ReceiptAnnotationLine:
-    receipt_id: int
+    receipt_id: int | None
     transaction_id: int
     receipt_path: str | None
     receipt_file_name: str
@@ -62,7 +62,8 @@ def _draw_label(img: Image.Image, line: ReceiptAnnotationLine) -> Image.Image:
     amount = f"{line.currency} {line.amount:,.2f}".strip()
     label = f"{amount} | {line.business_or_personal or 'REVIEW'}"
     sub = shorten(f"{line.transaction_date.isoformat()} | {line.supplier}", width=88, placeholder="...")
-    meta = shorten(f"{line.report_bucket or 'Unbucketed'} | R{line.receipt_id} TX{line.transaction_id}", width=88, placeholder="...")
+    receipt_label = line.receipt_id if line.receipt_id is not None else "missing"
+    meta = shorten(f"{line.report_bucket or 'Unbucketed'} | R{receipt_label} TX{line.transaction_id}", width=88, placeholder="...")
 
     label_box = draw.textbbox((0, 0), label, font=FONT_BOLD)
     sub_box = draw.textbbox((0, 0), sub, font=FONT_SMALL)
@@ -93,7 +94,7 @@ def _placeholder_tile(line: ReceiptAnnotationLine, reason: str) -> Image.Image:
         f"Amount: {line.currency} {line.amount:,.2f}",
         f"Type: {line.business_or_personal or 'Review'}",
         f"Bucket: {line.report_bucket or 'Unbucketed'}",
-        f"Receipt ID: {line.receipt_id}",
+        f"Receipt ID: {line.receipt_id if line.receipt_id is not None else 'missing'}",
         f"Transaction ID: {line.transaction_id}",
     ]
     y = 245
@@ -123,7 +124,7 @@ def _receipt_image(line: ReceiptAnnotationLine) -> Image.Image:
 
 
 def create_annotated_receipts_pdf(lines: list[ReceiptAnnotationLine], output_path: Path) -> int:
-    ordered = sorted(lines, key=lambda line: (line.transaction_date, line.supplier.lower(), line.amount, line.receipt_id))
+    ordered = sorted(lines, key=lambda line: (line.transaction_date, line.supplier.lower(), line.amount, line.receipt_id or 0))
     if not ordered:
         raise ValueError("No receipt lines are available for annotation")
 

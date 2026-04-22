@@ -8,17 +8,19 @@ The Telegram bot is the capture and clarification surface for coworkers. The bac
 2. Bot creates an `AppUser` if needed.
 3. Bot stores the Telegram file metadata, and downloads the file when `TELEGRAM_BOT_TOKEN` is configured.
 4. Bot creates a `ReceiptDocument`.
-5. Bot creates the first clarification question: Business or Personal.
+5. Bot runs the receipt extraction layer against caption/file-name hints.
+6. Bot creates targeted clarification questions only for missing or business-context fields.
 
 ## Clarification Flow
-Current skeleton:
-1. Business or Personal
-2. If Business: project/customer/trip reason
-3. If Business: attendees or beneficiaries
+Current flow:
+1. Missing receipt date, amount, or merchant if extraction cannot infer them.
+2. Business or Personal if extraction cannot infer it.
+3. If Business: project/customer/trip reason.
+4. If Business: attendees or beneficiaries.
 
-Future OCR/matching should insert smarter questions only when required, for example:
-- amount unclear
-- date unclear
+The extraction layer is currently deterministic and parses captions/file names. Future OCR/vision should plug into the same receipt fields before clarification questions are created.
+
+Future matching should insert smarter questions only when required, for example:
 - multiple statement matches
 - meal attendees missing
 - business reason missing

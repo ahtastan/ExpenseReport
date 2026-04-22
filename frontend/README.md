@@ -11,3 +11,7 @@ Recommended: Next.js internal web app.
 - Export history
 
 This folder is intentionally light for now. The backend and domain model should stabilize first.
+
+## Current minimal UI
+- `review-table.html` is a static review table that talks to the backend review-session APIs.
+- It lets a reviewer load statement rows, edit confirmed values, flag rows for attention, and confirm the reviewed data snapshot before report generation.

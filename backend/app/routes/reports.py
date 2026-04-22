@@ -1,6 +1,10 @@
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 
+from app.config import get_settings
 from app.db import get_session
 from app.models import ReportRun
 from app.schemas import ReportGenerateRequest, ReportRunRead, ReportValidationIssue, ReportValidationResult
@@ -45,3 +49,25 @@ def generate_report(payload: ReportGenerateRequest, session: Session = Depends(g
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{report_run_id}/download")
+def download_report(report_run_id: int, session: Session = Depends(get_session)):
+    run = session.get(ReportRun, report_run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Report run not found")
+    if run.status != "completed" or not run.output_workbook_path:
+        raise HTTPException(status_code=400, detail="Report run is not ready for download")
+
+    output_path = Path(run.output_workbook_path).resolve()
+    storage_root = get_settings().storage_root.resolve()
+    if storage_root not in output_path.parents:
+        raise HTTPException(status_code=400, detail="Report output path is outside storage root")
+    if not output_path.exists() or not output_path.is_file():
+        raise HTTPException(status_code=404, detail="Report output file not found")
+
+    return FileResponse(
+        output_path,
+        filename=output_path.name,
+        media_type="application/zip" if output_path.suffix.lower() == ".zip" else None,
+    )

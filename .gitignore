@@ -1,0 +1,5 @@
+.verify_data/
+backend/.verify_data/
+backend/data/
+__pycache__/
+*.py[cod]

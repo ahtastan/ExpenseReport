@@ -1,8 +1,17 @@
 from dataclasses import dataclass
+from datetime import date
+import json
 
 from sqlmodel import Session, select
 
-from app.models import ClarificationQuestion, MatchDecision, PolicyDecision, ReceiptDocument, StatementTransaction
+from app.models import ClarificationQuestion, MatchDecision, PolicyDecision, ReceiptDocument, ReviewSession, StatementTransaction
+
+
+AIRFARE_BUCKET = "Airfare/Bus/Ferry/Other"
+AIR_TRAVEL_DETAIL_ROWS_BY_SHEET = {
+    "Week 1A": 3,
+    "Week 2A": 3,
+}
 
 
 @dataclass(frozen=True)
@@ -13,6 +22,10 @@ class ValidationIssue:
     receipt_id: int | None = None
     statement_transaction_id: int | None = None
     match_decision_id: int | None = None
+    review_row_id: int | None = None
+    supplier: str | None = None
+    transaction_date: str | None = None
+    report_bucket: str | None = None
 
 
 @dataclass
@@ -45,6 +58,101 @@ def _approved_decisions_for_statement(session: Session, statement_import_id: int
     ]
 
 
+def _latest_review_session(session: Session, statement_import_id: int) -> ReviewSession | None:
+    return session.exec(
+        select(ReviewSession)
+        .where(ReviewSession.statement_import_id == statement_import_id)
+        .order_by(ReviewSession.created_at.desc())
+    ).first()
+
+
+def _parse_snapshot_date(value: object) -> date | None:
+    if value in (None, ""):
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _snapshot_issue_context(row: dict) -> dict:
+    return {
+        "review_row_id": row.get("review_row_id"),
+        "supplier": row.get("supplier"),
+        "transaction_date": row.get("transaction_date"),
+        "report_bucket": row.get("report_bucket"),
+        "statement_transaction_id": row.get("transaction_id"),
+    }
+
+
+def _review_snapshot_issues(session: Session, statement_import_id: int) -> tuple[list[ValidationIssue], int | None]:
+    review = _latest_review_session(session, statement_import_id)
+    if not review or review.status != "confirmed" or not review.snapshot_json:
+        return [
+            ValidationIssue(
+                severity="error",
+                code="review_not_confirmed",
+                message="Report generation requires a confirmed review snapshot. Confirm reviewed data before generating.",
+            )
+        ], None
+
+    snapshot = json.loads(review.snapshot_json)
+    dates = sorted(
+        {
+            tx_date
+            for row in snapshot
+            if (tx_date := _parse_snapshot_date(row.get("transaction_date"))) is not None
+        }
+    )
+    first7, next7 = set(dates[:7]), set(dates[7:14])
+    page_counts = {"Week 1A": 0, "Week 2A": 0}
+    issues: list[ValidationIssue] = []
+    for row in snapshot:
+        if row.get("report_bucket") != AIRFARE_BUCKET:
+            continue
+        tx_date = _parse_snapshot_date(row.get("transaction_date"))
+        travel_date = _parse_snapshot_date(row.get("air_travel_date")) or tx_date
+        return_date = _parse_snapshot_date(row.get("air_travel_return_date"))
+        if (row.get("air_travel_rt_or_oneway") or "").strip().upper() == "RT" and not return_date:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="air_travel_return_date_missing",
+                    message="An RT air travel row is missing its return date.",
+                    **_snapshot_issue_context(row),
+                )
+            )
+        elif travel_date and return_date and return_date < travel_date:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="air_travel_return_date_before_travel_date",
+                    message="An RT air travel row has a return date before its travel date.",
+                    **_snapshot_issue_context(row),
+                )
+            )
+        if tx_date in first7:
+            page_counts["Week 1A"] += 1
+        elif tx_date in next7:
+            page_counts["Week 2A"] += 1
+
+    for sheet_name, count in page_counts.items():
+        capacity = AIR_TRAVEL_DETAIL_ROWS_BY_SHEET[sheet_name]
+        if count > capacity:
+            issues.append(
+                ValidationIssue(
+                    severity="warning",
+                    code="air_travel_detail_overflow",
+                    message=(
+                        f"{sheet_name} has {count} air travel rows, but the template only has "
+                        f"{capacity} Air Travel Reconciliation detail rows. Extra air travel details "
+                        "will not be written to the worksheet."
+                    ),
+                )
+            )
+    return issues, len(snapshot)
+
+
 def validate_report_readiness(session: Session, statement_import_id: int) -> ReportValidation:
     transactions = session.exec(
         select(StatementTransaction).where(StatementTransaction.statement_import_id == statement_import_id)
@@ -57,6 +165,8 @@ def validate_report_readiness(session: Session, statement_import_id: int) -> Rep
     ]
     decisions = [decision for decision in all_decisions if decision.approved]
     issues: list[ValidationIssue] = []
+    review_issue_list, confirmed_review_rows = _review_snapshot_issues(session, statement_import_id)
+    issues.extend(review_issue_list)
 
     if not transactions:
         issues.append(
@@ -227,7 +337,11 @@ def validate_report_readiness(session: Session, statement_import_id: int) -> Rep
         ready=error_count == 0,
         issue_count=error_count,
         warning_count=warning_count,
-        included_transactions=len(included_policy_tx_ids) if included_policy_tx_ids else len(approved_by_transaction),
+        included_transactions=confirmed_review_rows
+        if confirmed_review_rows is not None
+        else len(included_policy_tx_ids)
+        if included_policy_tx_ids
+        else len(approved_by_transaction),
         approved_matches=len(decisions),
         business_receipts=business_receipts,
         personal_receipts=personal_receipts,

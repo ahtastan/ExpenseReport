@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -50,6 +51,19 @@ class ReceiptUpdate(BaseModel):
     business_reason: str | None = None
     attendees: str | None = None
     needs_clarification: bool | None = None
+
+
+class ReceiptExtractionRead(BaseModel):
+    receipt_id: int
+    status: str
+    extracted_date: date | None
+    extracted_supplier: str | None
+    extracted_local_amount: float | None
+    extracted_currency: str | None
+    business_or_personal: str | None
+    confidence: float | None
+    missing_fields: list[str]
+    notes: list[str]
 
 
 class ClarificationQuestionRead(BaseModel):
@@ -145,6 +159,48 @@ class ReviewSummary(BaseModel):
     open_questions: int
 
 
+class ReviewRowUpdate(BaseModel):
+    fields: dict[str, Any] | None = None
+    attention_required: bool | None = None
+    attention_note: str | None = None
+
+
+class ReviewBulkUpdateRequest(BaseModel):
+    fields: dict[str, Any]
+    scope: str = "attention_required"
+
+
+class ReviewBulkUpdateResult(BaseModel):
+    updated_rows: int
+    remaining_attention_rows: int
+
+
+class ReviewConfirmRequest(BaseModel):
+    confirmed_by_user_id: int | None = None
+    confirmed_by_label: str | None = None
+
+
+class ReviewRowRead(BaseModel):
+    id: int
+    status: str
+    attention_required: bool
+    attention_note: str | None
+    source: dict[str, Any]
+    suggested: dict[str, Any]
+    confirmed: dict[str, Any]
+
+
+class ReviewSessionRead(BaseModel):
+    id: int
+    statement_import_id: int
+    status: str
+    confirmed_at: datetime | None
+    confirmed_by_user_id: int | None
+    confirmed_by_label: str | None
+    snapshot_hash: str | None
+    rows: list[ReviewRowRead]
+
+
 class ReportValidationIssue(BaseModel):
     severity: str
     code: str
@@ -152,6 +208,10 @@ class ReportValidationIssue(BaseModel):
     receipt_id: int | None = None
     statement_transaction_id: int | None = None
     match_decision_id: int | None = None
+    review_row_id: int | None = None
+    supplier: str | None = None
+    transaction_date: str | None = None
+    report_bucket: str | None = None
 
 
 class ReportValidationResult(BaseModel):

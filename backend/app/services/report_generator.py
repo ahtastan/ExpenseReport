@@ -11,6 +11,7 @@ from app.config import get_settings
 from app.models import MatchDecision, ReceiptDocument, ReportRun, StatementTransaction
 from app.services.receipt_annotations import ReceiptAnnotationLine, create_annotated_receipts_pdf
 from app.services.report_validation import ReportValidation, validate_report_readiness
+from app.services.review_sessions import confirmed_snapshot
 
 
 DEFAULT_BUSINESS_REASONS = {
@@ -21,10 +22,95 @@ DEFAULT_BUSINESS_REASONS = {
 }
 
 
+REPORT_BUCKETS = [
+    "Airfare/Bus/Ferry/Other",
+    "Hotel/Lodging/Laundry",
+    "Auto Rental",
+    "Auto Gasoline",
+    "Taxi/Parking/Tolls/Uber",
+    "Other Travel Related",
+    "Membership/Subscription Fees",
+    "Customer Gifts",
+    "Telephone/Internet",
+    "Postage/Shipping",
+    "Admin Supplies",
+    "Lab Supplies",
+    "Field Service Supplies",
+    "Assets",
+    "Other",
+    "Meals/Snacks",
+    "Breakfast",
+    "Lunch",
+    "Dinner",
+    "Entertainment",
+]
+
+
+BUCKET_TOTAL_KEYS = {
+    "airfare/bus/ferry/other": "airfare",
+    "hotel/lodging/laundry": "hotel",
+    "auto rental": "auto_rental",
+    "auto gasoline": "gas",
+    "taxi/parking/tolls/uber": "ground",
+    "other travel related": "travel_other",
+    "membership/subscription fees": "membership",
+    "customer gifts": "gifts",
+    "telephone/internet": "phone",
+    "postage/shipping": "postage",
+    "admin supplies": "admin",
+    "lab supplies": "lab",
+    "field service supplies": "field_service",
+    "assets": "assets",
+    "other": "other",
+    "meals/snacks": "meal_m",
+    "breakfast": "meal_b",
+    "lunch": "meal_l",
+    "dinner": "meal_d",
+    "entertainment": "ent",
+}
+
+
+MEAL_DETAIL_CODES = {
+    "meal_m": "M",
+    "meal_b": "B",
+    "meal_l": "L",
+    "meal_d": "D",
+    "ent": "E",
+}
+
+
+def _bucket_key(bucket: str) -> str:
+    return " ".join(bucket.lower().replace("(", "").replace(")", "").split())
+
+
+AIRFARE_BUCKET = "Airfare/Bus/Ferry/Other"
+
+# Row layout for the AIR TRAVEL RECONCILIATION section per sheet.
+# Week 1A: title=44, headers=45-46, data=47-49.
+# Week 2A: title=45, headers=46-47, data=48-50.
+AIR_TRAVEL_ROWS_BY_SHEET = {
+    "Week 1A": [47, 48, 49],
+    "Week 2A": [48, 49, 50],
+}
+
+
+@dataclass(frozen=True)
+class MealDetailLine:
+    tx_date: date
+    code: str
+    place: str
+    location: str
+    participants: str
+    reason: str
+    amount: float
+    eg: bool
+    mr: bool
+
+
 @dataclass(frozen=True)
 class ReportLine:
     transaction_id: int
-    receipt_id: int
+    receipt_id: int | None
     receipt_path: str | None
     receipt_file_name: str
     transaction_date: date
@@ -35,6 +121,20 @@ class ReportLine:
     report_bucket: str
     business_reason: str
     attendees: str
+    air_travel_date: date | None = None
+    air_travel_from: str | None = None
+    air_travel_to: str | None = None
+    air_travel_airline: str | None = None
+    air_travel_rt_or_oneway: str | None = None
+    air_travel_return_date: date | None = None
+    air_travel_paid_by: str | None = None
+    air_travel_total_tkt_cost: float | None = None
+    air_travel_prior_tkt_value: float | None = None
+    air_travel_comments: str | None = None
+    meal_place: str | None = None
+    meal_location: str | None = None
+    meal_eg: bool = False
+    meal_mr: bool = False
 
 
 def _approved_lines(session: Session, statement_import_id: int) -> list[ReportLine]:
@@ -81,44 +181,104 @@ def _approved_lines(session: Session, statement_import_id: int) -> list[ReportLi
                 attendees=receipt.attendees or "",
             )
         )
-    return sorted(lines, key=lambda line: (line.transaction_date, line.supplier, line.amount))
+    return sorted(lines, key=lambda line: (line.transaction_date, line.transaction_id))
 
 
-def _allocate(line: ReportLine, day_totals: dict[date, dict[str, float]], detail_lines: dict[date, list[tuple[str, str, str, float]]]) -> None:
-    bucket = line.report_bucket.lower()
+def _parse_optional_date(value: object) -> date | None:
+    if value in (None, ""):
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "eg", "mr"}
+
+
+def _confirmed_lines(session: Session, statement_import_id: int) -> list[ReportLine]:
+    _review, snapshot = confirmed_snapshot(session, statement_import_id)
+    lines: list[ReportLine] = []
+    for row in snapshot:
+        tx_date_raw = row.get("transaction_date")
+        amount = row.get("amount")
+        if not tx_date_raw or amount is None:
+            continue
+        tx_date = date.fromisoformat(str(tx_date_raw))
+        lines.append(
+            ReportLine(
+                transaction_id=int(row["transaction_id"]),
+                receipt_id=int(row["receipt_id"]) if row.get("receipt_id") is not None else None,
+                receipt_path=row.get("receipt_path"),
+                receipt_file_name=row.get("receipt_file_name") or f"receipt_{row.get('receipt_id')}",
+                transaction_date=tx_date,
+                supplier=row.get("supplier") or "",
+                amount=float(amount),
+                currency=row.get("currency") or "TRY",
+                business_or_personal=row.get("business_or_personal") or "",
+                report_bucket=row.get("report_bucket") or "",
+                business_reason=row.get("business_reason") or "",
+                attendees=row.get("attendees") or "",
+                air_travel_date=_parse_optional_date(row.get("air_travel_date")) or tx_date,
+                air_travel_from=row.get("air_travel_from") or None,
+                air_travel_to=row.get("air_travel_to") or None,
+                air_travel_airline=row.get("air_travel_airline") or None,
+                air_travel_rt_or_oneway=row.get("air_travel_rt_or_oneway") or None,
+                air_travel_return_date=_parse_optional_date(row.get("air_travel_return_date")),
+                air_travel_paid_by=row.get("air_travel_paid_by") or None,
+                air_travel_total_tkt_cost=_parse_optional_float(row.get("air_travel_total_tkt_cost")),
+                air_travel_prior_tkt_value=_parse_optional_float(row.get("air_travel_prior_tkt_value")),
+                air_travel_comments=row.get("air_travel_comments") or None,
+                meal_place=row.get("meal_place") or None,
+                meal_location=row.get("meal_location") or None,
+                meal_eg=_parse_bool(row.get("meal_eg")),
+                meal_mr=_parse_bool(row.get("meal_mr")),
+            )
+        )
+    return sorted(lines, key=lambda line: (line.transaction_date, line.transaction_id))
+
+
+def _allocate(line: ReportLine, day_totals: dict[date, dict[str, list[float]]], detail_lines: dict[date, list[MealDetailLine]]) -> None:
     bp = line.business_or_personal.lower()
     day = day_totals[line.transaction_date]
     if bp != "business":
-        day["other"] += line.amount
+        day["other"].append(line.amount)
         return
 
-    if "hotel" in bucket:
-        day["hotel"] += line.amount
-    elif "auto gasoline" in bucket or "fuel" in bucket:
-        day["gas"] += line.amount
-    elif "taxi/parking/tolls/uber" in bucket or "taxi" in bucket or "uber" in bucket:
-        day["ground"] += line.amount
-    elif "airfare" in bucket or "bus" in bucket or "ferry" in bucket:
-        day["airfare"] += line.amount
-    elif "other (travel related)" in bucket:
-        day["travel_other"] += line.amount
-    elif "breakfast" in bucket:
-        day["meal_b"] += line.amount
-        detail_lines[line.transaction_date].append(("B", line.supplier, line.business_reason, line.amount))
-    elif "lunch" in bucket:
-        day["meal_l"] += line.amount
-        detail_lines[line.transaction_date].append(("L", line.supplier, line.business_reason, line.amount))
-    elif "dinner" in bucket:
-        day["meal_d"] += line.amount
-        detail_lines[line.transaction_date].append(("D", line.supplier, line.business_reason, line.amount))
-    elif "meal" in bucket or "snack" in bucket:
-        day["meal_m"] += line.amount
-        detail_lines[line.transaction_date].append(("M", line.supplier, line.business_reason, line.amount))
-    elif "entertainment" in bucket:
-        day["ent"] += line.amount
-        detail_lines[line.transaction_date].append(("E", line.supplier, line.business_reason, line.amount))
-    else:
-        day["other"] += line.amount
+    bucket_key = _bucket_key(line.report_bucket)
+    total_key = BUCKET_TOTAL_KEYS.get(bucket_key, "other")
+    total_amount = line.amount
+    if bucket_key == _bucket_key(AIRFARE_BUCKET) and line.air_travel_total_tkt_cost is not None:
+        total_amount = line.air_travel_total_tkt_cost
+    day[total_key].append(total_amount)
+    if total_key in MEAL_DETAIL_CODES:
+        detail_lines[line.transaction_date].append(
+            MealDetailLine(
+                tx_date=line.transaction_date,
+                code=MEAL_DETAIL_CODES[total_key],
+                place=line.meal_place or line.supplier,
+                location=line.meal_location or "",
+                participants=line.attendees,
+                reason=line.business_reason,
+                amount=total_amount,
+                eg=line.meal_eg,
+                mr=line.meal_mr,
+            )
+        )
 
 
 def _fill_workbook(template_path: Path, output_path: Path, employee_name: str, title: str, lines: list[ReportLine]) -> None:
@@ -127,8 +287,8 @@ def _fill_workbook(template_path: Path, output_path: Path, employee_name: str, t
     ws1a["B3"] = employee_name
     ws1a["G3"] = title
 
-    day_totals: dict[date, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    detail_lines: dict[date, list[tuple[str, str, str, float]]] = defaultdict(list)
+    day_totals: dict[date, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    detail_lines: dict[date, list[MealDetailLine]] = defaultdict(list)
     for line in lines:
         _allocate(line, day_totals, detail_lines)
 
@@ -137,38 +297,102 @@ def _fill_workbook(template_path: Path, output_path: Path, employee_name: str, t
     cols = ["E", "F", "G", "H", "I", "J", "K"]
 
     def fill_a(ws, page_dates: list[date]) -> None:
+        def total_value(amounts: list[float] | None) -> float | str | None:
+            if not amounts:
+                return None
+            if len(amounts) == 1:
+                return amounts[0]
+            parts = [f"{amount:.2f}".rstrip("0").rstrip(".") for amount in amounts]
+            return "=" + "+".join(parts)
+
         for col, tx_date in zip(cols, page_dates):
             vals = day_totals[tx_date]
             ws[f"{col}5"] = datetime(tx_date.year, tx_date.month, tx_date.day)
             ws[f"{col}6"] = DEFAULT_BUSINESS_REASONS.get(tx_date, "")
-            ws[f"{col}7"] = vals.get("airfare") or None
-            ws[f"{col}8"] = vals.get("hotel") or None
-            ws[f"{col}10"] = vals.get("gas") or None
-            ws[f"{col}11"] = vals.get("ground") or None
-            ws[f"{col}14"] = vals.get("travel_other") or None
-            ws[f"{col}26"] = vals.get("other") or None
-            ws[f"{col}29"] = vals.get("meal_m") or None
-            ws[f"{col}30"] = vals.get("meal_b") or None
-            ws[f"{col}31"] = vals.get("meal_l") or None
-            ws[f"{col}32"] = vals.get("meal_d") or None
-            ws[f"{col}35"] = vals.get("ent") or None
+            ws[f"{col}7"] = total_value(vals.get("airfare"))
+            ws[f"{col}8"] = total_value(vals.get("hotel"))
+            ws[f"{col}9"] = total_value(vals.get("auto_rental"))
+            ws[f"{col}10"] = total_value(vals.get("gas"))
+            ws[f"{col}11"] = total_value(vals.get("ground"))
+            ws[f"{col}14"] = total_value(vals.get("travel_other"))
+            ws[f"{col}18"] = total_value(vals.get("membership"))
+            ws[f"{col}19"] = total_value(vals.get("gifts"))
+            ws[f"{col}20"] = total_value(vals.get("phone"))
+            ws[f"{col}21"] = total_value(vals.get("postage"))
+            ws[f"{col}22"] = total_value(vals.get("admin"))
+            ws[f"{col}23"] = total_value(vals.get("lab"))
+            ws[f"{col}24"] = total_value(vals.get("field_service"))
+            ws[f"{col}25"] = total_value(vals.get("assets"))
+            ws[f"{col}26"] = total_value(vals.get("other"))
+            ws[f"{col}29"] = total_value(vals.get("meal_m"))
+            ws[f"{col}30"] = total_value(vals.get("meal_b"))
+            ws[f"{col}31"] = total_value(vals.get("meal_l"))
+            ws[f"{col}32"] = total_value(vals.get("meal_d"))
+            ws[f"{col}35"] = total_value(vals.get("ent"))
+
+    def fill_air_travel(ws, sheet_name: str, page_lines: list[ReportLine]) -> None:
+        def travel_date_value(ln: ReportLine) -> datetime | str | None:
+            travel_date = ln.air_travel_date or ln.transaction_date
+            if travel_date is None:
+                return None
+            if (ln.air_travel_rt_or_oneway or "").strip().upper() == "RT" and ln.air_travel_return_date:
+                return f"{travel_date:%d.%m.%Y} - {ln.air_travel_return_date:%d.%m.%Y}"
+            return datetime(travel_date.year, travel_date.month, travel_date.day)
+
+        rows = AIR_TRAVEL_ROWS_BY_SHEET.get(sheet_name, [])
+        if not rows:
+            return
+        air_lines = [ln for ln in page_lines if _bucket_key(ln.report_bucket) == _bucket_key(AIRFARE_BUCKET)]
+        for row_num, ln in zip(rows, air_lines):
+            value = travel_date_value(ln)
+            if value is not None:
+                ws[f"B{row_num}"] = value
+            if ln.air_travel_from:
+                ws[f"C{row_num}"] = ln.air_travel_from
+            if ln.air_travel_to:
+                ws[f"D{row_num}"] = ln.air_travel_to
+            if ln.air_travel_airline:
+                ws[f"E{row_num}"] = ln.air_travel_airline
+            if ln.air_travel_rt_or_oneway:
+                ws[f"F{row_num}"] = ln.air_travel_rt_or_oneway
+            ws[f"G{row_num}"] = ln.air_travel_paid_by or "DC Card"
+            if ln.air_travel_total_tkt_cost is not None:
+                ws[f"H{row_num}"] = ln.air_travel_total_tkt_cost
+            else:
+                # Fall back to the line amount so the formula in column J has a value.
+                ws[f"H{row_num}"] = ln.amount
+            ws[f"I{row_num}"] = ln.air_travel_prior_tkt_value if ln.air_travel_prior_tkt_value is not None else 0
+            # Column J holds the `=H-I` formula in the template — do not overwrite.
+            if ln.air_travel_comments:
+                ws[f"K{row_num}"] = ln.air_travel_comments
 
     def fill_b(ws, page_dates: list[date]) -> None:
-        rownum = 8
-        for tx_date in page_dates:
-            for code, supplier, reason, _usd in detail_lines.get(tx_date, []):
-                if rownum > 42:
-                    return
-                ws[f"B{rownum}"] = datetime(tx_date.year, tx_date.month, tx_date.day)
-                ws[f"E{rownum}"] = supplier[:40]
-                ws[f"F{rownum}"] = reason[:50]
-                ws[f"G{rownum}"] = code
-                rownum += 1
+        code_rows = {"M": 0, "B": 1, "L": 2, "D": 3, "E": 4}
+        for day_index, tx_date in enumerate(page_dates):
+            used_codes: set[str] = set()
+            for detail in detail_lines.get(tx_date, []):
+                if detail.code not in code_rows or detail.code in used_codes:
+                    continue
+                used_codes.add(detail.code)
+                rownum = 8 + day_index * 5 + code_rows[detail.code]
+                ws[f"C{rownum}"] = detail.place[:40]
+                ws[f"D{rownum}"] = detail.location[:28]
+                ws[f"E{rownum}"] = detail.participants[:40]
+                ws[f"F{rownum}"] = detail.reason[:50]
+                ws[f"H{rownum}"] = "x" if detail.eg else None
+                ws[f"I{rownum}"] = "x" if detail.mr else None
+
+    first7_set = set(first7)
+    next7_set = set(next7)
+    first7_lines = [ln for ln in lines if ln.transaction_date in first7_set]
+    next7_lines = [ln for ln in lines if ln.transaction_date in next7_set]
 
     fill_a(ws1a, first7)
     fill_a(ws2a, next7)
     fill_b(ws1b, first7)
     fill_b(ws2b, next7)
+    fill_air_travel(ws1a, "Week 1A", first7_lines)
+    fill_air_travel(ws2a, "Week 2A", next7_lines)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
 
@@ -224,13 +448,15 @@ def generate_report_package(
 
     validation = validate_report_readiness(session, statement_import_id)
     if validation.issue_count:
+        if any(issue.code == "review_not_confirmed" for issue in validation.issues):
+            raise ValueError("Report generation requires confirmed review data")
         raise ValueError(f"Report has {validation.issue_count} blocking validation error(s)")
     if validation.warning_count and not allow_warnings:
         raise ValueError(f"Report has {validation.warning_count} validation warning(s)")
 
-    lines = _approved_lines(session, statement_import_id)
+    lines = _confirmed_lines(session, statement_import_id)
     if not lines:
-        raise ValueError("No approved matches are available for report generation")
+        raise ValueError("No confirmed review rows are available for report generation")
 
     run = ReportRun(statement_import_id=statement_import_id, template_name=settings.report_template_path.name, status="running")
     session.add(run)

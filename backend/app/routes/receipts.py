@@ -3,8 +3,9 @@ from sqlmodel import Session, select
 
 from app.db import get_session
 from app.models import ReceiptDocument
-from app.schemas import ReceiptRead, ReceiptUpdate
-from app.services.clarifications import ensure_initial_receipt_question
+from app.schemas import ReceiptExtractionRead, ReceiptRead, ReceiptUpdate
+from app.services.clarifications import ensure_receipt_review_questions
+from app.services.receipt_extraction import apply_receipt_extraction
 from app.services.storage import save_upload_file
 
 router = APIRouter()
@@ -46,6 +47,16 @@ def update_receipt(
     return receipt
 
 
+@router.post("/{receipt_id}/extract", response_model=ReceiptExtractionRead)
+def extract_receipt(receipt_id: int, session: Session = Depends(get_session)):
+    receipt = session.get(ReceiptDocument, receipt_id)
+    if not receipt:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    result = apply_receipt_extraction(session, receipt)
+    ensure_receipt_review_questions(session, receipt, receipt.uploader_user_id)
+    return ReceiptExtractionRead(**result.__dict__)
+
+
 @router.post("/upload", response_model=ReceiptRead)
 async def upload_receipt(
     file: UploadFile = File(...),
@@ -65,5 +76,6 @@ async def upload_receipt(
     session.add(receipt)
     session.commit()
     session.refresh(receipt)
-    ensure_initial_receipt_question(session, receipt, None)
+    apply_receipt_extraction(session, receipt)
+    ensure_receipt_review_questions(session, receipt, None)
     return receipt

@@ -2,9 +2,26 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app.models import ClarificationQuestion, MatchDecision, ReceiptDocument, StatementImport, StatementTransaction
-from app.schemas import ClarificationAnswer, ClarificationQuestionRead, ReviewSummary
+from app.models import ClarificationQuestion, MatchDecision, ReceiptDocument, ReviewSession, StatementImport, StatementTransaction
+from app.schemas import (
+    ClarificationAnswer,
+    ClarificationQuestionRead,
+    ReviewBulkUpdateRequest,
+    ReviewBulkUpdateResult,
+    ReviewConfirmRequest,
+    ReviewRowRead,
+    ReviewRowUpdate,
+    ReviewSessionRead,
+    ReviewSummary,
+)
 from app.services.clarifications import answer_question
+from app.services.review_sessions import (
+    bulk_update_review_rows,
+    confirm_review_session,
+    get_or_create_review_session,
+    session_payload,
+    update_review_row,
+)
 
 router = APIRouter()
 
@@ -26,6 +43,74 @@ def review_summary(session: Session = Depends(get_session)):
         rejected_matches=sum(1 for decision in decisions if decision.rejected),
         open_questions=len(questions),
     )
+
+
+@router.get("/report/{statement_import_id}", response_model=ReviewSessionRead)
+def get_report_review(statement_import_id: int, session: Session = Depends(get_session)):
+    review = get_or_create_review_session(session, statement_import_id)
+    return session_payload(session, review)
+
+
+@router.post("/report/{statement_import_id}/build", response_model=ReviewSessionRead)
+def build_report_review(statement_import_id: int, session: Session = Depends(get_session)):
+    review = get_or_create_review_session(session, statement_import_id)
+    return session_payload(session, review)
+
+
+@router.patch("/report/rows/{row_id}", response_model=ReviewRowRead)
+def edit_report_review_row(row_id: int, payload: ReviewRowUpdate, session: Session = Depends(get_session)):
+    try:
+        row = update_review_row(
+            session,
+            row_id=row_id,
+            fields=payload.fields,
+            attention_required=payload.attention_required,
+            attention_note=payload.attention_note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    review = session.get(ReviewSession, row.review_session_id)
+    if not review:
+        raise HTTPException(status_code=404, detail="Review session not found")
+    for item in session_payload(session, review)["rows"]:
+        if item["id"] == row.id:
+            return item
+    raise HTTPException(status_code=404, detail="Review row not found")
+
+
+@router.post("/report/{review_session_id}/bulk-update", response_model=ReviewBulkUpdateResult)
+def bulk_edit_report_review_rows(
+    review_session_id: int,
+    payload: ReviewBulkUpdateRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return bulk_update_review_rows(
+            session,
+            review_session_id=review_session_id,
+            fields=payload.fields,
+            scope=payload.scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/report/{review_session_id}/confirm", response_model=ReviewSessionRead)
+def confirm_report_review(
+    review_session_id: int,
+    payload: ReviewConfirmRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        review = confirm_review_session(
+            session,
+            review_session_id=review_session_id,
+            confirmed_by_user_id=payload.confirmed_by_user_id,
+            confirmed_by_label=payload.confirmed_by_label,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return session_payload(session, review)
 
 
 @router.get("/questions", response_model=list[ClarificationQuestionRead])

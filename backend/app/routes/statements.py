@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from app.db import get_session
@@ -12,7 +12,15 @@ router = APIRouter()
 
 @router.get("/", response_model=list[StatementImportRead])
 def list_statements(session: Session = Depends(get_session)):
-    return session.exec(select(StatementImport).order_by(StatementImport.created_at.desc())).all()
+    return session.exec(select(StatementImport).order_by(StatementImport.created_at.desc(), StatementImport.id.desc())).all()
+
+
+@router.get("/latest", response_model=StatementImportRead)
+def latest_statement(session: Session = Depends(get_session)):
+    statement = session.exec(select(StatementImport).order_by(StatementImport.created_at.desc(), StatementImport.id.desc())).first()
+    if not statement:
+        raise HTTPException(status_code=404, detail="No statement imports found")
+    return statement
 
 
 @router.post("/import-excel", response_model=StatementImportRead)
@@ -21,7 +29,10 @@ async def import_statement_excel(
     session: Session = Depends(get_session),
 ):
     stored_path = await save_upload_file(file, "statements")
-    return import_diners_excel(session, stored_path, file.filename or stored_path.name)
+    try:
+        return import_diners_excel(session, stored_path, file.filename or stored_path.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{statement_id}/transactions", response_model=list[StatementTransactionRead])

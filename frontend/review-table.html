@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Expense Review</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #667085;
+      --line: #d8dee8;
+      --soft: #f6f8fb;
+      --accent: #116b5f;
+      --warn: #b54708;
+      --bad: #b42318;
+      --good-bg: #ecfdf3;
+      --bad-bg: #fef3f2;
+    }
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      color: var(--ink);
+      background: white;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+    }
+    main {
+      padding: 20px 24px 32px;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    input, select, button {
+      font: inherit;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: white;
+    }
+    button {
+      cursor: pointer;
+      font-weight: 700;
+    }
+    button.primary {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: white;
+    }
+    button.danger {
+      border-color: var(--bad);
+      color: var(--bad);
+    }
+    .status {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .status.success {
+      color: var(--accent);
+    }
+    .status.error {
+      color: var(--bad);
+    }
+    .notice {
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .notice.success {
+      border-color: var(--accent);
+      background: var(--good-bg);
+      color: var(--accent);
+    }
+    .notice.error {
+      border-color: var(--bad);
+      background: var(--bad-bg);
+      color: var(--bad);
+    }
+    .notice a {
+      color: inherit;
+      font-weight: 700;
+    }
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    table {
+      width: 100%;
+      min-width: 1380px;
+      border-collapse: collapse;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px;
+      vertical-align: top;
+      text-align: left;
+      font-size: 13px;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: var(--soft);
+      z-index: 1;
+    }
+    td input, td select {
+      width: 100%;
+      box-sizing: border-box;
+      min-width: 90px;
+    }
+    .pill {
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .pill.needs_review, .pill.edited {
+      color: var(--warn);
+      border-color: var(--warn);
+    }
+    .pill.confirmed {
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .issue {
+      color: var(--bad);
+      font-weight: 700;
+    }
+    .source {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .bulk-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft);
+    }
+    .bulk-bar input, .bulk-bar select {
+      min-width: 140px;
+    }
+    tr.detail-row > td {
+      background: #f9fbfd;
+      border-bottom: 1px solid var(--line);
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 8px;
+    }
+    .detail-grid label {
+      display: flex;
+      flex-direction: column;
+      font-size: 12px;
+      color: var(--muted);
+      gap: 4px;
+    }
+    .detail-grid input, .detail-grid select {
+      font-size: 13px;
+      color: var(--ink);
+    }
+    .air-detail-grid {
+      grid-template-columns: 112px 82px 82px minmax(110px, 1fr) 112px 112px 92px 108px 108px minmax(120px, 1fr);
+      gap: 6px;
+      align-items: end;
+    }
+    .air-detail-grid label {
+      font-size: 11px;
+      gap: 2px;
+    }
+    .air-detail-grid input, .air-detail-grid select {
+      min-width: 0;
+      padding: 5px 7px;
+      font-size: 12px;
+    }
+    .air-return-date.is-hidden {
+      display: none;
+    }
+    .detail-title {
+      font-weight: 700;
+      margin: 0 0 6px;
+      color: var(--ink);
+    }
+    .flag-buttons {
+      display: flex;
+      gap: 6px;
+      align-items: end;
+    }
+    .flag-toggle {
+      min-width: 46px;
+      padding: 8px 10px;
+      color: var(--muted);
+      background: white;
+    }
+    .flag-toggle.active {
+      border-color: var(--accent);
+      background: var(--good-bg);
+      color: var(--accent);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Expense Review</strong>
+    <div class="controls">
+      <label>Statement <input id="statementId" type="number" min="1" value="1"></label>
+      <button id="loadBtn">Load</button>
+      <button id="confirmBtn" class="primary">Confirm reviewed data for report</button>
+      <button id="validateBtn">Validate before generate</button>
+      <button id="generateBtn">Generate report package</button>
+      <span id="sessionStatus" class="status"></span>
+    </div>
+  </header>
+  <main>
+    <div id="reviewNotice" class="notice">Load and review rows, then confirm. Any edit after confirmation returns the session to draft and requires reconfirmation before report generation.</div>
+    <div id="reportStatus" class="notice" hidden></div>
+    <div class="bulk-bar">
+      <strong>Bulk classify</strong>
+      <label>Rows
+        <select id="bulkScope">
+          <option value="attention_required">Flagged rows</option>
+          <option value="all">All rows</option>
+        </select>
+      </label>
+      <label>Business
+        <select id="bulkBusiness">
+          <option value="Business">Business</option>
+          <option value="Personal">Personal</option>
+        </select>
+      </label>
+      <label>Category <select id="bulkCategory"></select></label>
+      <label>Bucket <select id="bulkBucket"></select></label>
+      <button id="bulkApplyBtn">Apply to rows</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Issue</th>
+            <th>Date</th>
+            <th>Supplier</th>
+            <th>Amount</th>
+            <th>Currency</th>
+            <th>Business</th>
+            <th>Category</th>
+            <th>Bucket</th>
+            <th>Provenance</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </main>
+  <script>
+    let currentSession = null;
+    const REPORT_BUCKETS = [
+      "Other",
+      "Taxi/Parking/Tolls/Uber",
+      "Hotel/Lodging/Laundry",
+      "Auto Rental",
+      "Auto Gasoline",
+      "Airfare/Bus/Ferry/Other",
+      "Other Travel Related",
+      "Meals/Snacks",
+      "Breakfast",
+      "Lunch",
+      "Dinner",
+      "Entertainment",
+      "Membership/Subscription Fees",
+      "Customer Gifts",
+      "Telephone/Internet",
+      "Postage/Shipping",
+      "Admin Supplies",
+      "Lab Supplies",
+      "Field Service Supplies",
+      "Assets",
+    ];
+
+    // Parent categories group the EDT buckets for easier picking.
+    const CATEGORY_GROUPS = [
+      { key: "Hotel & Travel", buckets: [
+        "Hotel/Lodging/Laundry",
+        "Auto Rental",
+        "Auto Gasoline",
+        "Taxi/Parking/Tolls/Uber",
+        "Other Travel Related",
+      ]},
+      { key: "Meals & Entertainment", buckets: [
+        "Meals/Snacks",
+        "Breakfast",
+        "Lunch",
+        "Dinner",
+        "Entertainment",
+      ]},
+      { key: "Air Travel", buckets: [
+        "Airfare/Bus/Ferry/Other",
+      ]},
+      { key: "Other", buckets: [
+        "Membership/Subscription Fees",
+        "Customer Gifts",
+        "Telephone/Internet",
+        "Postage/Shipping",
+        "Admin Supplies",
+        "Lab Supplies",
+        "Field Service Supplies",
+        "Assets",
+        "Other",
+      ]},
+    ];
+    const CATEGORY_KEYS = CATEGORY_GROUPS.map(g => g.key);
+    const BUCKET_TO_CATEGORY = (() => {
+      const map = {};
+      CATEGORY_GROUPS.forEach(g => g.buckets.forEach(b => { map[b] = g.key; }));
+      return map;
+    })();
+    const bucketsForCategory = (category) => {
+      const group = CATEGORY_GROUPS.find(g => g.key === category);
+      return group ? group.buckets : REPORT_BUCKETS;
+    };
+
+    const setReportStatus = (message, kind = "", html = false) => {
+      const status = document.getElementById("reportStatus");
+      status.hidden = false;
+      status.className = `notice ${kind}`;
+      if (html) {
+        status.innerHTML = message;
+      } else {
+        status.textContent = message;
+      }
+    };
+
+    const escapeHtml = (value) => String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+
+    const renderValidation = (result) => {
+      const hasErrors = result.issue_count > 0;
+      const hasWarnings = result.warning_count > 0;
+      const kind = hasErrors ? "error" : "success";
+      const title = hasErrors
+        ? "Validation found blocking issues"
+          : hasWarnings
+            ? "Validation passed with warnings"
+            : "Validation passed";
+      const issueContext = (issue) => {
+        const parts = [];
+        if (issue.review_row_id) parts.push(`row ${issue.review_row_id}`);
+        if (issue.transaction_date) parts.push(issue.transaction_date);
+        if (issue.supplier) parts.push(issue.supplier);
+        if (issue.report_bucket) parts.push(issue.report_bucket);
+        return parts.length ? ` <span class="source">(${parts.map(escapeHtml).join(" | ")})</span>` : "";
+      };
+      const issueItems = result.issues.map(issue => (
+        `<li><strong>${escapeHtml(issue.severity.toUpperCase())}</strong>: ${escapeHtml(issue.message)}${issueContext(issue)}</li>`
+      )).join("");
+      const summary = `${escapeHtml(title)}. ${result.issue_count} errors, ${result.warning_count} warnings.`;
+      setReportStatus(issueItems ? `${summary}<ul>${issueItems}</ul>` : summary, kind, true);
+    };
+
+    const setReviewNotice = (message, kind = "") => {
+      const notice = document.getElementById("reviewNotice");
+      notice.className = `notice ${kind}`;
+      notice.textContent = message;
+    };
+
+    const readError = async (response) => {
+      const text = await response.text();
+      try {
+        const parsed = JSON.parse(text);
+        return parsed.detail || text;
+      } catch {
+        return text;
+      }
+    };
+
+    const api = async (path, options = {}) => {
+      const response = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...options,
+      });
+      if (!response.ok) throw new Error(await readError(response));
+      return response.json();
+    };
+
+    const field = (row, key, type = "text") => {
+      const value = row.confirmed[key] ?? "";
+      return `<input data-row="${row.id}" data-key="${key}" type="${type}" value="${String(value).replaceAll('"', '&quot;')}">`;
+    };
+
+    const select = (row, key, options) => {
+      const value = row.confirmed[key] ?? "";
+      const items = value && !options.includes(value) ? [value, ...options] : options;
+      return `<select data-row="${row.id}" data-key="${key}">${items.map(item => `<option value="${item}" ${item === value ? "selected" : ""}>${item || "-"}</option>`).join("")}</select>`;
+    };
+
+    // Category select: derived from current bucket. Not persisted as a row field; acts as a filter only.
+    const categorySelect = (row) => {
+      const currentBucket = row.confirmed.report_bucket ?? "";
+      const currentCategory = BUCKET_TO_CATEGORY[currentBucket] ?? "";
+      const items = ["", ...CATEGORY_KEYS];
+      return `<select data-row="${row.id}" data-category="1">${items.map(item => `<option value="${item}" ${item === currentCategory ? "selected" : ""}>${item || "-"}</option>`).join("")}</select>`;
+    };
+
+    // Bucket select: options filtered by currently selected category (or all if none).
+    const bucketSelect = (row) => {
+      const currentBucket = row.confirmed.report_bucket ?? "";
+      const currentCategory = BUCKET_TO_CATEGORY[currentBucket] ?? "";
+      const options = ["", ...(currentCategory ? bucketsForCategory(currentCategory) : REPORT_BUCKETS)];
+      const items = currentBucket && !options.includes(currentBucket) ? [currentBucket, ...options] : options;
+      return `<select data-row="${row.id}" data-key="report_bucket">${items.map(item => `<option value="${item}" ${item === currentBucket ? "selected" : ""}>${item || "-"}</option>`).join("")}</select>`;
+    };
+
+    const AIRFARE_BUCKET = "Airfare/Bus/Ferry/Other";
+    const AIR_TRAVEL_FIELDS = [
+      "air_travel_date", "air_travel_from", "air_travel_to",
+      "air_travel_airline", "air_travel_rt_or_oneway", "air_travel_return_date", "air_travel_paid_by",
+      "air_travel_total_tkt_cost", "air_travel_prior_tkt_value", "air_travel_comments",
+    ];
+    const MEAL_BUCKETS = ["Meals/Snacks", "Breakfast", "Lunch", "Dinner", "Entertainment"];
+
+    // Detail panel for Air Travel Reconciliation. Rendered as a second <tr> under the main row.
+    // Always rendered for every row but hidden when the bucket is not Airfare/Bus/Ferry/Other
+    // so its inputs are always available to the saveRow collector.
+    const airTravelDetail = (row) => {
+      const isAir = (row.confirmed.report_bucket || "") === AIRFARE_BUCKET;
+      const rtValue = row.confirmed.air_travel_rt_or_oneway || "";
+      const rtOptions = ["", "RT", "One way"];
+      const rtItems = rtValue && !rtOptions.includes(rtValue) ? [rtValue, ...rtOptions] : rtOptions;
+      const paidBy = row.confirmed.air_travel_paid_by ?? "DC Card";
+      const showReturnDate = rtValue === "RT";
+      return `
+        <tr class="air-detail detail-row" data-air-row="${row.id}" ${isAir ? "" : 'style="display: none;"'}>
+          <td colspan="11">
+            <div class="detail-title">Air Travel Reconciliation</div>
+            <div class="detail-grid air-detail-grid">
+              <label>Travel date <input data-row="${row.id}" data-key="air_travel_date" type="date" value="${row.confirmed.air_travel_date || ""}"></label>
+              <label>From <input data-row="${row.id}" data-key="air_travel_from" type="text" value="${(row.confirmed.air_travel_from || "").replaceAll('"', '&quot;')}"></label>
+              <label>To <input data-row="${row.id}" data-key="air_travel_to" type="text" value="${(row.confirmed.air_travel_to || "").replaceAll('"', '&quot;')}"></label>
+              <label>Airline <input data-row="${row.id}" data-key="air_travel_airline" type="text" value="${(row.confirmed.air_travel_airline || "").replaceAll('"', '&quot;')}"></label>
+              <label>RT / One way
+                <select data-row="${row.id}" data-key="air_travel_rt_or_oneway">
+                  ${rtItems.map(item => `<option value="${item}" ${item === rtValue ? "selected" : ""}>${item || "-"}</option>`).join("")}
+                </select>
+              </label>
+              <label class="air-return-date ${showReturnDate ? "" : "is-hidden"}" data-air-return-row="${row.id}">Return date <input data-row="${row.id}" data-key="air_travel_return_date" type="date" min="${row.confirmed.air_travel_date || ""}" value="${row.confirmed.air_travel_return_date || ""}"></label>
+              <label>Paid by <input data-row="${row.id}" data-key="air_travel_paid_by" type="text" value="${String(paidBy).replaceAll('"', '&quot;')}"></label>
+              <label>Total ticket cost <input data-row="${row.id}" data-key="air_travel_total_tkt_cost" type="number" step="0.01" value="${row.confirmed.air_travel_total_tkt_cost ?? ""}"></label>
+              <label>Prior ticket value <input data-row="${row.id}" data-key="air_travel_prior_tkt_value" type="number" step="0.01" value="${row.confirmed.air_travel_prior_tkt_value ?? ""}"></label>
+              <label>Comments <input data-row="${row.id}" data-key="air_travel_comments" type="text" value="${(row.confirmed.air_travel_comments || "").replaceAll('"', '&quot;')}"></label>
+            </div>
+          </td>
+        </tr>
+      `;
+    };
+
+    const mealFlagButton = (row, key, label) => {
+      const active = Boolean(row.confirmed[key]);
+      return `
+        <input data-row="${row.id}" data-key="${key}" type="hidden" value="${active ? "true" : "false"}">
+        <button type="button" class="flag-toggle ${active ? "active" : ""}" data-meal-flag="${key}" data-row="${row.id}" title="${label}">${label}</button>
+      `;
+    };
+
+    const mealEntertainmentDetail = (row) => {
+      const isMeal = MEAL_BUCKETS.includes(row.confirmed.report_bucket || "");
+      return `
+        <tr class="meal-detail detail-row" data-meal-row="${row.id}" ${isMeal ? "" : 'style="display: none;"'}>
+          <td colspan="11">
+            <div class="detail-title">Meals & Entertainment Documentation</div>
+            <div class="detail-grid">
+              <label>Place / type <input data-row="${row.id}" data-key="meal_place" type="text" value="${(row.confirmed.meal_place || row.confirmed.supplier || "").replaceAll('"', '&quot;')}"></label>
+              <label>Location <input data-row="${row.id}" data-key="meal_location" type="text" value="${(row.confirmed.meal_location || "").replaceAll('"', '&quot;')}"></label>
+              <label>Participants <input data-row="${row.id}" data-key="attendees" type="text" value="${(row.confirmed.attendees || "").replaceAll('"', '&quot;')}"></label>
+              <label>Business reason <input data-row="${row.id}" data-key="business_reason" type="text" value="${(row.confirmed.business_reason || "").replaceAll('"', '&quot;')}"></label>
+              <div class="flag-buttons">
+                ${mealFlagButton(row, "meal_eg", "EG")}
+                ${mealFlagButton(row, "meal_mr", "MR")}
+              </div>
+            </div>
+          </td>
+        </tr>
+      `;
+    };
+
+    const provenance = (row) => {
+      const statement = row.source.statement || {};
+      const receipt = row.source.receipt || {};
+      const match = row.source.match || {};
+      return `
+        <div class="source">Statement: ${statement.supplier_raw || "-"} | ${statement.local_amount ?? "-"} ${statement.local_currency || ""}</div>
+        <div class="source">Receipt: ${receipt.extracted_supplier || "-"} | ${receipt.extracted_local_amount ?? "-"} ${receipt.extracted_currency || ""}</div>
+        <div class="source">Match: ${match.confidence || "-"} | ${match.match_method || "-"}</div>
+      `;
+    };
+
+    const render = (session) => {
+      currentSession = session;
+      document.getElementById("statementId").value = session.statement_import_id;
+      document.getElementById("sessionStatus").textContent = `Session ${session.id} | ${session.status}${session.snapshot_hash ? " | snapshot " + session.snapshot_hash.slice(0, 10) : ""}`;
+      if (session.status === "confirmed") {
+        setReviewNotice("Review data is confirmed. If any row is edited, reconfirm before generating another report package.", "success");
+      } else {
+        setReviewNotice("Draft review data is not confirmed. Confirm reviewed data before generating a report package.", "");
+      }
+      document.getElementById("rows").innerHTML = session.rows.map(row => `
+        <tr>
+          <td><span class="pill ${row.status}">${row.status}</span></td>
+          <td>
+            <label><input data-attention="${row.id}" type="checkbox" ${row.attention_required ? "checked" : ""}> Flag</label>
+            <div class="issue">${row.attention_note || ""}</div>
+          </td>
+          <td>${field(row, "transaction_date", "date")}</td>
+          <td>${field(row, "supplier")}</td>
+          <td>${field(row, "amount", "number")}</td>
+          <td>${field(row, "currency")}</td>
+          <td>${select(row, "business_or_personal", ["", "Business", "Personal"])}</td>
+          <td>${categorySelect(row)}</td>
+          <td>${bucketSelect(row)}</td>
+          <td>${provenance(row)}</td>
+          <td>
+            <button data-save="${row.id}">Save</button>
+          </td>
+        </tr>
+        ${airTravelDetail(row)}
+        ${mealEntertainmentDetail(row)}
+      `).join("");
+    };
+
+    const load = async () => {
+      const statementId = document.getElementById("statementId").value;
+      render(await api(`/reviews/report/${statementId}`));
+    };
+
+    const loadLatest = async () => {
+      setReviewNotice("Loading latest statement import...");
+      try {
+        const statement = await api("/statements/latest");
+        document.getElementById("statementId").value = statement.id;
+        await load();
+      } catch (error) {
+        currentSession = null;
+        document.getElementById("rows").innerHTML = "";
+        document.getElementById("sessionStatus").textContent = "";
+        setReviewNotice("No statement import is available yet. Import a statement, or enter a statement id manually and load it.", "error");
+      }
+    };
+
+    const saveRow = async (rowId) => {
+      const fields = {};
+      document.querySelectorAll(`[data-row="${rowId}"]`).forEach(input => {
+        if (!input.dataset.key) return; // skip category selector (no data-key)
+        if (input.type === "number") {
+          fields[input.dataset.key] = input.value === "" ? null : Number(input.value);
+        } else if (input.type === "hidden" && ["meal_eg", "meal_mr"].includes(input.dataset.key)) {
+          fields[input.dataset.key] = input.value === "true";
+        } else {
+          fields[input.dataset.key] = input.value;
+        }
+      });
+      const updated = await api(`/reviews/report/rows/${rowId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          fields,
+        }),
+      });
+      const row = currentSession.rows.find(item => item.id === rowId);
+      Object.assign(row, updated);
+      currentSession.status = "draft";
+      currentSession.snapshot_hash = null;
+      render(currentSession);
+      setReportStatus("Saved edit. This session now requires reconfirmation before report generation.", "error");
+    };
+
+    const bulkApply = async () => {
+      if (!currentSession) return;
+      const business = document.getElementById("bulkBusiness").value;
+      const bucket = document.getElementById("bulkBucket").value;
+      if (!bucket) {
+        setReportStatus("Enter a bucket before applying bulk classification.", "error");
+        return;
+      }
+      const result = await api(`/reviews/report/${currentSession.id}/bulk-update`, {
+        method: "POST",
+        body: JSON.stringify({
+          scope: document.getElementById("bulkScope").value,
+          fields: {
+            business_or_personal: business,
+            report_bucket: bucket,
+          },
+        }),
+      });
+      await load();
+      setReportStatus(`Applied classification to ${result.updated_rows} rows. ${result.remaining_attention_rows} rows remain flagged. Review, then confirm.`, result.remaining_attention_rows ? "error" : "success");
+    };
+
+    document.getElementById("loadBtn").addEventListener("click", load);
+    const renderBulkCategory = () => {
+      document.getElementById("bulkCategory").innerHTML =
+        ["", ...CATEGORY_KEYS].map(item => `<option value="${item}">${item || "(any)"}</option>`).join("");
+    };
+    const renderBulkBucket = (category) => {
+      const options = category ? bucketsForCategory(category) : REPORT_BUCKETS;
+      const defaultPick = options.includes("Other") ? "Other" : options[0] || "";
+      document.getElementById("bulkBucket").innerHTML =
+        options.map(item => `<option value="${item}" ${item === defaultPick ? "selected" : ""}>${item}</option>`).join("");
+    };
+    renderBulkCategory();
+    renderBulkBucket("");
+    document.getElementById("bulkCategory").addEventListener("change", event => {
+      renderBulkBucket(event.target.value);
+    });
+    document.getElementById("bulkApplyBtn").addEventListener("click", () => {
+      bulkApply().catch(error => setReportStatus(error.message, "error"));
+    });
+    document.getElementById("confirmBtn").addEventListener("click", async () => {
+      if (!currentSession) return;
+      try {
+        render(await api(`/reviews/report/${currentSession.id}/confirm`, {
+          method: "POST",
+          body: JSON.stringify({ confirmed_by_label: "web-review-table" }),
+        }));
+        setReportStatus("Review confirmed. Report generation is now allowed for this snapshot.", "success");
+      } catch (error) {
+        setReportStatus(error.message, "error");
+      }
+    });
+    document.getElementById("validateBtn").addEventListener("click", async () => {
+      if (!currentSession) return;
+      setReportStatus("Validating report readiness...");
+      try {
+        renderValidation(await api(`/reports/validate/${currentSession.statement_import_id}`));
+      } catch (error) {
+        setReportStatus(error.message, "error");
+      }
+    });
+    document.getElementById("generateBtn").addEventListener("click", async () => {
+      if (!currentSession) return;
+      setReportStatus("Generating report package...");
+      try {
+        const run = await api("/reports/generate", {
+          method: "POST",
+          body: JSON.stringify({ statement_import_id: currentSession.statement_import_id }),
+        });
+        const downloadUrl = `/reports/${run.id}/download`;
+        setReportStatus(`Report package generated. <a href="${downloadUrl}">Download package</a>`, "success", true);
+        window.location.href = downloadUrl;
+      } catch (error) {
+        setReportStatus(error.message, "error");
+      }
+    });
+    document.getElementById("rows").addEventListener("click", event => {
+      const rowId = Number(event.target.dataset.save);
+      if (rowId) saveRow(rowId).catch(error => setReportStatus(error.message, "error"));
+    });
+    // Toggle the Air Travel Reconciliation detail row under a specific row based on its bucket.
+    const toggleAirDetail = (rowId, bucket) => {
+      const detailRow = document.querySelector(`tr.air-detail[data-air-row="${rowId}"]`);
+      if (!detailRow) return;
+      detailRow.style.display = bucket === AIRFARE_BUCKET ? "" : "none";
+    };
+    const toggleAirReturnDate = (rowId, tripType) => {
+      const returnDate = document.querySelector(`[data-air-return-row="${rowId}"]`);
+      if (!returnDate) return;
+      returnDate.classList.toggle("is-hidden", tripType !== "RT");
+    };
+    const syncAirReturnDateMin = (rowId, travelDate) => {
+      const input = document.querySelector(`input[data-row="${rowId}"][data-key="air_travel_return_date"]`);
+      if (!input) return;
+      input.min = travelDate || "";
+      if (travelDate && input.value && input.value < travelDate) {
+        input.value = travelDate;
+      }
+    };
+    const toggleMealDetail = (rowId, bucket) => {
+      const detailRow = document.querySelector(`tr.meal-detail[data-meal-row="${rowId}"]`);
+      if (!detailRow) return;
+      detailRow.style.display = MEAL_BUCKETS.includes(bucket) ? "" : "none";
+    };
+    // When a row's Category dropdown changes, repopulate that row's Bucket dropdown
+    // to only show buckets in the chosen category. The selected bucket stays if still valid.
+    document.getElementById("rows").addEventListener("change", event => {
+      const rowId = Number(event.target.dataset.row);
+      if (!rowId) return;
+      if (event.target.dataset.category === "1") {
+        const bucketSelectEl = document.querySelector(`select[data-row="${rowId}"][data-key="report_bucket"]`);
+        if (!bucketSelectEl) return;
+        const category = event.target.value;
+        const options = ["", ...(category ? bucketsForCategory(category) : REPORT_BUCKETS)];
+        const prev = bucketSelectEl.value;
+        const keepPrev = prev && options.includes(prev);
+        bucketSelectEl.innerHTML = options.map(item => `<option value="${item}" ${keepPrev && item === prev ? "selected" : ""}>${item || "-"}</option>`).join("");
+        if (!keepPrev) bucketSelectEl.value = "";
+        toggleAirDetail(rowId, bucketSelectEl.value);
+        toggleMealDetail(rowId, bucketSelectEl.value);
+        return;
+      }
+      if (event.target.dataset.key === "report_bucket") {
+        toggleAirDetail(rowId, event.target.value);
+        toggleMealDetail(rowId, event.target.value);
+      }
+      if (event.target.dataset.key === "air_travel_rt_or_oneway") {
+        toggleAirReturnDate(rowId, event.target.value);
+      }
+      if (event.target.dataset.key === "air_travel_date") {
+        syncAirReturnDateMin(rowId, event.target.value);
+      }
+    });
+    document.getElementById("rows").addEventListener("click", event => {
+      if (!event.target.dataset.mealFlag) return;
+      const button = event.target;
+      const rowId = button.dataset.row;
+      const key = button.dataset.mealFlag;
+      const input = document.querySelector(`input[data-row="${rowId}"][data-key="${key}"]`);
+      const active = !(input.value === "true");
+      input.value = active ? "true" : "false";
+      button.classList.toggle("active", active);
+    });
+    loadLatest().catch(error => {
+      document.getElementById("sessionStatus").textContent = error.message;
+    });
+  </script>
+</body>
+</html>

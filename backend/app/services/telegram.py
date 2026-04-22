@@ -11,9 +11,10 @@ from app.config import get_settings
 from app.models import AppUser, ReceiptDocument
 from app.services.clarifications import (
     answer_question,
-    ensure_initial_receipt_question,
+    ensure_receipt_review_questions,
     next_open_question_for_user,
 )
+from app.services.receipt_extraction import apply_receipt_extraction
 from app.services.storage import save_bytes
 
 
@@ -171,9 +172,18 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     session.commit()
     session.refresh(receipt)
 
-    questions = ensure_initial_receipt_question(session, receipt, user.id)
+    extraction = apply_receipt_extraction(session, receipt)
+    questions = ensure_receipt_review_questions(session, receipt, user.id)
     if questions:
-        client.send_message(chat_id, questions[0].question_text)
+        if extraction.confidence and extraction.confidence >= 0.6:
+            summary = (
+                f"I read: {receipt.extracted_date or '?'} | "
+                f"{receipt.extracted_supplier or '?'} | "
+                f"{receipt.extracted_local_amount or '?'} {receipt.extracted_currency or ''}."
+            )
+            client.send_message(chat_id, f"{summary}\n{questions[0].question_text}")
+        else:
+            client.send_message(chat_id, questions[0].question_text)
     else:
         client.send_message(chat_id, "Receipt saved.")
 

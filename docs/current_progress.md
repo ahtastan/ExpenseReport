@@ -126,9 +126,17 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Authentication/admin web UI.
 
 ## Recommended Next Step
-Continue UI-only hardening by adding an operator-facing invalid-statement upload message in the Import Statement modal, only if a live smoke or manual check shows the current generic error is too vague.
 
-Strict next-model handoff: `docs/IMPORT_STATEMENT_UPLOAD_HANDOFF_2026-04-23.md`.
+**Validation complete for Telegram airport/payment-slip receipt — root cause isolated and fixed (ops-only, no code changed).**
 
-Immediate commands are listed in that handoff. The short version is:
-- Keep Import Statement narrow. Do not change statement import parsing, Add Statement, selected-visible bulk behavior, confirmation, snapshots, or report generation unless a focused UI smoke exposes a path-specific mismatch.
+Handoff with full validation record: `docs/TELEGRAM_AIRPORT_RECEIPT_VALIDATION_HANDOFF_2026-04-24.md`.
+
+Summary:
+- Root cause was an invalid placeholder `OPENAI_API_KEY` in `/etc/dcexpense/env` causing 401 on every vision call since deploy. ISLEM prompt / local-date fallback / non-answer guard patches were all correct but had never run.
+- Key replaced on VPS. Vision OCR verified working on receipt 8 (airport slip) at confidence 1.0 via internal rerun endpoint.
+- 22 stale interleaved `ClarificationQuestion` rows closed. `open_left = 0`.
+- Live Telegram end-to-end resend verified: bot reply `I read: 2025-08-26 | IST Sey | 750.0 TRY.` then asked for business reason (correct next step for Business classification).
+
+Next:
+1. Rotate `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` (both were exposed during troubleshooting), then re-register the webhook via `scripts/register_telegram_webhook.py`.
+2. Narrow follow-up code fix (separate step): `_parse_merchant` in `backend/app/services/receipt_extraction.py` should skip filename stems matching the literal `telegram_photo[_N]` pattern so the vision-extracted merchant is used for Telegram photo uploads that have no human filename.

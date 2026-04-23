@@ -1,6 +1,3 @@
-import base64
-import json
-import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -9,6 +6,7 @@ from pathlib import Path
 from sqlmodel import Session
 
 from app.models import ReceiptDocument
+from app.services import model_router
 
 
 AMOUNT_RE = re.compile(
@@ -118,83 +116,28 @@ def _source_text(receipt: ReceiptDocument) -> str:
     return " | ".join(part for part in parts if part)
 
 
-_VISION_PROMPT = (
-    "You are an expense receipt parser. Extract the following fields from the receipt image and return ONLY a JSON object with exactly these keys:\n"
-    "  date (ISO 8601 string YYYY-MM-DD or null),\n"
-    "  supplier (string or null),\n"
-    "  amount (number or null),\n"
-    "  currency (3-letter ISO code string or null),\n"
-    "  business_or_personal (\"Business\" or \"Personal\" or null).\n"
-    "Return only the JSON object, no other text."
-)
-
-_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-_PDF_EXTENSION = ".pdf"
-
-
-def _vision_extract(storage_path: str) -> dict | None:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None
-
-    path = Path(storage_path)
-    if not path.exists():
-        return None
-
-    suffix = path.suffix.lower()
-    if suffix not in _IMAGE_EXTENSIONS:
-        return None
-
-    try:
-        import anthropic  # deferred import — optional dependency
-
-        raw = path.read_bytes()
-        b64 = base64.standard_b64encode(raw).decode()
-        media_type_map = {
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".webp": "image/webp",
-            ".gif": "image/gif",
-        }
-        media_type = media_type_map.get(suffix, "image/jpeg")
-
-        client = anthropic.Anthropic(api_key=api_key)
-        message = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=256,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                        {"type": "text", "text": _VISION_PROMPT},
-                    ],
-                }
-            ],
-        )
-        text = message.content[0].text.strip()
-        # Strip markdown code fences if present
-        if text.startswith("```"):
-            text = re.sub(r"^```[a-z]*\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-        return json.loads(text)
-    except Exception:
-        return None
-
-
 def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
     text = _source_text(receipt)
     notes: list[str] = []
     if not text:
         notes.append("No caption, original file name, or storage file name was available to parse.")
 
-    # Try vision extraction first when a stored image is available and API key is set
+    # Stage 1: deterministic parse (regex over caption/filename).
+    det_date = _parse_date(text)
+    det_amount, det_currency = _parse_amount(text)
+    det_supplier = _parse_merchant(text, receipt.original_file_name)
+    det_bp = _parse_business_or_personal(text)
+
+    # Stage 2: escalate to the staged vision pipeline only when critical fields
+    # are still missing. The router tries mini first and escalates to the full
+    # model only when the mini attempt is invalid/incomplete (cost-controlled).
     vision: dict | None = None
-    if receipt.storage_path:
-        vision = _vision_extract(receipt.storage_path)
-        if vision:
-            notes.append("Vision extraction succeeded.")
+    needs_vision = any(value is None for value in (det_date, det_amount, det_supplier))
+    if needs_vision and receipt.storage_path:
+        vision_result = model_router.vision_extract(receipt.storage_path)
+        if vision_result is not None:
+            vision = vision_result.fields
+            notes.extend(vision_result.notes)
 
     def _vision_date() -> date | None:
         raw = (vision or {}).get("date")
@@ -205,16 +148,18 @@ def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
         except ValueError:
             return None
 
-    extracted_date = receipt.extracted_date or _vision_date() or _parse_date(text)
+    # Merge priority: previously-stored value > deterministic > vision.
+    # Deterministic wins over vision because it reflects ground truth from the
+    # upload metadata that the user typed; vision fills only the gaps.
+    extracted_date = receipt.extracted_date or det_date or _vision_date()
     vision_amount = (vision or {}).get("amount")
     vision_currency = (vision or {}).get("currency")
-    det_amount, det_currency = _parse_amount(text)
-    extracted_amount = vision_amount if vision_amount is not None else det_amount
-    extracted_currency = vision_currency or det_currency
+    extracted_amount = det_amount if det_amount is not None else vision_amount
+    extracted_currency = det_currency or vision_currency
     vision_supplier = (vision or {}).get("supplier")
-    extracted_supplier = receipt.extracted_supplier or vision_supplier or _parse_merchant(text, receipt.original_file_name)
+    extracted_supplier = receipt.extracted_supplier or det_supplier or vision_supplier
     vision_bp = (vision or {}).get("business_or_personal")
-    business_or_personal = receipt.business_or_personal or vision_bp or _parse_business_or_personal(text)
+    business_or_personal = receipt.business_or_personal or det_bp or vision_bp
 
     if receipt.extracted_local_amount is not None:
         extracted_amount = receipt.extracted_local_amount

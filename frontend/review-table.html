@@ -730,10 +730,6 @@ function AirTravelExpanded({ row, onSave }) {
   const isRoundTrip = String(f.atRt||'').trim().toLowerCase() === 'rt';
   function save() {
     setErr('');
-    if (isRoundTrip && f.atDate && f.atReturn && f.atReturn < f.atDate) {
-      setErr('Return date cannot be before travel date.');
-      return;
-    }
     onSave(row.id, f);
   }
   const field = (label, content) => (

@@ -137,15 +137,6 @@ def _review_snapshot_issues(session: Session, statement_import_id: int) -> tuple
                     **_air_travel_issue_context(row, travel_date, return_date),
                 )
             )
-        elif travel_date and return_date and return_date < travel_date:
-            issues.append(
-                ValidationIssue(
-                    severity="error",
-                    code="air_travel_return_date_before_travel_date",
-                    message="An RT air travel row has a return date before its travel date.",
-                    **_air_travel_issue_context(row, travel_date, return_date),
-                )
-            )
         if tx_date in first7:
             page_counts["Week 1A"] += 1
         elif tx_date in next7:

@@ -85,6 +85,7 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Category dropdown bug fixed: selecting a parent category (Hotel & Travel / Meals & Entertainment / Air Travel / Other) now updates local React state only via `handleLocalUpdate`, instead of calling the API with `{report_bucket:null}` and losing the selection. The bucket dropdown repopulates with the correct child options; the API is called only when the user picks a specific bucket.
 - Bulk-classify was re-added to the React SPA review queue. The toolbar can apply B/P and/or a category-filtered bucket to flagged rows or all rows through the existing `POST /reviews/report/{review_session_id}/bulk-update` endpoint, then reloads the current statement/session.
 - Validation issue rows now render API-provided row context chips (`Row #`, supplier, transaction date, and bucket), so Air Travel RT date errors point to the exact review row to fix.
+- Return date earlier than travel date is now intentionally allowed: the client-side guard in `AirTravelExpanded.save()` was removed and the backend no longer emits `air_travel_return_date_before_travel_date`. The RT missing-return-date validation error is still enforced. Smoke (`backend/tests/smoke_air_travel.py`) now asserts the early-return scenario produces zero validation issues.
 
 ## Not Implemented Yet
 - Personal expense report categories, including Personal Car mileage reimbursement, are intentionally out of scope for now.
@@ -95,7 +96,7 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Authentication/admin web UI.
 
 ## Recommended Next Step
-Live browser smoke now passes in the isolated test path. The next narrow app/data step is to correct live review row `2`: supplier `Istanbul Oht-4 Dogu Sh`, bucket `Airfare/Bus/Ferry/Other`, `RT`, travel date `2026-05-09`, return date `2026-03-30`. Correct that row's return date or classify it as one-way, then reconfirm and re-run validation.
+Live browser smoke now passes in the isolated test path. Because the return-date-before-travel-date restriction has been lifted at the user's request, the live row 2 (`Istanbul Oht-4 Dogu Sh`, RT, travel `2026-05-09`, return `2026-03-30`) no longer produces a validation error. Re-run `GET /reports/validate/2` to confirm and proceed to Confirm reviewed data + Generate report package.
 
 **Live browser smoke pass** — start the backend, open `/review`, log in as `ahmet/demo`, and verify:
 1. Review queue loads rows from the latest statement import.

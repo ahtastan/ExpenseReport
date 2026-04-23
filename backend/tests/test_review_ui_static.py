@@ -21,8 +21,9 @@ def main() -> None:
     assert "air_travel_return_date" in html
     assert "Return date" in html
     assert "flexWrap:'nowrap'" in html
-    assert "Return date cannot be before travel date." in html
-    assert "f.atReturn < f.atDate" in html
+    # Return date earlier than travel date is intentionally allowed now.
+    assert "Return date cannot be before travel date." not in html
+    assert "f.atReturn < f.atDate" not in html
     assert 'data-testid="air-travel-panel"' in html
 
     print("review_ui_static_tests=passed")

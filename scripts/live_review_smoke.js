@@ -396,7 +396,8 @@ async function smokeRawCdp() {
       return true;
     })()
   `);
-  await waitFor("document.body.innerText.includes('Return date cannot be before travel date.')");
+  // Return date earlier than travel date is intentionally allowed; save must succeed without the old inline error.
+  await waitFor("!document.body.innerText.includes('Return date cannot be before travel date.')");
 
   await evalJs("window.__smoke.clickText('Validation', 'button')");
   await waitFor("document.body.innerText.includes('Report Validation')");

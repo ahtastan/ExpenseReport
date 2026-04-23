@@ -139,7 +139,16 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
             if created:
                 client.send_message(chat_id, created[0].question_text)
             else:
-                client.send_message(chat_id, "Got it. I saved that clarification.")
+                # No new question was created by answer_question (e.g. the
+                # follow-up such as `attendees` already existed from the
+                # initial seeding). Ask the next still-open question so the
+                # user can keep progressing through the queue instead of
+                # getting stuck after a single "Got it".
+                follow_up = next_open_question_for_user(session, user.id)
+                if follow_up:
+                    client.send_message(chat_id, follow_up.question_text)
+                else:
+                    client.send_message(chat_id, "Got it. I saved that clarification.")
             return {
                 "ok": True,
                 "action": "answered_clarification",

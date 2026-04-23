@@ -98,7 +98,9 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Authentication/admin web UI.
 
 ## Recommended Next Step
-Live browser smoke now passes in the isolated test path. Because the return-date-before-travel-date restriction has been lifted at the user's request, the live row 2 (`Istanbul Oht-4 Dogu Sh`, RT, travel `2026-05-09`, return `2026-03-30`) no longer produces a validation error. Re-run `GET /reports/validate/2` to confirm and proceed to Confirm reviewed data + Generate report package.
+Wire `SYNTHESIS_MODEL` (default `gpt-5.4`) into the report package generator. Emit a `summary.md` alongside `expense_report_part_*.xlsx` and `annotated_receipts.pdf` with trip purpose, totals by bucket, and flagged anomalies. Narrow scope: one synthesis call per package, no changes to the Excel generator. Deferred: real-data OPENAI_API_KEY smoke for both OCR escalation and match disambiguation.
+
+See `docs/LLM_MATCHING_HANDOFF_2026-04-23.md` for the most recent handoff detail.
 
 **Live browser smoke pass** — start the backend, open `/review`, log in as `ahmet/demo`, and verify:
 1. Review queue loads rows from the latest statement import.

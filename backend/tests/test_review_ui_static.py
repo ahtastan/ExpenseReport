@@ -8,6 +8,7 @@ def main() -> None:
     assert "bulk-update" in html
     assert "setBulkScope" in html
     assert "attention_required" in html
+    assert "visible row" in html
     assert "All rows" in html
     assert "Apply to" in html
     assert "issue.review_row_id" in html

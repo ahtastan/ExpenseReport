@@ -140,6 +140,17 @@ async function smokeBrowser() {
   await page.getByRole('button', { name: /review queue/i }).click();
   await page.getByText('Bulk classify').waitFor({ state: 'visible', timeout: 15000 });
   await page.getByText('Aat Istanbul Airport S').waitFor({ state: 'visible', timeout: 15000 });
+  await page.getByRole('button', { name: /confirmed/i }).click();
+  await page.getByText('No rows match this filter.').waitFor({ state: 'visible', timeout: 15000 });
+  await dropdownByText(page, 'Scope', 'selected (visible)');
+  await page.getByText('0 visible rows').waitFor({ state: 'visible', timeout: 15000 });
+  const emptyApplyButton = page.getByRole('button', { name: /apply to visible/i });
+  await emptyApplyButton.waitFor({ state: 'visible', timeout: 15000 });
+  if (!(await emptyApplyButton.isDisabled())) {
+    throw new Error('Apply to visible should be disabled when no rows are visible');
+  }
+  await page.getByRole('button', { name: /All/ }).first().click();
+  await dropdownByText(page, 'selected (visible)', 'attention_required');
 
   await page.getByText('Aat Istanbul Airport S').click();
   await page.getByText('Air Travel Reconciliation').waitFor({ state: 'visible', timeout: 15000 });
@@ -341,6 +352,20 @@ async function smokeRawCdp() {
   await waitFor("document.body.innerText.includes('Review Queue')");
   await evalJs("window.__smoke.clickText('Review Queue', 'button')");
   await waitFor("document.body.innerText.includes('Bulk classify') && document.body.innerText.includes('Aat Istanbul Airport S')");
+  await evalJs("window.__smoke.clickText('Confirmed', 'button')");
+  await waitFor("document.body.innerText.includes('No rows match this filter.')");
+  await evalJs("window.__smoke.pickToolbarDropdown(0, 'selected (visible)')");
+  await waitFor("document.body.innerText.includes('0 visible rows')");
+  const applyDisabled = await evalJs(`(() => {
+    const button = Array.from(document.querySelectorAll('button')).find(btn => /Apply to visible/i.test((btn.textContent || '').trim()));
+    if (!button) throw new Error('Missing apply button');
+    return button.disabled === true;
+  })()`);
+  if (!applyDisabled) {
+    throw new Error('Apply to visible should be disabled when no rows are visible');
+  }
+  await evalJs("window.__smoke.clickText('All', 'button')");
+  await evalJs("window.__smoke.pickToolbarDropdown(0, 'attention_required')");
   await evalJs("window.__smoke.pickToolbarDropdown(1, 'business')");
   await evalJs("window.__smoke.pickToolbarDropdown(2, 'Air Travel')");
   await evalJs("window.__smoke.pickToolbarDropdown(3, 'Airfare/Bus/Ferry/Other')");

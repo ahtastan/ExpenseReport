@@ -105,6 +105,9 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Telegram clarification handling now also treats simple chatter/non-answers such as `hello` as non-answers for receipt date, amount, and business/personal prompts. The original question remains open and a helper prompt is returned, instead of consuming the chatter as a failed answer and advancing to unrelated retry prompts. Regression: `backend/tests/test_clarification_non_answer.py`.
 - The OCR vision prompt now also calls out Turkish payment-slip `ISLEM` transaction date lines such as `DD/MM/YYYY - HH:MM`, so airport card slips can use that value as the receipt date.
 - The React SPA bulk-classify toolbar now includes a `selected (visible)` scope option alongside `attention_required` and `all`.
+- The React SPA bulk-classify toolbar now shows the number of visible rows when `selected (visible)` is active and disables the apply action when nothing is visible.
+- Live browser smoke on `/review` passed after the visible-row count change; it loaded the review queue, bulk-classified through the toolbar, and reached validation successfully.
+- Live browser smoke also verified the empty-filter case: `selected (visible)` shows `0 visible rows` and keeps Apply disabled when no rows are visible.
 - When the `selected` scope is chosen, the frontend snapshots the IDs of the currently visible filtered rows and sends them as `row_ids` in the `POST /reviews/report/{review_session_id}/bulk-update` payload.
 - The backend `bulk-update` route and service now accept the `selected` scope and `row_ids: list[int]`, applying the updates only to the specified row IDs. It explicitly rejects the `selected` scope if `row_ids` is empty or missing.
 
@@ -119,15 +122,7 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 ## Recommended Next Step
 Deploy the local Telegram OCR/clarification fixes to the VPS, restart `dcexpense`, and resend the receipt images that previously asked for date/amount/business-personal despite visible values.
 
-Strict next-model handoff: `docs/REVIEW_BULK_SELECTED_SCOPE_HANDOFF_FINAL_2026-04-23.md`.
+Strict next-model handoff: `docs/REVIEW_BULK_SELECTED_SCOPE_HIGHLIGHT_HANDOFF_2026-04-23.md`.
 
 Immediate commands are listed in that handoff. The short version is:
-- Production check: copy `backend/app/services/clarifications.py` and `backend/app/services/model_router.py` to `/opt/dcexpense/app/backend/app/services/`, restart `dcexpense`, verify `/health`, check Telegram webhook status, and resend the Onder/airport receipts.
-
-**Live browser smoke pass** — start the backend, open `/review`, log in as `ahmet/demo`, and verify:
-1. Review queue loads rows from the latest statement import.
-2. Filter the queue to `Needs review` or `⚑ Attention`.
-3. Use the bulk-classify toolbar with the new `selected (visible)` scope.
-4. Verify only the filtered visible rows are updated.
-5. Click `Validate before generate` — confirm messages identify the exact row/date/supplier/bucket.
-Current live validation error: review row `2`, supplier `Istanbul Oht-4 Dogu Sh`, bucket `Airfare/Bus/Ferry/Other`, has `RT`, travel date `2026-05-09`, and return date `2026-03-30`. Correct that row's return date or classify it as one-way, then reconfirm and re-run validation.
+- Browser check: start the backend, open `/review`, log in as `ahmet/demo`, switch the bulk scope to `selected (visible)`, and verify the new visible-row count appears and the Apply button stays disabled when the filtered set is empty.

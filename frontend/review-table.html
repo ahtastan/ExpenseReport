@@ -1044,7 +1044,8 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, o
   const colH = (label, extra={}) => <div style={{ fontSize:10, fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'0.05em', ...extra }}>{label}</div>;
   const bulkCategories = Object.keys(categoryMap||{}).filter(k => (categoryMap[k]||[]).length > 0);
   const bulkBuckets = bulkCategory ? (categoryMap[bulkCategory]||[]) : [];
-  const bulkDisabled = bulkBusy || (!bulkBp && !bulkBucket);
+  const visibleScopeCount = filtered.length;
+  const bulkDisabled = bulkBusy || (!bulkBp && !bulkBucket) || (bulkScope === 'selected (visible)' && visibleScopeCount === 0);
 
   return (
     <div style={{ display:'flex', flexDirection:'column', height:'100%', position:'relative' }}>
@@ -1085,6 +1086,11 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, o
           placeholder="Category" width={154}/>
         <Dropdown value={bulkBucket} options={bulkBuckets} onChange={setBulkBucket}
           placeholder={bulkCategory?'Bucket':'Pick category'} width={176} danger={!!bulkCategory&&!bulkBucket}/>
+        {bulkScope === 'selected (visible)' && (
+          <span style={{ fontSize:11, color:'var(--text-3)', padding:'0 4px' }}>
+            {visibleScopeCount} visible row{visibleScopeCount === 1 ? '' : 's'}
+          </span>
+        )}
         <button onClick={handleBulkApply} disabled={bulkDisabled}
           style={{ padding:'6px 12px', borderRadius:5, border:'none',
             background:bulkDisabled?'var(--surface-2)':'var(--accent)',

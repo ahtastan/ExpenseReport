@@ -352,6 +352,54 @@ async function smokeRawCdp() {
   await waitFor("document.body.innerText.includes('Review Queue')");
   await evalJs("window.__smoke.clickText('Review Queue', 'button')");
   await waitFor("document.body.innerText.includes('Bulk classify') && document.body.innerText.includes('Aat Istanbul Airport S')");
+  await evalJs(`
+    (async () => {
+      window.__smoke.clickText('Add Statement', 'button');
+      const started = Date.now();
+      while (!document.body.innerText.includes('Add Statement Entry')) {
+        if (Date.now() - started > 5000) throw new Error('Add Statement modal did not open');
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      const input = document.querySelector('input[type="file"][accept*="image"]');
+      if (!input) throw new Error('Missing Add Statement file input');
+      const file = new File(['manual smoke receipt'], 'merchant=Migros_total_419.58TRY_2026-03-11.jpg', { type: 'image/jpeg' });
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      window.__smoke.clickText('Extract', 'button');
+      return true;
+    })()
+  `);
+  await waitFor("document.body.innerText.includes('Extraction needs review') || document.body.innerText.includes('Extraction filled the statement fields')", 20000);
+  const addStatementPrefill = await evalJs(`(() => {
+    const buttons = Array.from(document.querySelectorAll('button'));
+    const saveButton = buttons.find(btn => /Save statement entry/i.test((btn.textContent || '').trim()));
+    if (!saveButton) throw new Error('Missing Save statement entry button');
+    const modal = saveButton.closest('div[style*="background"]') || document.body;
+    const date = Array.from(document.querySelectorAll('input[type="date"]')).find(input => input.value === '2026-03-11');
+    const values = Array.from(document.querySelectorAll('input')).map(input => input.value);
+    return {
+      hasDate: !!date,
+      hasSupplier: values.includes('Migros'),
+      hasAmount: values.includes('419.58'),
+      hasCurrency: values.includes('TRY'),
+    };
+  })()`);
+  if (!addStatementPrefill.hasDate || !addStatementPrefill.hasSupplier || !addStatementPrefill.hasAmount || !addStatementPrefill.hasCurrency) {
+    throw new Error('Add Statement fields were not prefilled: ' + JSON.stringify(addStatementPrefill));
+  }
+  await evalJs(`(() => {
+    const inputs = Array.from(document.querySelectorAll('input'));
+    const supplier = inputs.find(input => input.value === 'Migros');
+    const amount = inputs.find(input => input.value === '419.58');
+    if (!supplier || !amount) throw new Error('Missing editable Add Statement fields');
+    window.__smoke.setInput(supplier, 'Migros Market');
+    window.__smoke.setInput(amount, '420.00');
+    window.__smoke.clickText('Save statement entry', 'button');
+    return true;
+  })()`);
+  await waitFor("document.body.innerText.includes('Migros Market')", 20000);
   await evalJs("window.__smoke.clickText('Confirmed', 'button')");
   await waitFor("document.body.innerText.includes('No rows match this filter.')");
   await evalJs("window.__smoke.pickToolbarDropdown(0, 'selected (visible)')");

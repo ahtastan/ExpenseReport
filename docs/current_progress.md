@@ -110,6 +110,10 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Live browser smoke also verified the empty-filter case: `selected (visible)` shows `0 visible rows` and keeps Apply disabled when no rows are visible.
 - When the `selected` scope is chosen, the frontend snapshots the IDs of the currently visible filtered rows and sends them as `row_ids` in the `POST /reviews/report/{review_session_id}/bulk-update` payload.
 - The backend `bulk-update` route and service now accept the `selected` scope and `row_ids: list[int]`, applying the updates only to the specified row IDs. It explicitly rejects the `selected` scope if `row_ids` is empty or missing.
+- `/review` now has an `Add Statement` action for receipt-assisted manual statement entries. The operator uploads a receipt, the UI calls the existing receipt extraction pipeline through `POST /statements/manual/receipt`, pre-fills editable transaction date/supplier/amount/currency/business-purpose fields, then saves one manual `StatementTransaction` through `POST /statements/manual/transactions`.
+- Manual statement entry reuses statement-led review architecture: the saved transaction has `source_kind="manual"`, an uploaded receipt is linked with an approved `manual_statement_entry` match when present, and the current draft review session is refreshed so the row appears without Excel import. Confirmed sessions are left frozen; adding a manual row after confirmation creates a new draft review session for that statement import.
+- Manual statement entry regression passed: upload/extract creates a receipt draft from deterministic extraction, save creates one statement transaction, approved manual match, and review row with linked receipt data. Static UI regression still verifies selected-visible toolbar text and the new Add Statement endpoints.
+- Live browser smoke now covers the Add Statement modal: it opens `/review`, uploads a deterministic filename receipt, verifies extracted date/supplier/amount/currency prefill, edits supplier and amount, saves, and verifies the new manual row appears before continuing the existing bulk/validation smoke path.
 
 ## Not Implemented Yet
 - Personal expense report categories, including Personal Car mileage reimbursement, are intentionally out of scope for now.
@@ -122,7 +126,7 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 ## Recommended Next Step
 Deploy the local Telegram OCR/clarification fixes to the VPS, restart `dcexpense`, and resend the receipt images that previously asked for date/amount/business-personal despite visible values.
 
-Strict next-model handoff: `docs/REVIEW_BULK_SELECTED_SCOPE_HIGHLIGHT_HANDOFF_2026-04-23.md`.
+Strict next-model handoff: `docs/MANUAL_STATEMENT_LIVE_SMOKE_HANDOFF_2026-04-23.md`.
 
 Immediate commands are listed in that handoff. The short version is:
-- Browser check: start the backend, open `/review`, log in as `ahmet/demo`, switch the bulk scope to `selected (visible)`, and verify the new visible-row count appears and the Apply button stays disabled when the filtered set is empty.
+- Keep Add Statement narrow. If continuing, only add a dedicated browser assertion for PDF/manual validation states or stop and move to the next requested UI slice.

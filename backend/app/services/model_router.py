@@ -71,6 +71,16 @@ class VisionResult:
     notes: list[str]
 
 
+@dataclass(frozen=True)
+class MatchDisambiguation:
+    """Outcome of a matching-model disambiguation call."""
+
+    transaction_id: int | None  # chosen candidate id, or None if model abstained
+    confidence: str  # "high" | "medium" | "low" as judged by the model
+    reasoning: str  # short natural-language rationale (for audit trail)
+    model: str
+
+
 def _count_missing(fields: dict[str, Any]) -> list[str]:
     return [key for key in CRITICAL_FIELDS if not fields.get(key)]
 
@@ -135,6 +145,108 @@ def _call_openai(model: str, media_type: str, b64: str) -> dict[str, Any] | None
 # The concrete call is indirected through this module-level attribute so
 # tests can monkey-patch a fake without reaching into the OpenAI SDK.
 _vision_call = _call_openai
+
+
+_MATCH_PROMPT = (
+    "You are a receipt-to-bank-statement matcher. You will be given a single "
+    "receipt and a list of candidate statement transactions. Pick the single "
+    "best candidate, or abstain if none is plausible.\n\n"
+    "Return ONLY a JSON object with exactly these keys:\n"
+    "  transaction_id (integer id from the candidate list, or null to abstain),\n"
+    "  confidence (\"high\", \"medium\", or \"low\"),\n"
+    "  reasoning (one short sentence explaining the pick).\n"
+    "Do not invent a transaction_id that is not in the candidate list."
+)
+
+
+def _call_openai_text(model: str, prompt: str, payload: str) -> dict[str, Any] | None:
+    """Invoke a text-only OpenAI chat completion and parse a JSON response."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI  # deferred import
+    except Exception:
+        return None
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=model,
+            max_tokens=256,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": payload},
+            ],
+        )
+        content = response.choices[0].message.content or ""
+        return _extract_json(content)
+    except Exception as exc:  # pragma: no cover - depends on live API
+        logger.warning("OpenAI text call failed on %s: %s", model, exc)
+        return None
+
+
+# Indirect text calls the same way vision calls are indirected so tests can
+# substitute a recorder without touching the OpenAI SDK.
+_text_call = _call_openai_text
+
+
+def match_disambiguate(
+    receipt: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> MatchDisambiguation | None:
+    """Ask the matching model to pick the best candidate transaction.
+
+    ``receipt`` and each ``candidates`` entry should be a small dict of the
+    fields relevant to matching (supplier, date, amount, currency, and a
+    transaction id on each candidate). The function validates that the chosen
+    ``transaction_id`` is actually among the candidates and returns ``None``
+    for any invalid or unparseable response.
+    """
+    if not candidates:
+        return None
+
+    candidate_ids = {
+        candidate.get("transaction_id")
+        for candidate in candidates
+        if isinstance(candidate.get("transaction_id"), int)
+    }
+    if not candidate_ids:
+        return None
+
+    payload = json.dumps(
+        {"receipt": receipt, "candidates": candidates},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    result = _text_call(MATCHING_MODEL, _MATCH_PROMPT, payload)
+    if not isinstance(result, dict):
+        return None
+
+    raw_tx = result.get("transaction_id")
+    chosen: int | None
+    if raw_tx is None:
+        chosen = None
+    elif isinstance(raw_tx, int) and raw_tx in candidate_ids:
+        chosen = raw_tx
+    else:
+        # Model hallucinated an id that was not offered; treat as abstain.
+        return MatchDisambiguation(
+            transaction_id=None,
+            confidence="low",
+            reasoning="model returned an id that was not in the candidate list",
+            model=MATCHING_MODEL,
+        )
+
+    confidence = str(result.get("confidence") or "low").lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "low"
+    reasoning = str(result.get("reasoning") or "")[:300]
+    return MatchDisambiguation(
+        transaction_id=chosen,
+        confidence=confidence,
+        reasoning=reasoning,
+        model=MATCHING_MODEL,
+    )
 
 
 def vision_extract(storage_path: str) -> VisionResult | None:

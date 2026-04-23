@@ -6,6 +6,7 @@ const path = require('path');
 const repoRoot = path.resolve(__dirname, '..');
 const pythonExe = process.env.PYTHON || 'C:\\Users\\CASPER\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe';
 let baseUrl = process.env.SMOKE_BASE_URL || 'http://127.0.0.1:8090';
+const importFixturePath = process.env.SMOKE_IMPORT_FIXTURE || path.join(repoRoot, '.verify_data', 'live_import_statement_smoke.xlsx');
 
 async function dropdownByText(page, currentText, optionText) {
   await page.getByRole('button', { name: new RegExp(currentText) }).first().click();
@@ -28,6 +29,8 @@ async function waitForServer(url, timeoutMs = 20000) {
 function seedIsolatedDb(env) {
   const seedCode = `
 from datetime import date
+from pathlib import Path
+from openpyxl import Workbook
 from sqlmodel import Session
 from app.db import create_db_and_tables, engine
 from app.models import StatementImport, StatementTransaction
@@ -55,6 +58,14 @@ with Session(engine) as session:
             source_row_ref=f"smoke-{idx}",
         ))
     session.commit()
+fixture = Path(".verify_data") / "live_import_statement_smoke.xlsx"
+fixture.parent.mkdir(parents=True, exist_ok=True)
+wb = Workbook()
+ws = wb.active
+ws.append(["Tran Date", "Supplier", "Source Amount", "Amount Incl"])
+ws.append(["04/01/2026", "Smoke Import Market", "123.45 TRY", 2.85])
+wb.save(fixture)
+wb.close()
 print(f"seeded_db={engine.url}")
 `;
   const result = spawnSync(pythonExe, ['-X', 'utf8', '-'], {
@@ -362,6 +373,20 @@ async function smokeRawCdp() {
       }
       const input = document.querySelector('input[type="file"][accept*="image"]');
       if (!input) throw new Error('Missing Add Statement file input');
+      const file = new File(['manual smoke receipt'], 'x.jpg', { type: 'image/jpeg' });
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      window.__smoke.clickText('Extract', 'button');
+      return true;
+    })()
+  `);
+  await waitFor("document.body.innerText.includes('Extraction finished, but no usable statement fields were found.')", 20000);
+  await evalJs(`
+    (() => {
+      const input = document.querySelector('input[type="file"][accept*="image"]');
+      if (!input) throw new Error('Missing Add Statement file input');
       const file = new File(['manual smoke receipt'], 'merchant=Migros_total_419.58TRY_2026-03-11.jpg', { type: 'image/jpeg' });
       const transfer = new DataTransfer();
       transfer.items.add(file);
@@ -391,8 +416,27 @@ async function smokeRawCdp() {
   }
   await evalJs(`(() => {
     const inputs = Array.from(document.querySelectorAll('input'));
+    const date = inputs.find(input => input.type === 'date' && input.value === '2026-03-11');
     const supplier = inputs.find(input => input.value === 'Migros');
     const amount = inputs.find(input => input.value === '419.58');
+    if (!date || !supplier || !amount) throw new Error('Missing Add Statement fields for validation check');
+    window.__smoke.setInput(date, '');
+    window.__smoke.setInput(supplier, '');
+    window.__smoke.setInput(amount, '');
+    window.__smoke.clickText('Save statement entry', 'button');
+    return true;
+  })()`);
+  await waitFor("document.body.innerText.includes('Transaction date is required.') && document.body.innerText.includes('Supplier is required.') && document.body.innerText.includes('Positive amount is required.')");
+  await evalJs(`(() => {
+    const labelInput = (name) => {
+      const label = Array.from(document.querySelectorAll('label')).find(item => (item.textContent || '').includes(name));
+      return label ? label.querySelector('input') : null;
+    };
+    const date = labelInput('Date');
+    const supplier = labelInput('Supplier');
+    const amount = labelInput('Amount');
+    if (!date) throw new Error('Missing editable Add Statement date field');
+    window.__smoke.setInput(date, '2026-03-11');
     if (!supplier || !amount) throw new Error('Missing editable Add Statement fields');
     window.__smoke.setInput(supplier, 'Migros Market');
     window.__smoke.setInput(amount, '420.00');
@@ -474,14 +518,39 @@ async function smokeRawCdp() {
 
   await evalJs("window.__smoke.clickText('Validation', 'button')");
   await waitFor("document.body.innerText.includes('Report Validation')");
-  const bodyText = await evalJs("document.body.innerText");
+  const validationBodyText = await evalJs("document.body.innerText");
+
+  if (!fs.existsSync(importFixturePath)) {
+    throw new Error(`Missing Import Statement smoke fixture: ${importFixturePath}`);
+  }
+  await evalJs("window.__smoke.clickText('Review Queue', 'button')");
+  await waitFor("document.body.innerText.includes('Bulk classify')");
+  await evalJs("window.__smoke.clickText('Import Statement', 'button')");
+  await waitFor("document.body.innerText.includes('Import Diners Statement')");
+  const documentNode = await send('DOM.getDocument', { depth: -1, pierce: true }, sessionId);
+  const fileInputNode = await send('DOM.querySelector', {
+    nodeId: documentNode.root.nodeId,
+    selector: 'input[type="file"][accept=".xlsx,.xls"]',
+  }, sessionId);
+  if (!fileInputNode.nodeId) {
+    throw new Error('Missing Import Statement file input');
+  }
+  await send('DOM.setFileInputFiles', { nodeId: fileInputNode.nodeId, files: [importFixturePath] }, sessionId);
+  await waitFor("document.body.innerText.includes('live_import_statement_smoke.xlsx')");
+  await evalJs("window.__smoke.clickText('Import statement', 'button')");
+  await waitFor("document.body.innerText.includes('Imported successfully')", 20000);
+  const sawImportSuccess = true;
+  await waitFor("document.body.innerText.includes('Smoke Import Market')", 20000);
+  const importBodyText = await evalJs("document.body.innerText");
   socket.close();
 
   console.log(JSON.stringify({
     status: 'passed',
     mode: 'raw-cdp',
     sawBulkToast: /Bulk updated \d+ rows/.test(bodyTextAfterBulk),
-    sawValidation: bodyText.includes('Report Validation'),
+    sawValidation: validationBodyText.includes('Report Validation'),
+    sawImportSuccess,
+    sawImportRow: importBodyText.includes('Smoke Import Market'),
   }));
 }
 

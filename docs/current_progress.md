@@ -114,6 +114,8 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Manual statement entry reuses statement-led review architecture: the saved transaction has `source_kind="manual"`, an uploaded receipt is linked with an approved `manual_statement_entry` match when present, and the current draft review session is refreshed so the row appears without Excel import. Confirmed sessions are left frozen; adding a manual row after confirmation creates a new draft review session for that statement import.
 - Manual statement entry regression passed: upload/extract creates a receipt draft from deterministic extraction, save creates one statement transaction, approved manual match, and review row with linked receipt data. Static UI regression still verifies selected-visible toolbar text and the new Add Statement endpoints.
 - Live browser smoke now covers the Add Statement modal: it opens `/review`, uploads a deterministic filename receipt, verifies extracted date/supplier/amount/currency prefill, edits supplier and amount, saves, and verifies the new manual row appears before continuing the existing bulk/validation smoke path.
+- Add Statement validation UX is hardened narrowly: missing date, supplier, and positive amount now show field-level messages and highlights; extraction that returns no usable statement prefill shows a clear operator-facing banner. The live smoke verifies the no-prefill banner, required-field messages, editability, save, new manual row, selected-visible bulk path, and validation path.
+- `/review` Import Statement upload now posts to the mounted backend route `POST /statements/import-excel` instead of the stale `/statements/import` path that returned Not Found. The live browser smoke generates a deterministic one-row Diners-format workbook, opens Import Statement, uploads it through the modal, waits for the import success state, and verifies `Smoke Import Market` appears after the review state refreshes.
 
 ## Not Implemented Yet
 - Personal expense report categories, including Personal Car mileage reimbursement, are intentionally out of scope for now.
@@ -124,9 +126,9 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Authentication/admin web UI.
 
 ## Recommended Next Step
-Deploy the local Telegram OCR/clarification fixes to the VPS, restart `dcexpense`, and resend the receipt images that previously asked for date/amount/business-personal despite visible values.
+Continue UI-only hardening by adding an operator-facing invalid-statement upload message in the Import Statement modal, only if a live smoke or manual check shows the current generic error is too vague.
 
-Strict next-model handoff: `docs/MANUAL_STATEMENT_LIVE_SMOKE_HANDOFF_2026-04-23.md`.
+Strict next-model handoff: `docs/IMPORT_STATEMENT_UPLOAD_HANDOFF_2026-04-23.md`.
 
 Immediate commands are listed in that handoff. The short version is:
-- Keep Add Statement narrow. If continuing, only add a dedicated browser assertion for PDF/manual validation states or stop and move to the next requested UI slice.
+- Keep Import Statement narrow. Do not change statement import parsing, Add Statement, selected-visible bulk behavior, confirmation, snapshots, or report generation unless a focused UI smoke exposes a path-specific mismatch.

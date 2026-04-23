@@ -9,6 +9,15 @@ def main() -> None:
     assert "setBulkScope" in html
     assert "attention_required" in html
     assert "visible row" in html
+    assert "/statements/import-excel" in html
+    assert "/statements/import', fd" not in html
+    assert "Add Statement" in html
+    assert "/statements/manual/receipt" in html
+    assert "/statements/manual/transactions" in html
+    assert "Transaction date is required." in html
+    assert "Supplier is required." in html
+    assert "Positive amount is required." in html
+    assert "no usable statement fields" in html
     assert "All rows" in html
     assert "Apply to" in html
     assert "issue.review_row_id" in html

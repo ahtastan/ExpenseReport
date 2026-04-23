@@ -26,10 +26,13 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 @'
 from datetime import date
 
+from openpyxl import Workbook
 from sqlmodel import Session
 
 from app.db import create_db_and_tables, engine
 from app.models import StatementImport, StatementTransaction
+
+from pathlib import Path
 
 create_db_and_tables()
 with Session(engine) as session:
@@ -58,7 +61,17 @@ with Session(engine) as session:
             )
         )
     session.commit()
+
+fixture = Path(".verify_data") / "live_import_statement_smoke.xlsx"
+fixture.parent.mkdir(parents=True, exist_ok=True)
+wb = Workbook()
+ws = wb.active
+ws.append(["Tran Date", "Supplier", "Source Amount", "Amount Incl"])
+ws.append(["04/01/2026", "Smoke Import Market", "123.45 TRY", 2.85])
+wb.save(fixture)
+wb.close()
 print(f"seeded={engine.url}")
+print(f"import_fixture={fixture.resolve()}")
 '@ | & $Python -X utf8 -
 
 $ServerInfo = [System.Diagnostics.ProcessStartInfo]::new()

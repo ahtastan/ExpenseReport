@@ -117,6 +117,29 @@ class StatementTransactionRead(BaseModel):
     created_at: datetime
 
 
+class ManualStatementDraft(BaseModel):
+    receipt_id: int
+    status: str
+    extracted_date: date | None
+    extracted_supplier: str | None
+    extracted_local_amount: float | None
+    extracted_currency: str | None
+    business_or_personal: str | None
+    confidence: float | None
+    missing_fields: list[str]
+    notes: list[str]
+
+
+class ManualStatementCreate(BaseModel):
+    statement_import_id: int | None = None
+    receipt_id: int | None = None
+    transaction_date: date
+    supplier: str
+    amount: float
+    currency: str = "TRY"
+    business_reason: str | None = None
+
+
 class MatchDecisionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -200,6 +223,11 @@ class ReviewSessionRead(BaseModel):
     confirmed_by_label: str | None
     snapshot_hash: str | None
     rows: list[ReviewRowRead]
+
+
+class ManualStatementCreateResult(BaseModel):
+    transaction: StatementTransactionRead
+    review_session: ReviewSessionRead
 
 
 class ReportValidationIssue(BaseModel):

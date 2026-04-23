@@ -47,6 +47,10 @@ _VISION_PROMPT = (
     "  amount (number or null),\n"
     "  currency (3-letter ISO code string or null),\n"
     "  business_or_personal (\"Business\" or \"Personal\" or null).\n"
+    "For Turkish receipts, the date may be labeled TARIH and may appear as "
+    "DD/MM/YYYY or DD.MM.YYYY; convert it to YYYY-MM-DD.\n"
+    "Payment slips may label the transaction date as ISLEM with a value like "
+    "DD/MM/YYYY - HH:MM; use that as the receipt date.\n"
     "Return only the JSON object, no other text."
 )
 
@@ -124,7 +128,7 @@ def _call_openai(model: str, media_type: str, b64: str) -> dict[str, Any] | None
         data_url = f"data:{media_type};base64,{b64}"
         response = client.chat.completions.create(
             model=model,
-            max_tokens=256,
+            max_completion_tokens=256,
             messages=[
                 {
                     "role": "user",
@@ -158,6 +162,13 @@ _MATCH_PROMPT = (
     "Do not invent a transaction_id that is not in the candidate list."
 )
 
+_SYNTHESIS_PROMPT = (
+    "You are an internal expense report summarizer. Given structured report "
+    "package data, write a concise Markdown summary for a finance reviewer. "
+    "Cover trip purpose, totals by bucket, and flagged anomalies. "
+    "Return ONLY a JSON object with exactly one key: summary_md."
+)
+
 
 def _call_openai_text(model: str, prompt: str, payload: str) -> dict[str, Any] | None:
     """Invoke a text-only OpenAI chat completion and parse a JSON response."""
@@ -172,7 +183,7 @@ def _call_openai_text(model: str, prompt: str, payload: str) -> dict[str, Any] |
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
             model=model,
-            max_tokens=256,
+            max_completion_tokens=256,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": payload},
@@ -247,6 +258,23 @@ def match_disambiguate(
         reasoning=reasoning,
         model=MATCHING_MODEL,
     )
+
+
+def synthesize_report_summary(report: dict[str, Any]) -> str | None:
+    """Generate a Markdown report summary through the synthesis model.
+
+    Returns ``None`` when the model is unavailable or does not provide a usable
+    ``summary_md`` string. The report generator supplies a deterministic
+    fallback so package creation does not depend on live API availability.
+    """
+    payload = json.dumps(report, ensure_ascii=False, sort_keys=True, default=str)
+    result = _text_call(SYNTHESIS_MODEL, _SYNTHESIS_PROMPT, payload)
+    if not isinstance(result, dict):
+        return None
+    summary = result.get("summary_md")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    return summary.strip()
 
 
 def vision_extract(storage_path: str) -> VisionResult | None:

@@ -391,17 +391,22 @@ def bulk_update_review_rows(
     review_session_id: int,
     fields: dict[str, Any],
     scope: str = "attention_required",
+    row_ids: list[int] | None = None,
 ) -> dict[str, int]:
     review = session.get(ReviewSession, review_session_id)
     if not review:
         raise ValueError("Review session not found")
-    if scope not in {"attention_required", "all"}:
-        raise ValueError("Bulk update scope must be attention_required or all")
+    if scope not in {"attention_required", "all", "selected"}:
+        raise ValueError("Bulk update scope must be attention_required, all, or selected")
+    if scope == "selected" and not row_ids:
+        raise ValueError("Bulk update with selected scope requires row_ids")
 
     rows = review_rows(session, review_session_id)
     updated = 0
     for row in rows:
         if scope == "attention_required" and not row.attention_required:
+            continue
+        if scope == "selected" and row.id not in row_ids:
             continue
         update_review_row(session, row.id or 0, fields=fields)
         updated += 1

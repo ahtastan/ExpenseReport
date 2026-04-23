@@ -7,6 +7,8 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - SQLite/SQLModel app foundation.
 - Local file storage under `backend/data` by default.
 - Telegram webhook skeleton for receipt photo/PDF capture.
+- Telegram webhook now accepts Diners Excel statement documents (`.xlsx/.xlsm/.xltx/.xltm`), downloads them through the existing Telegram file path, imports them through the Diners importer, builds the review session rows, and replies with the imported row count and statement period.
+- Telegram webhook registration helper added at `scripts/register_telegram_webhook.py`: it loads local env files, registers `TELEGRAM_WEBHOOK_URL` or `--url` via Telegram `setWebhook`, includes `TELEGRAM_WEBHOOK_SECRET` as the secret token when configured, supports sanitized `--status`, and never prints the bot token or webhook secret.
 - Receipt upload/list/update APIs.
 - Deterministic receipt-field extraction from captions/file names.
 - Manual `POST /receipts/{receipt_id}/extract` rerun endpoint.
@@ -89,26 +91,43 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Receipt OCR now runs through `backend/app/services/model_router.py`, which encodes the staged cost-control policy: deterministic regex parse first; if critical fields (date/supplier/amount) are still missing, the router calls the mini OCR model (`OCR_MINI_MODEL`, default `gpt-5.4-mini`) and only escalates to the full model (`OCR_FULL_MODEL`, default `gpt-5.4`) when the mini response is invalid or incomplete. `receipt_extraction.py` consumes the router and no longer talks to the Anthropic SDK. Provider dependency switched from `anthropic` to `openai` in `backend/pyproject.toml`. Unit test `backend/tests/test_model_router.py` covers mini-only, escalation, mini-unavailable, both-fail, partial-mini fallback, and unsupported-file paths.
 - Receipt↔statement matching now disambiguates hard cases via the matching model (`MATCHING_MODEL`, default `gpt-5.4-mini`). After deterministic scoring, any receipt with no unique-high pick but two or more plausible (high/medium) candidates is sent to `model_router.match_disambiguate`; a confident pick is promoted to high, rival highs are demoted to medium, the chosen `MatchDecision` records `match_method="llm_disambiguated_v1"` and stores the model's reasoning in `reason`, and auto-approval fires. If the model abstains (null transaction id or non-high confidence) or is unavailable, matching falls back to the deterministic baseline with no auto-approval. `MatchRunStats` gains `llm_disambiguated` and `llm_abstained` counters. Unit test `backend/tests/test_llm_matching.py` covers confident-pick, abstain, and unavailable paths.
 
+- Report packages now include `summary.md` generated through `model_router.synthesize_report_summary()` using `SYNTHESIS_MODEL` (default `gpt-5.4`). The generator sends one structured payload per package with trip-purpose candidates, totals by bucket, workbooks, and anomalies; if the model is unavailable or does not return `summary_md`, package generation falls back to a deterministic Markdown summary. Existing Excel generation is unchanged. Unit test `backend/tests/test_report_synthesis.py` verifies one synthesis call, `summary.md` zip inclusion, and payload totals.
+- Disposable live model smoke helper added at `scripts/run_live_model_smoke.py`. It loads optional `.env` files, requires `OPENAI_API_KEY`, uses a disposable SQLite DB/output directory, sends one real receipt image through OCR, imports the real Diners transactions workbook for matching, generates a report package, and verifies `summary.md` exists. Current environment has no `OPENAI_API_KEY`, so the helper currently reports `{"status":"skipped","reason":"OPENAI_API_KEY missing"}` with exit code 2.
+- Live model smoke preflight now checks that the `openai` SDK is importable before any OCR/matching/synthesis calls. The earlier `OCR model smoke returned no result` failure was traced to the bundled Python missing the `openai` package; `openai>=1.50` has now been installed into `C:\Users\CASPER\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`. Local `.env` files are ignored by git.
+- OpenAI router calls now use `max_completion_tokens` for both vision and text Chat Completions calls. The live smoke exposed that GPT-5.4 models reject the older `max_tokens` parameter with a 400 `unsupported_parameter` error; `backend/tests/test_model_router_openai_params.py` covers the request shape without making a live API call.
+- Live model smoke template selection now ignores directories when resolving the report template. This fixes the post-model package-generation failure where missing `EXPENSE_REPORT_TEMPLATE_PATH` caused `Path("")` to resolve to the current directory and openpyxl rejected it as an invalid workbook. `backend/tests/test_live_model_smoke_template_path.py` covers the fallback to `../Expense Report Form_Blank.xlsx`.
+- Live model smoke passed from the user's PowerShell with a configured API key: OCR completed on `gpt-5.4-mini` without escalation and returned all critical fields, matching completed on `gpt-5.4-mini` with a high-confidence transaction id, synthesis produced non-empty `summary.md`, and the generated disposable package was `.verify_data/live_model_smoke_e89f3e69269b4c4a9e033a1cc1808341/reports/report_1_20260423T043010Z/expense_report_package.zip`.
+- Live-smoke package content review: `summary.md` is coherent for the disposable run and correctly flags that all 91 imported statement lines are missing receipts. It is not yet representative of a real matched-receipt package because the smoke intentionally imports statement data without loading receipt support.
+- Telegram statement upload regression (`backend/tests/test_telegram_statement_import.py`) passed: a Telegram `.xlsx` document imports 2 transactions, creates a statement import, builds a review session with 2 rows, and sends the import acknowledgement.
+- Telegram webhook registration regression (`backend/tests/test_telegram_webhook_registration.py`) passed: registration normalizes a base public URL to `/telegram/webhook`, sends `secret_token` to Telegram when configured, fetches webhook status, and returns sanitized JSON without token/secret leakage.
+- Receipt OCR date merge now accepts vision-returned local receipt dates such as `04/09/2025` instead of only ISO `YYYY-MM-DD`. This fixes Turkish receipt images where the model reads `TARIH : 04/09/2025` but returns the visible slash date. The vision prompt now explicitly calls out Turkish `TARIH` labels and asks for ISO conversion. Regression: `backend/tests/test_receipt_extraction_vision_dates.py`.
+- Clarification handling now treats question-like replies to receipt-date prompts (for example, "why can't you read the date?") as meta questions instead of failed date answers. The original date question stays open and the bot sends an explanatory helper prompt. Regression: `backend/tests/test_clarification_non_answer.py`.
+- Telegram clarification handling now also treats simple chatter/non-answers such as `hello` as non-answers for receipt date, amount, and business/personal prompts. The original question remains open and a helper prompt is returned, instead of consuming the chatter as a failed answer and advancing to unrelated retry prompts. Regression: `backend/tests/test_clarification_non_answer.py`.
+- The OCR vision prompt now also calls out Turkish payment-slip `ISLEM` transaction date lines such as `DD/MM/YYYY - HH:MM`, so airport card slips can use that value as the receipt date.
+- The React SPA bulk-classify toolbar now includes a `selected (visible)` scope option alongside `attention_required` and `all`.
+- When the `selected` scope is chosen, the frontend snapshots the IDs of the currently visible filtered rows and sends them as `row_ids` in the `POST /reviews/report/{review_session_id}/bulk-update` payload.
+- The backend `bulk-update` route and service now accept the `selected` scope and `row_ids: list[int]`, applying the updates only to the specified row IDs. It explicitly rejects the `selected` scope if `row_ids` is empty or missing.
+
 ## Not Implemented Yet
 - Personal expense report categories, including Personal Car mileage reimbursement, are intentionally out of scope for now.
-- Telegram webhook registration script.
+- Live Telegram webhook registration against the real Bot API.
 - Vision OCR tested against real receipt images.
 - PDF receipt OCR/rendering.
 - Full frontend app beyond the served static review table.
 - Authentication/admin web UI.
 
 ## Recommended Next Step
-Wire `SYNTHESIS_MODEL` (default `gpt-5.4`) into the report package generator. Emit a `summary.md` alongside `expense_report_part_*.xlsx` and `annotated_receipts.pdf` with trip purpose, totals by bucket, and flagged anomalies. Narrow scope: one synthesis call per package, no changes to the Excel generator. Deferred: real-data OPENAI_API_KEY smoke for both OCR escalation and match disambiguation.
+Deploy the local Telegram OCR/clarification fixes to the VPS, restart `dcexpense`, and resend the receipt images that previously asked for date/amount/business-personal despite visible values.
 
-See `docs/LLM_MATCHING_HANDOFF_2026-04-23.md` for the most recent handoff detail.
+Strict next-model handoff: `docs/REVIEW_BULK_SELECTED_SCOPE_HANDOFF_FINAL_2026-04-23.md`.
+
+Immediate commands are listed in that handoff. The short version is:
+- Production check: copy `backend/app/services/clarifications.py` and `backend/app/services/model_router.py` to `/opt/dcexpense/app/backend/app/services/`, restart `dcexpense`, verify `/health`, check Telegram webhook status, and resend the Onder/airport receipts.
 
 **Live browser smoke pass** — start the backend, open `/review`, log in as `ahmet/demo`, and verify:
 1. Review queue loads rows from the latest statement import.
-2. Selecting a parent category repopulates the bucket dropdown without clearing the selection.
-3. Selecting a bucket saves immediately via PATCH and persists on page reload.
-4. An Air Travel row shows the compact reconciliation detail when expanded.
-5. A Meals & Entertainment row shows the detail panel when expanded.
-6. Click `Validate before generate` — confirm messages identify the exact row/date/supplier/bucket.
-7. Use the restored bulk-classify toolbar on flagged rows and verify the page reloads with updated rows.
+2. Filter the queue to `Needs review` or `⚑ Attention`.
+3. Use the bulk-classify toolbar with the new `selected (visible)` scope.
+4. Verify only the filtered visible rows are updated.
+5. Click `Validate before generate` — confirm messages identify the exact row/date/supplier/bucket.
 Current live validation error: review row `2`, supplier `Istanbul Oht-4 Dogu Sh`, bucket `Airfare/Bus/Ferry/Other`, has `RT`, travel date `2026-05-09`, and return date `2026-03-30`. Correct that row's return date or classify it as one-way, then reconfirm and re-run validation.
-If all pass, the next feature step should be deciding whether the bulk toolbar needs a selected-visible-rows scope.

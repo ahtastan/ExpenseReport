@@ -90,6 +90,7 @@ def bulk_edit_report_review_rows(
             review_session_id=review_session_id,
             fields=payload.fields,
             scope=payload.scope,
+            row_ids=payload.row_ids,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

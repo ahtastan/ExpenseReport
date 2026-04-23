@@ -168,6 +168,7 @@ class ReviewRowUpdate(BaseModel):
 class ReviewBulkUpdateRequest(BaseModel):
     fields: dict[str, Any]
     scope: str = "attention_required"
+    row_ids: list[int] | None = None
 
 
 class ReviewBulkUpdateResult(BaseModel):
@@ -252,6 +253,8 @@ class TelegramWebhookResult(BaseModel):
     ok: bool
     action: str
     receipt_id: int | None = None
+    statement_import_id: int | None = None
     user_id: int | None = None
     questions_created: int = 0
+    transactions_imported: int = 0
     message: str | None = None

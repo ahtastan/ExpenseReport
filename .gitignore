@@ -1,5 +1,7 @@
 .verify_data/
 backend/.verify_data/
 backend/data/
+.env
+backend/.env
 __pycache__/
 *.py[cod]

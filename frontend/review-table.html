@@ -1013,9 +1013,14 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, o
     }
     setBulkBusy(true);
     try {
+      const scopeVal = bulkScope === 'selected (visible)' ? 'selected' : bulkScope;
+      const payload = { fields:buildApiFields(localChanges), scope:scopeVal };
+      if (scopeVal === 'selected') {
+        payload.row_ids = filtered.map(r => r.id);
+      }
       const result = await api(`/reviews/report/${session.id}/bulk-update`, {
         method:'POST',
-        body:JSON.stringify({ fields:buildApiFields(localChanges), scope:bulkScope }),
+        body:JSON.stringify(payload),
       });
       addAudit('row_edited', 'Bulk classify', `${result.updated_rows} row${result.updated_rows===1?'':'s'}`);
       if (onImported) await onImported();
@@ -1069,10 +1074,10 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, o
       <div style={{ padding:'8px 14px', borderBottom:'1px solid var(--border)', background:'var(--surface)',
         display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', flexShrink:0 }}>
         <span style={{ fontSize:12, fontWeight:600, color:'var(--text-2)', marginRight:2 }}>Bulk classify</span>
-        <Dropdown value={bulkScope} options={['attention_required','all']} onChange={setBulkScope}
-          placeholder="Scope" width={128}/>
+        <Dropdown value={bulkScope} options={['attention_required','all','selected (visible)']} onChange={setBulkScope}
+          placeholder="Scope" width={140}/>
         <span style={{ fontSize:11, color:'var(--text-3)' }}>
-          {bulkScope==='attention_required'?'Flagged rows':'All rows'}
+          {bulkScope==='attention_required'?'Flagged rows':bulkScope==='all'?'All rows':'Currently visible rows'}
         </span>
         <Dropdown value={bulkBp} options={['business','personal']} onChange={setBulkBp}
           placeholder="B/P" width={96}/>
@@ -1085,7 +1090,7 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, o
             background:bulkDisabled?'var(--surface-2)':'var(--accent)',
             color:bulkDisabled?'var(--text-3)':'#fff', fontSize:12, fontWeight:600,
             cursor:bulkDisabled?'default':'pointer', opacity:bulkBusy?0.7:1 }}>
-          {bulkBusy?'Applying...':`Apply to ${bulkScope==='attention_required'?'flagged':'all'}`}
+          {bulkBusy?'Applying...':`Apply to ${bulkScope==='attention_required'?'flagged':bulkScope==='all'?'all':'visible'}`}
         </button>
       </div>
       {/* Column headers */}

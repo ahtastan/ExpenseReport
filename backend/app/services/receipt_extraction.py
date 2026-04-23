@@ -146,7 +146,7 @@ def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
         try:
             return date.fromisoformat(str(raw))
         except ValueError:
-            return None
+            return _parse_date(str(raw))
 
     # Merge priority: previously-stored value > deterministic > vision.
     # Deterministic wins over vision because it reflects ground truth from the

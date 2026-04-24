@@ -147,6 +147,7 @@ function apiRowToLocal(apiRow) {
     matchMethod: match.match_method || null,
     // receipt
     hasReceipt:  !!c.receipt_id,
+    receiptId:   c.receipt_id || null,
     receiptLabel:c.receipt_file_name || null,
     // editable fields mapped to local names
     date:        c.transaction_date || '',
@@ -591,16 +592,31 @@ function Dashboard({ statement, localRows, auditLog, onNavigate, onReload }) {
 
 // ─── Review Queue sub-components ──────────────────────────────────────────────
 function ReceiptModal({ row, onClose }) {
+  const [meta, setMeta] = useState(null);
+  const [metaError, setMetaError] = useState(null);
   useEffect(() => {
     const h = e => e.key==='Escape' && onClose();
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
   }, []);
+  useEffect(() => {
+    if (!row.receiptId) return;
+    let cancelled = false;
+    fetch(`/receipts/${row.receiptId}`)
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(r.statusText)))
+      .then(j => { if (!cancelled) setMeta(j); })
+      .catch(e => { if (!cancelled) setMetaError(e.message || 'failed to load'); });
+    return () => { cancelled = true; };
+  }, [row.receiptId]);
+  const fileUrl = row.receiptId ? `/receipts/${row.receiptId}/file` : null;
+  const mime = meta?.mime_type || '';
+  const isImage = mime.startsWith('image/');
+  const isPdf = mime === 'application/pdf';
   return (
     <div onClick={onClose} style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.55)',
       zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center' }}>
       <div onClick={e=>e.stopPropagation()} style={{ background:'var(--surface)', border:'1px solid var(--border)',
-        borderRadius:10, width:400, overflow:'hidden', boxShadow:'0 20px 60px rgba(0,0,0,0.25)' }}>
+        borderRadius:10, width:520, maxHeight:'90vh', display:'flex', flexDirection:'column', overflow:'hidden', boxShadow:'0 20px 60px rgba(0,0,0,0.25)' }}>
         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'12px 16px', borderBottom:'1px solid var(--border)' }}>
           <div>
             <div style={{ fontSize:13, fontWeight:600 }}>{row.receiptLabel||'Receipt'}</div>
@@ -610,17 +626,26 @@ function ReceiptModal({ row, onClose }) {
           </div>
           <button onClick={onClose} style={{ background:'none', border:'none', cursor:'pointer', fontSize:18, color:'var(--text-3)' }}>×</button>
         </div>
-        <div style={{ background:'var(--surface-2)', borderBottom:'1px solid var(--border)' }}>
-          <svg width="100%" viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg" style={{ display:'block' }}>
-            <defs><pattern id="rh" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="10" stroke="#e4e4e0" strokeWidth="1.5"/></pattern></defs>
-            <rect width="400" height="200" fill="url(#rh)"/>
-            <rect x="60" y="15" width="280" height="170" rx="4" fill="white" stroke="#e4e4e0" strokeWidth="1"/>
-            <text x="200" y="42" textAnchor="middle" fontFamily="IBM Plex Sans,sans-serif" fontSize="11" fontWeight="700" fill="#1a1917">{(row.supplier||'').toUpperCase()}</text>
-            <line x1="80" y1="50" x2="320" y2="50" stroke="#e4e4e0" strokeWidth="1"/>
-            <text x="88" y="68" fontFamily="monospace" fontSize="10" fill="#6b6b67">Date: {row.date}</text>
-            <text x="88" y="82" fontFamily="monospace" fontSize="10" fill="#6b6b67">Local: {row.localAmount?.toLocaleString()} {row.localCurrency}</text>
-            <text x="88" y="96" fontFamily="monospace" fontSize="10" fill="#6b6b67">USD: ${row.usdAmount?.toFixed(2)}</text>
-          </svg>
+        <div style={{ background:'var(--surface-2)', borderBottom:'1px solid var(--border)', flex:'1 1 auto', overflow:'auto',
+          display:'flex', alignItems:'center', justifyContent:'center', minHeight:200 }}>
+          {!row.receiptId && (
+            <div style={{ padding:'32px 16px', fontSize:12, color:'var(--text-3)' }}>No receipt attached</div>
+          )}
+          {row.receiptId && metaError && (
+            <div style={{ padding:'32px 16px', fontSize:12, color:'var(--text-3)' }}>Could not load receipt ({metaError})</div>
+          )}
+          {row.receiptId && !meta && !metaError && (
+            <div style={{ padding:'32px 16px', fontSize:12, color:'var(--text-3)' }}>Loading…</div>
+          )}
+          {row.receiptId && meta && isImage && (
+            <img src={fileUrl} alt={row.receiptLabel||'Receipt'} style={{ display:'block', maxWidth:'100%', maxHeight:'60vh', objectFit:'contain' }} />
+          )}
+          {row.receiptId && meta && isPdf && (
+            <iframe src={fileUrl} title={row.receiptLabel||'Receipt'} style={{ width:'100%', height:'60vh', border:'none', background:'white' }} />
+          )}
+          {row.receiptId && meta && !isImage && !isPdf && (
+            <a href={fileUrl} download style={{ padding:'32px 16px', fontSize:13, color:'var(--text-2)' }}>Download receipt</a>
+          )}
         </div>
         <div style={{ padding:'10px 16px', display:'flex', gap:12, flexWrap:'wrap' }}>
           {row.confidence && <div>

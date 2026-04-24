@@ -34,7 +34,7 @@ class _Recorder:
         self._responses = list(responses)
         self.calls: list[str] = []
 
-    def __call__(self, model, media_type, b64):  # matches the real signature
+    def __call__(self, model, images):  # matches the real signature
         self.calls.append(model)
         if not self._responses:
             return None

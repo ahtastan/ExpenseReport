@@ -53,7 +53,10 @@ def validate_report(statement_import_id: int, session: Session = Depends(get_ses
     try:
         result = validate_report_readiness(session, expense_report_id=expense_report_id)
     except NotImplementedError as exc:
-        raise HTTPException(status_code=501, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=501,
+            detail="Report validation is not available for this report type.",
+        ) from exc
     return ReportValidationResult(
         statement_import_id=result.statement_import_id,
         ready=result.ready,
@@ -79,9 +82,15 @@ def generate_report(payload: ReportGenerateRequest, session: Session = Depends(g
             allow_warnings=payload.allow_warnings,
         )
     except NotImplementedError as exc:
-        raise HTTPException(status_code=501, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=501,
+            detail="Report generation is not available for this report type.",
+        ) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=500,
+            detail="Report generation is not available because the report template is missing.",
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -97,7 +106,7 @@ def download_report(report_run_id: int, session: Session = Depends(get_session))
     output_path = Path(run.output_workbook_path).resolve()
     storage_root = get_settings().storage_root.resolve()
     if storage_root not in output_path.parents:
-        raise HTTPException(status_code=400, detail="Report output path is outside storage root")
+        raise HTTPException(status_code=400, detail="Report output file is unavailable")
     if not output_path.exists() or not output_path.is_file():
         raise HTTPException(status_code=404, detail="Report output file not found")
 

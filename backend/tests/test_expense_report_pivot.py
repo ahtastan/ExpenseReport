@@ -238,4 +238,6 @@ def test_reports_generate_returns_501_for_personal_reimbursement(
         },
     )
     assert response.status_code == 501, response.text
-    assert "M1 Day 8-9" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert "not available for this report type" in detail
+    assert "M1 Day 8-9" not in detail

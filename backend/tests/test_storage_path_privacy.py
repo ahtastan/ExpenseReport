@@ -138,6 +138,22 @@ def _seed_matched_review_payload(engine, raw_receipt_path: str) -> int:
         return statement.id
 
 
+def _seed_statement_for_report_generation(engine) -> int:
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=88002, display_name="Report Privacy Tester")
+        session.add(user)
+        session.flush()
+        statement = StatementImport(
+            source_filename="report_privacy_statement.xlsx",
+            row_count=0,
+            uploader_user_id=user.id,
+        )
+        session.add(statement)
+        session.commit()
+        session.refresh(statement)
+        return statement.id
+
+
 def test_receipt_read_does_not_expose_storage_path(client):
     uploaded = client.post("/receipts/upload", files=[_receipt_upload()])
     assert uploaded.status_code == 200, uploaded.text
@@ -246,6 +262,82 @@ def test_report_download_endpoint_still_serves_file(client, isolated_db, tmp_pat
 
     assert response.status_code == 200, response.text
     assert response.content == b"report package bytes"
+
+
+def test_report_download_error_does_not_expose_internal_storage_root(client, isolated_db, tmp_path):
+    outside_path = tmp_path / "outside-storage" / "report_package.zip"
+    outside_path.parent.mkdir(parents=True)
+    outside_path.write_bytes(b"outside")
+    with Session(isolated_db) as session:
+        run = ReportRun(
+            statement_import_id=None,
+            template_name="privacy_template",
+            status="completed",
+            output_workbook_path=str(outside_path),
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        report_run_id = run.id
+
+    response = client.get(f"/reports/{report_run_id}/download")
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "storage root" not in detail.lower()
+    assert str(outside_path) not in detail
+
+
+def test_report_generate_file_error_does_not_expose_internal_exception_details(
+    client, isolated_db, monkeypatch, tmp_path
+):
+    statement_id = _seed_statement_for_report_generation(isolated_db)
+    missing_template = tmp_path / "private-template.xlsx"
+
+    from app.routes import reports as reports_route_module
+
+    def _fake_generator(*args, **kwargs):
+        raise FileNotFoundError(
+            f"{missing_template} was not found. Set EXPENSE_REPORT_TEMPLATE_PATH."
+        )
+
+    monkeypatch.setattr(reports_route_module, "generate_report_package", _fake_generator)
+
+    response = client.post(
+        "/reports/generate",
+        json={"statement_import_id": statement_id},
+    )
+
+    assert response.status_code == 500, response.text
+    detail = response.json()["detail"]
+    assert "EXPENSE_REPORT_TEMPLATE_PATH" not in detail
+    assert str(missing_template) not in detail
+
+
+def test_telegram_webhook_requires_configured_secret(client, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
+    get_settings.cache_clear()
+
+    response = client.post(
+        "/telegram/webhook",
+        json={"message": {"from": {"id": 100}, "chat": {"id": 200}, "text": "hello"}},
+    )
+
+    assert response.status_code == 503, response.text
+
+
+def test_telegram_webhook_accepts_matching_configured_secret(client, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "test-webhook-secret")
+    get_settings.cache_clear()
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"},
+        json={},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["action"] == "ignored"
 
 
 def test_receipt_file_endpoint_still_serves_file(client):

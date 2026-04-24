@@ -170,7 +170,12 @@ def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
     extracted_amount = det_amount if det_amount is not None else vision_amount
     extracted_currency = det_currency or vision_currency
     vision_supplier = (vision or {}).get("supplier")
-    extracted_supplier = receipt.extracted_supplier or det_supplier or vision_supplier
+    if receipt.content_type == "document":
+        # Document filenames are upload IDs / booking refs / customer names,
+        # not merchant names. Vision gets the final word on supplier.
+        extracted_supplier = receipt.extracted_supplier or vision_supplier or det_supplier
+    else:
+        extracted_supplier = receipt.extracted_supplier or det_supplier or vision_supplier
     vision_bp = (vision or {}).get("business_or_personal")
     business_or_personal = receipt.business_or_personal or det_bp or vision_bp
 

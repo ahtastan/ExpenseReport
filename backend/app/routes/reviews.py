@@ -16,6 +16,7 @@ from app.schemas import (
 )
 from app.services.clarifications import answer_question
 from app.services.review_sessions import (
+    _resolve_statement_to_expense_report,
     bulk_update_review_rows,
     confirm_review_session,
     get_or_create_review_session,
@@ -24,6 +25,20 @@ from app.services.review_sessions import (
 )
 
 router = APIRouter()
+
+
+def _expense_report_id_for_statement(session: Session, statement_import_id: int) -> int:
+    statement = session.get(StatementImport, statement_import_id)
+    if statement is None:
+        raise HTTPException(status_code=404, detail="Statement import not found")
+    if statement.uploader_user_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Statement has no uploader; cannot resolve expense report owner",
+        )
+    return _resolve_statement_to_expense_report(
+        session, statement_import_id, owner_user_id=statement.uploader_user_id
+    )
 
 
 @router.get("/summary", response_model=ReviewSummary)
@@ -47,13 +62,15 @@ def review_summary(session: Session = Depends(get_session)):
 
 @router.get("/report/{statement_import_id}", response_model=ReviewSessionRead)
 def get_report_review(statement_import_id: int, session: Session = Depends(get_session)):
-    review = get_or_create_review_session(session, statement_import_id)
+    expense_report_id = _expense_report_id_for_statement(session, statement_import_id)
+    review = get_or_create_review_session(session, expense_report_id=expense_report_id)
     return session_payload(session, review)
 
 
 @router.post("/report/{statement_import_id}/build", response_model=ReviewSessionRead)
 def build_report_review(statement_import_id: int, session: Session = Depends(get_session)):
-    review = get_or_create_review_session(session, statement_import_id)
+    expense_report_id = _expense_report_id_for_statement(session, statement_import_id)
+    review = get_or_create_review_session(session, expense_report_id=expense_report_id)
     return session_payload(session, review)
 
 

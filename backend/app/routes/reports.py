@@ -6,12 +6,34 @@ from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db import get_session
-from app.models import ReportRun
+from app.models import ReportRun, StatementImport
 from app.schemas import ReportGenerateRequest, ReportRunRead, ReportValidationIssue, ReportValidationResult
 from app.services.report_generator import generate_report_package
 from app.services.report_validation import validate_report_readiness
+from app.services.review_sessions import _resolve_statement_to_expense_report
 
 router = APIRouter()
+
+
+def _resolve_owner_for_statement(session: Session, statement_import_id: int) -> tuple[int, int]:
+    """Return (expense_report_id, owner_user_id) for a statement-keyed URL.
+
+    Raises 404 if the statement does not exist, 422 if it has no uploader.
+    The uploader is required — no fallback — so report ownership is always
+    grounded in a real user.
+    """
+    statement = session.get(StatementImport, statement_import_id)
+    if statement is None:
+        raise HTTPException(status_code=404, detail="Statement import not found")
+    if statement.uploader_user_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Statement has no uploader; cannot resolve expense report owner",
+        )
+    expense_report_id = _resolve_statement_to_expense_report(
+        session, statement_import_id, owner_user_id=statement.uploader_user_id
+    )
+    return expense_report_id, statement.uploader_user_id
 
 
 @router.get('/')
@@ -21,7 +43,11 @@ def list_reports(session: Session = Depends(get_session)):
 
 @router.get("/validate/{statement_import_id}", response_model=ReportValidationResult)
 def validate_report(statement_import_id: int, session: Session = Depends(get_session)):
-    result = validate_report_readiness(session, statement_import_id)
+    expense_report_id, _ = _resolve_owner_for_statement(session, statement_import_id)
+    try:
+        result = validate_report_readiness(session, expense_report_id=expense_report_id)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
     return ReportValidationResult(
         statement_import_id=result.statement_import_id,
         ready=result.ready,
@@ -37,14 +63,17 @@ def validate_report(statement_import_id: int, session: Session = Depends(get_ses
 
 @router.post("/generate", response_model=ReportRunRead)
 def generate_report(payload: ReportGenerateRequest, session: Session = Depends(get_session)):
+    expense_report_id, _ = _resolve_owner_for_statement(session, payload.statement_import_id)
     try:
         return generate_report_package(
             session=session,
-            statement_import_id=payload.statement_import_id,
+            expense_report_id=expense_report_id,
             employee_name=payload.employee_name,
             title_prefix=payload.title_prefix,
             allow_warnings=payload.allow_warnings,
         )
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ValueError as exc:

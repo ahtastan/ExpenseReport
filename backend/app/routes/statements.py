@@ -14,7 +14,11 @@ from app.schemas import (
 )
 from app.services.clarifications import ensure_receipt_review_questions
 from app.services.receipt_extraction import apply_receipt_extraction
-from app.services.review_sessions import get_or_create_review_session, session_payload
+from app.services.review_sessions import (
+    _resolve_statement_to_expense_report,
+    get_or_create_review_session,
+    session_payload,
+)
 from app.services.statement_import import _normalize_supplier, import_diners_excel
 from app.services.storage import save_upload_file
 
@@ -50,15 +54,32 @@ def _update_statement_summary(statement: StatementImport, transaction_date: date
         statement.period_end = transaction_date if statement.period_end is None else max(statement.period_end, transaction_date)
 
 
+def _resolve_manual_entry_owner(statement: StatementImport) -> int:
+    if statement.uploader_user_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Statement has no uploader; cannot resolve expense report owner",
+        )
+    return statement.uploader_user_id
+
+
 def _draft_review_for_manual_entry(session: Session, statement: StatementImport) -> ReviewSession:
+    owner_user_id = _resolve_manual_entry_owner(statement)
+    expense_report_id = _resolve_statement_to_expense_report(
+        session, statement.id or 0, owner_user_id=owner_user_id
+    )
     latest = _latest_review(session, statement.id or 0)
     if latest and latest.status == "confirmed":
-        review = ReviewSession(statement_import_id=statement.id or 0, status="draft")
+        review = ReviewSession(
+            statement_import_id=statement.id or 0,
+            expense_report_id=expense_report_id,
+            status="draft",
+        )
         session.add(review)
         session.commit()
         session.refresh(review)
         return review
-    return get_or_create_review_session(session, statement.id or 0)
+    return get_or_create_review_session(session, expense_report_id=expense_report_id)
 
 
 @router.get("/", response_model=list[StatementImportRead])
@@ -160,7 +181,9 @@ def create_manual_statement_transaction(
         session.commit()
 
     review = _draft_review_for_manual_entry(session, statement)
-    review = get_or_create_review_session(session, review.statement_import_id)
+    review = get_or_create_review_session(
+        session, expense_report_id=review.expense_report_id
+    )
     return ManualStatementCreateResult(
         transaction=transaction,
         review_session=session_payload(session, review),

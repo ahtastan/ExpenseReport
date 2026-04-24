@@ -5,7 +5,14 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from app.models import MatchDecision, ReceiptDocument, ReviewRow, ReviewSession, StatementTransaction
+from app.models import (
+    ExpenseReport,
+    MatchDecision,
+    ReceiptDocument,
+    ReviewRow,
+    ReviewSession,
+    StatementTransaction,
+)
 from app.services.merchant_buckets import suggest_bucket
 
 
@@ -98,12 +105,47 @@ def _dumps(value: dict[str, Any] | list[dict[str, Any]]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def _latest_session(session: Session, statement_import_id: int) -> ReviewSession | None:
+def _latest_session(session: Session, expense_report_id: int) -> ReviewSession | None:
     return session.exec(
         select(ReviewSession)
-        .where(ReviewSession.statement_import_id == statement_import_id)
+        .where(ReviewSession.expense_report_id == expense_report_id)
         .order_by(ReviewSession.created_at.desc())
     ).first()
+
+
+def _resolve_statement_to_expense_report(
+    session: Session, statement_import_id: int, *, owner_user_id: int
+) -> int:
+    """Find or create a diners_statement ExpenseReport for a statement.
+
+    Compatibility glue for URL-bound ``statement_import_id`` routes and the
+    manual-entry flow. Callers must pass ``owner_user_id`` explicitly; the
+    helper never falls back or invents an owner. Returns the ExpenseReport id.
+    """
+    existing = session.exec(
+        select(ExpenseReport)
+        .where(
+            ExpenseReport.statement_import_id == statement_import_id,
+            ExpenseReport.report_kind == "diners_statement",
+            ExpenseReport.owner_user_id == owner_user_id,
+        )
+        .order_by(ExpenseReport.id.asc())
+    ).first()
+    if existing is not None and existing.id is not None:
+        return existing.id
+
+    report = ExpenseReport(
+        owner_user_id=owner_user_id,
+        report_kind="diners_statement",
+        title=f"Diners statement {statement_import_id}",
+        status="draft",
+        report_currency="USD",
+        statement_import_id=statement_import_id,
+    )
+    session.add(report)
+    session.commit()
+    session.refresh(report)
+    return report.id  # type: ignore[return-value]
 
 
 def _amount_and_currency(tx: StatementTransaction) -> tuple[float | None, str | None]:
@@ -221,14 +263,33 @@ def _row_payload(tx: StatementTransaction, receipt: ReceiptDocument, decision: M
     return source, suggested
 
 
-def get_or_create_review_session(session: Session, statement_import_id: int) -> ReviewSession:
-    existing = _latest_session(session, statement_import_id)
+def get_or_create_review_session(
+    session: Session, *, expense_report_id: int
+) -> ReviewSession:
+    """Return the current review session for an expense report, creating one if needed.
+
+    The ``expense_report_id`` is the primary operational key. For
+    ``report_kind='diners_statement'`` reports, the underlying
+    ``statement_import_id`` is read off the ExpenseReport and copied onto
+    the ReviewSession so row-sync can walk the statement transactions.
+    For ``report_kind='personal_reimbursement'``, no statement exists, so
+    the review session is created empty (no rows synced from transactions).
+    """
+    report = session.get(ExpenseReport, expense_report_id)
+    if report is None:
+        raise ValueError(f"ExpenseReport {expense_report_id} not found")
+
+    existing = _latest_session(session, expense_report_id)
     if existing:
         if existing.status != "confirmed":
             _sync_review_rows(session, existing)
         return existing
 
-    review = ReviewSession(statement_import_id=statement_import_id, status="draft")
+    review = ReviewSession(
+        expense_report_id=expense_report_id,
+        statement_import_id=report.statement_import_id,
+        status="draft",
+    )
     session.add(review)
     session.commit()
     session.refresh(review)
@@ -238,6 +299,12 @@ def get_or_create_review_session(session: Session, statement_import_id: int) -> 
 
 
 def _sync_review_rows(session: Session, review: ReviewSession) -> None:
+    # Personal-reimbursement reports carry no statement, so there are no
+    # transactions to sync rows from. Leave the review session empty.
+    if review.statement_import_id is None:
+        session.commit()
+        return
+
     existing_rows_by_tx: dict[int, ReviewRow] = {
         row.statement_transaction_id: row
         for row in review_rows(session, review.id or 0)
@@ -495,8 +562,10 @@ def confirm_review_session(
     return review
 
 
-def confirmed_snapshot(session: Session, statement_import_id: int) -> tuple[ReviewSession, list[dict[str, Any]]]:
-    review = _latest_session(session, statement_import_id)
+def confirmed_snapshot(
+    session: Session, *, expense_report_id: int
+) -> tuple[ReviewSession, list[dict[str, Any]]]:
+    review = _latest_session(session, expense_report_id)
     if not review or review.status != "confirmed" or not review.snapshot_json:
         raise ValueError("Report generation requires confirmed review data")
     return review, json.loads(review.snapshot_json)

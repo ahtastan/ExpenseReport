@@ -41,6 +41,38 @@ CUSTOMER_ENTERTAINMENT_BUCKET = "Customer Entertainment"
 DINNER_CAP_WITH_CUSTOMER_USD = 60
 DINNER_CAP_SOLO_USD = 30
 
+# Addition B: hotel-chain keywords. Case-insensitive substring match on the
+# confirmed supplier name. A payment_receipt-classified receipt from any of
+# these suppliers gets a soft flag — EDT prefers itemized folios.
+HOTEL_CHAIN_KEYWORDS = (
+    "hilton",
+    "hampton",
+    "wyndham",
+    "tryp",
+    "marriott",
+    "ibis",
+    "novotel",
+    "holiday inn",
+    "hyatt",
+    "sheraton",
+    "westin",
+    "intercontinental",
+    "ritz",
+    "four seasons",
+    "accor",
+    "mercure",
+    "best western",
+    "comfort inn",
+    "wingate",
+)
+
+
+def _supplier_is_hotel(supplier: object) -> bool:
+    if not isinstance(supplier, str):
+        return False
+    lowered = supplier.lower()
+    return any(keyword in lowered for keyword in HOTEL_CHAIN_KEYWORDS)
+
 
 def _split_attendees(value: object) -> list[str]:
     raw = (value or "").strip() if isinstance(value, str) else ""
@@ -460,6 +492,32 @@ def validate_report_readiness(
                             report_bucket=bucket_value,
                         )
                     )
+
+            # Addition B: hotel folio soft-flag. A hotel-chain supplier with
+            # receipt_type=payment_receipt means the user captured a POS slip
+            # instead of the itemized folio. EDT's reviewer needs the folio
+            # to see room rate + charges broken out. Soft flag only.
+            if (
+                _supplier_is_hotel(supplier)
+                and receipt.receipt_type == "payment_receipt"
+            ):
+                issues.append(
+                    ValidationIssue(
+                        severity="warning",
+                        code="hotel_needs_itemized_folio",
+                        message=(
+                            f"Hotel row {row_id} ({supplier}) has a payment receipt only, "
+                            "not an itemized folio. EDT prefers hotel receipts that show "
+                            "room cost and charges."
+                        ),
+                        receipt_id=receipt.id,
+                        review_row_id=row_id,
+                        statement_transaction_id=confirmed.get("transaction_id"),
+                        supplier=supplier,
+                        transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                        report_bucket=bucket_value or None,
+                    )
+                )
 
             # Addition A: Dinner per-head cap. Soft flag. USD-only until FX
             # lookup lands (M1 Day 7). Skipped when attendees is empty —

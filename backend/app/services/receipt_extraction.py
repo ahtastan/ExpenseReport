@@ -26,6 +26,20 @@ TELEGRAM_PLACEHOLDER_STEM_RE = re.compile(
 )
 
 
+# Addition B: receipt_type classification from the vision model.
+# Anything outside this set is coerced to "unknown" on write.
+RECEIPT_TYPES = {"itemized", "payment_receipt", "invoice", "confirmation", "unknown"}
+
+
+def _coerce_receipt_type(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace(" ", "_").replace("-", "_")
+    if not normalized:
+        return None
+    return normalized if normalized in RECEIPT_TYPES else "unknown"
+
+
 @dataclass(frozen=True)
 class ReceiptExtraction:
     receipt_id: int
@@ -35,6 +49,7 @@ class ReceiptExtraction:
     extracted_local_amount: float | None = None
     extracted_currency: str | None = None
     business_or_personal: str | None = None
+    receipt_type: str | None = None
     confidence: float | None = None
     missing_fields: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -179,6 +194,12 @@ def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
     vision_bp = (vision or {}).get("business_or_personal")
     business_or_personal = receipt.business_or_personal or det_bp or vision_bp
 
+    # Addition B: receipt_type follows the "stored wins" merge rule. Vision
+    # only gets to assign on first classification; user/operator overrides
+    # are preserved on re-extract.
+    vision_receipt_type = _coerce_receipt_type((vision or {}).get("receipt_type"))
+    receipt_type = receipt.receipt_type or vision_receipt_type
+
     if receipt.extracted_local_amount is not None:
         extracted_amount = receipt.extracted_local_amount
     if receipt.extracted_currency:
@@ -208,6 +229,7 @@ def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
         extracted_local_amount=extracted_amount,
         extracted_currency=extracted_currency or ("TRY" if extracted_amount is not None else None),
         business_or_personal=business_or_personal,
+        receipt_type=receipt_type,
         confidence=round(confidence, 2),
         missing_fields=missing,
         notes=notes,
@@ -221,6 +243,9 @@ def apply_receipt_extraction(session: Session, receipt: ReceiptDocument) -> Rece
     receipt.extracted_local_amount = result.extracted_local_amount
     receipt.extracted_currency = result.extracted_currency
     receipt.business_or_personal = result.business_or_personal
+    # Addition B: stored wins — don't clobber an existing classification.
+    if receipt.receipt_type is None and result.receipt_type is not None:
+        receipt.receipt_type = result.receipt_type
     receipt.ocr_confidence = result.confidence
     receipt.status = result.status
     receipt.needs_clarification = bool(result.missing_fields) or result.business_or_personal == "Business"

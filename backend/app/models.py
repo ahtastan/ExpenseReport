@@ -43,6 +43,12 @@ class ReceiptDocument(SQLModel, table=True):
     extracted_local_amount: float | None = None
     extracted_currency: str | None = None
     ocr_confidence: float | None = None
+    # Addition B: classification from the vision model so validation can flag
+    # payment_receipt-only rows on hotel-chain suppliers (hotel_needs_itemized_folio).
+    # Allowed: 'itemized' | 'payment_receipt' | 'invoice' | 'confirmation' | 'unknown'.
+    # NULL means "not yet classified" (pre-Addition-B rows; classifier script
+    # backfills on demand).
+    receipt_type: str | None = Field(default=None, index=True)
     business_or_personal: str | None = Field(default=None, index=True)
     report_bucket: str | None = None
     business_reason: str | None = None

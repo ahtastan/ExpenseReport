@@ -111,6 +111,7 @@ class MealDetailLine:
 @dataclass(frozen=True)
 class ReportLine:
     transaction_id: int
+    review_row_id: int | None
     receipt_id: int | None
     receipt_path: str | None
     receipt_file_name: str
@@ -178,6 +179,7 @@ def _confirmed_lines(
         lines.append(
             ReportLine(
                 transaction_id=int(row["transaction_id"]),
+                review_row_id=int(row["review_row_id"]) if row.get("review_row_id") is not None else None,
                 receipt_id=int(row["receipt_id"]) if row.get("receipt_id") is not None else None,
                 receipt_path=row.get("receipt_path"),
                 receipt_file_name=row.get("receipt_file_name") or f"receipt_{row.get('receipt_id')}",
@@ -205,7 +207,7 @@ def _confirmed_lines(
                 meal_mr=_parse_bool(row.get("meal_mr")),
             )
         )
-    return sorted(lines, key=lambda line: (line.transaction_date, line.transaction_id))
+    return sorted(lines, key=lambda line: (line.transaction_date, line.review_row_id or 0))
 
 
 def _allocate(line: ReportLine, day_totals: dict[date, dict[str, list[float]]], detail_lines: dict[date, list[MealDetailLine]]) -> None:
@@ -469,6 +471,7 @@ def _annotation_lines(lines: list[ReportLine]) -> list[ReceiptAnnotationLine]:
         ReceiptAnnotationLine(
             receipt_id=line.receipt_id,
             transaction_id=line.transaction_id,
+            review_row_id=line.review_row_id,
             receipt_path=line.receipt_path,
             receipt_file_name=line.receipt_file_name,
             transaction_date=line.transaction_date,

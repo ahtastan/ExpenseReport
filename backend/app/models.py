@@ -15,6 +15,11 @@ class AppUser(SQLModel, table=True):
     first_name: str | None = None
     last_name: str | None = None
     display_name: str | None = None
+    # Sticky 30-min current-report session context (M1 Day 2+).
+    current_report_id: int | None = Field(
+        default=None, foreign_key="expensereport.id", index=True
+    )
+    current_report_set_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -43,6 +48,10 @@ class ReceiptDocument(SQLModel, table=True):
     business_reason: str | None = None
     attendees: str | None = None
     needs_clarification: bool = Field(default=True, index=True)
+    # Attach a receipt to an expense report; NULL until M1 Day 4+ endpoint links it.
+    expense_report_id: int | None = Field(
+        default=None, foreign_key="expensereport.id", index=True
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -115,7 +124,15 @@ class PolicyDecision(SQLModel, table=True):
 
 class ReviewSession(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    statement_import_id: int = Field(foreign_key="statementimport.id", index=True)
+    # Nullable at the SQLModel layer for M1; existing SQLite NOT NULL constraint
+    # on pre-migration rows is retained (SQLite cannot relax NOT NULL via ALTER),
+    # so legacy rows keep their non-null value and only NEW inserts may omit it.
+    statement_import_id: int | None = Field(
+        default=None, foreign_key="statementimport.id", index=True
+    )
+    expense_report_id: int | None = Field(
+        default=None, foreign_key="expensereport.id", index=True
+    )
     status: str = Field(default="draft", index=True)
     snapshot_json: str | None = Field(default=None, sa_column=Column(Text))
     snapshot_hash: str | None = Field(default=None, index=True)
@@ -144,9 +161,42 @@ class ReviewRow(SQLModel, table=True):
 
 class ReportRun(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    statement_import_id: int = Field(foreign_key="statementimport.id", index=True)
+    # See ReviewSession note on nullable vs. SQLite NOT NULL retention.
+    statement_import_id: int | None = Field(
+        default=None, foreign_key="statementimport.id", index=True
+    )
+    expense_report_id: int | None = Field(
+        default=None, foreign_key="expensereport.id", index=True
+    )
     template_name: str = "corporate_expense_report"
     status: str = Field(default="draft", index=True)
     output_workbook_path: str | None = None
     output_pdf_path: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class ExpenseReport(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    owner_user_id: int = Field(foreign_key="appuser.id", index=True)
+    report_kind: str = Field(index=True)  # 'diners_statement' | 'personal_reimbursement'
+    title: str
+    status: str = Field(default="draft", index=True)
+    period_start: date | None = None
+    period_end: date | None = None
+    report_currency: str = Field(default="USD")  # USD or EUR only, enforced in app layer
+    statement_import_id: int | None = Field(
+        default=None, foreign_key="statementimport.id", index=True
+    )
+    notes: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class FxRate(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    rate_date: date = Field(index=True)
+    from_currency: str = Field(index=True)
+    to_currency: str = Field(index=True)
+    rate: float
+    source: str  # "openexchangerates" | "ecb" | "manual"
+    fetched_at: datetime = Field(default_factory=utc_now)

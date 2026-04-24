@@ -7,7 +7,13 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.db import get_session
 from app.models import ReportRun, StatementImport
-from app.schemas import ReportGenerateRequest, ReportRunRead, ReportValidationIssue, ReportValidationResult
+from app.schemas import (
+    ReportGenerateRequest,
+    ReportRunListRead,
+    ReportRunRead,
+    ReportValidationIssue,
+    ReportValidationResult,
+)
 from app.services.report_generator import generate_report_package
 from app.services.report_validation import validate_report_readiness
 from app.services.review_sessions import _resolve_statement_to_expense_report
@@ -36,7 +42,7 @@ def _resolve_owner_for_statement(session: Session, statement_import_id: int) -> 
     return expense_report_id, statement.uploader_user_id
 
 
-@router.get('/')
+@router.get('/', response_model=ReportRunListRead)
 def list_reports(session: Session = Depends(get_session)):
     return {"items": session.exec(select(ReportRun).order_by(ReportRun.created_at.desc())).all()}
 

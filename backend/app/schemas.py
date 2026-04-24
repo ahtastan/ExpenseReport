@@ -267,12 +267,14 @@ class ReportRunRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    statement_import_id: int
+    statement_import_id: int | None
     template_name: str
     status: str
-    output_workbook_path: str | None
-    output_pdf_path: str | None
     created_at: datetime
+
+
+class ReportRunListRead(BaseModel):
+    items: list[ReportRunRead]
 
 
 class ReportCreate(BaseModel):

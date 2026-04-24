@@ -199,7 +199,71 @@ def test_edited_row_is_not_overwritten_by_late_match() -> None:
         )
 
 
+def test_matched_row_falls_back_to_suggest_bucket_when_receipt_has_no_bucket() -> None:
+    """B3 regression: a matched receipt with null report_bucket must get a
+    suggested bucket derived from the statement supplier name, not leave the
+    review row with report_bucket=None."""
+    from app.services.merchant_buckets import suggest_bucket as _suggest
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=2002, display_name="B3 Tester")
+        statement = StatementImport(
+            source_filename=f"b3_bucket_{uuid4().hex[:8]}.xlsx",
+            row_count=1,
+        )
+        session.add(user)
+        session.add(statement)
+        session.commit()
+        session.refresh(statement)
+
+        tx = StatementTransaction(
+            statement_import_id=statement.id,
+            transaction_date=date(2026, 3, 15),
+            supplier_raw="SHELL PETROL",
+            supplier_normalized="SHELL PETROL",
+            local_currency="TRY",
+            local_amount=500.00,
+        )
+        receipt = ReceiptDocument(
+            source="test",
+            status="imported",
+            content_type="photo",
+            original_file_name="shell.jpg",
+            extracted_date=date(2026, 3, 15),
+            extracted_supplier="Shell",
+            extracted_local_amount=500.00,
+            extracted_currency="TRY",
+            business_or_personal="Business",
+            report_bucket=None,  # ← the B3 case: receipt has no stored bucket
+            needs_clarification=False,
+        )
+        session.add(tx)
+        session.add(receipt)
+        session.commit()
+        session.refresh(tx)
+        session.refresh(receipt)
+
+        _approve_match(session, tx.id, receipt.id)
+
+        review = get_or_create_review_session(session, statement.id)
+        rows = review_rows(session, review.id)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.receipt_document_id == receipt.id
+
+        import json as _json
+
+        suggested = _json.loads(row.suggested_json)
+        expected_bucket = _suggest("SHELL PETROL")
+        assert expected_bucket is not None, "fixture error: supplier must map to a known bucket"
+        assert suggested.get("report_bucket") == expected_bucket, (
+            f"matched row must fall back to suggest_bucket when receipt.report_bucket is None; "
+            f"got {suggested.get('report_bucket')!r}, expected {expected_bucket!r}"
+        )
+
+
 if __name__ == "__main__":
     test_review_session_picks_up_late_approved_match()
     test_edited_row_is_not_overwritten_by_late_match()
+    test_matched_row_falls_back_to_suggest_bucket_when_receipt_has_no_bucket()
     print("review_session_late_match_tests=passed")

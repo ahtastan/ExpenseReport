@@ -30,7 +30,7 @@ app.dcexpense.com {
 	# /review-sessions/*, and any future endpoint.
 	handle {
 		basicauth {
-			ahmet $2a$14$WuW.GOAH3L2gfd48qJAK9uCFKHz6SRxufNKMoBwXByIxF4Xi8xRra
+			ahmet $2a$14$4Tzeq45WGESr7zktv1wgD.rFJGlX8mY3sHyZLE/hC9ArlXQ4OR4Da
 		}
 		reverse_proxy 127.0.0.1:8080
 	}

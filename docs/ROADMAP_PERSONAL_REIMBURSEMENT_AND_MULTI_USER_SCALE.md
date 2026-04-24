@@ -264,6 +264,39 @@ Source: *Travel Tips — Hotels*.
 - Preferred chains (International): Ibis, Holiday Inn Express, Novotel.
 - Prohibited luxury chains: Ritz Carlton, Intercontinental, Marriott → flag for justification if detected in supplier.
 
+### 8.6.1 Automobile rental
+Source: *EDT Automobile Rental Guidelines and Agreement (`docs/source/EDT-Automobile-Rental-Guidelines-and-Agreement.docx`)*.
+
+**Hard rules (block submit unless justified):**
+- **Receipt required.** The final rental-agreement receipt must be attached. Diners Club summary totals and booking estimates do not qualify — block submit with code `car_rental_estimate_only`.
+- **Card used must be Diners Club** (processed as MasterCard). Rental charged to any other card → not reimbursable unless a written justification is attached (block code `car_rental_wrong_card`).
+- **Traffic / parking tickets and all infractions are not reimbursable.** Detect from supplier (e.g., "traffic fine", "ticket", "infraction", "citation") → hard block.
+- **Personal-use portion must be deducted.** If an employee flags a rental line as spanning personal days, use the §8.7 partial-expense pattern (`edt_share_amount`) to expense only the business portion. Include any personal-portion fuel purchases in the same deduction.
+
+**Auto-adjusted rules (modify amount on submit):**
+- **Prepaid gas / fuel drop-off charges → reimburse at 60% only.** Detect via bucket = `Auto Gasoline` AND supplier matches `\b(prepaid|drop.?off|fuel.?charge|fpo)\b` OR merchant = rental-company domain (Avis, Hertz, Enterprise, Budget, Sixt, Europcar, etc.). On submit, the policy engine auto-reduces the reimbursed amount to `0.60 × local_amount` and leaves an audit note `car_rental_prepaid_gas_60pct`. Employee can override with an "approved explanation of why it was not possible to purchase fuel at a station" — override requires a justification attached.
+
+**Soft flags (surface to reviewer / approver):**
+- **Car class above `standard / intermediate / mid-size`** → flag `car_rental_oversized` with message "Full-size or above requires ≥ 2 EDTers, excess luggage, or winter-weather justification." Employee can clear by attaching one of those reasons.
+- **Optional insurance charged** (CDW/LDW, SLI/LIS/LI beyond the primary-coverage minimum, PAI, PEC, ESP) → flag `car_rental_unneeded_insurance` unless a note "local law required" is attached.
+- **Non-preferred vendor used** (i.e., not Avis) when booking → flag `car_rental_non_avis`. Clear if the booking saved ≥ 15% versus the Avis rate (auto-dismiss when `booked_total ≤ 0.85 × avis_quote`, if `avis_quote` is provided; otherwise employee justifies).
+- **Unlisted driver note.** Display a dismissible advisory when any rental row is approved: *"Any driver who was not listed on the rental contract invalidates both credit-card and rental-company coverage."* Not a blocker; a gentle nudge on review.
+
+**Preferred-vendor data (seed rows for M4 `rental_preferred_vendor` table):**
+
+| Key | Value |
+|-----|-------|
+| Preferred chain | Avis |
+| AWD / corporate discount | **L016662** |
+| Reimbursable class ceiling | standard / intermediate / mid-size |
+| Upsize justification triggers | ≥ 2 EDTers, excess luggage, winter weather |
+| Approved insurance stance | Decline CDW/LDW, SLI/LIS/LI (beyond primary-coverage minimum), PAI, PEC, ESP |
+| Required payment instrument | Diners Club (processed as MasterCard) |
+
+**UI affordances M1/M2 can ship ahead of the full policy engine:**
+- Bucket `Auto Rental` (already exists in `REPORT_BUCKETS`) gets the same MEExpanded-style panel the M&E buckets have, with fields: `car_class_actual`, `upsize_reason`, `personal_days_included` (boolean → triggers §8.7 prompt), `prepaid_gas_charge` (boolean → auto-computes the 60% adjustment).
+- Receipt-extraction prompt additions: look for "prepaid fuel", "FPO", "fuel service option", and "car class" tokens on rental receipts; surface them in the review row automatically.
+
 ### 8.7 Partial-expense pattern (feature, not a rule)
 Source: *Travel Tips — Food, Drink, and Entertainment* ("EDT share = $X").
 - Receipt-level field `edt_share_amount` (local currency). If set, the report line uses that value instead of `local_amount`. UI lets the employee note "EDT share = $X" on the receipt attachment, surfacing the delta in the summary.

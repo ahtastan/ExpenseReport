@@ -201,7 +201,7 @@ def test_browser_import_assigns_stable_owner_and_unblocks_review_and_validation(
 
     with Session(engine) as session:
         demo_users = session.exec(
-            select(AppUser).where(AppUser.username == "demo-browser")
+            select(AppUser).where(AppUser.username == "demo")
         ).all()
     assert len(demo_users) == 1
 

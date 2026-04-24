@@ -25,11 +25,11 @@ from app.services.storage import save_upload_file
 router = APIRouter()
 
 
-def _browser_demo_user(session: Session) -> AppUser:
-    user = session.exec(select(AppUser).where(AppUser.username == "demo-browser")).first()
+def get_or_create_demo_user(session: Session) -> AppUser:
+    user = session.exec(select(AppUser).where(AppUser.username == "demo")).first()
     if user:
         return user
-    user = AppUser(username="demo-browser", display_name="Browser Demo User")
+    user = AppUser(username="demo", display_name="Demo User")
     session.add(user)
     session.commit()
     session.refresh(user)
@@ -37,7 +37,7 @@ def _browser_demo_user(session: Session) -> AppUser:
 
 
 def _browser_demo_user_id(session: Session) -> int:
-    user = _browser_demo_user(session)
+    user = get_or_create_demo_user(session)
     if user.id is None:
         raise HTTPException(status_code=500, detail="Demo user could not be initialized")
     return user.id

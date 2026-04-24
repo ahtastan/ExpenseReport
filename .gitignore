@@ -5,3 +5,6 @@ backend/data/
 backend/.env
 __pycache__/
 *.py[cod]
+
+# pip editable-install artifact
+*.egg-info/

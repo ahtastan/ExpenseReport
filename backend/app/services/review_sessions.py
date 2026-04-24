@@ -25,6 +25,8 @@ REQUIRED_FIELDS = [
     "report_bucket",
 ]
 
+PUBLIC_PATH_KEYS = {"storage_path", "receipt_path"}
+
 # Optional fields for the Air Travel Reconciliation detail table.
 # Not required for confirmation; populated per-row when the bucket is "Airfare/Bus/Ferry/Other".
 AIR_TRAVEL_FIELDS = [
@@ -99,6 +101,18 @@ def _other_meal_bucket_suggestions(bucket: str) -> str:
 
 def _loads(raw: str | None) -> dict[str, Any]:
     return json.loads(raw or "{}")
+
+
+def _public_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _public_payload(child)
+            for key, child in value.items()
+            if key not in PUBLIC_PATH_KEYS
+        }
+    if isinstance(value, list):
+        return [_public_payload(item) for item in value]
+    return value
 
 
 def _dumps(value: dict[str, Any] | list[dict[str, Any]]) -> str:
@@ -412,9 +426,9 @@ def session_payload(session: Session, review: ReviewSession) -> dict[str, Any]:
                 "status": row.status,
                 "attention_required": row.attention_required,
                 "attention_note": row.attention_note,
-                "source": _loads(row.source_json),
-                "suggested": _loads(row.suggested_json),
-                "confirmed": _loads(row.confirmed_json),
+                "source": _public_payload(_loads(row.source_json)),
+                "suggested": _public_payload(_loads(row.suggested_json)),
+                "confirmed": _public_payload(_loads(row.confirmed_json)),
             }
         )
     return {

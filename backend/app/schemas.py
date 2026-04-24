@@ -26,7 +26,6 @@ class ReceiptRead(BaseModel):
     content_type: str
     original_file_name: str | None
     mime_type: str | None
-    storage_path: str | None
     caption: str | None
     extracted_date: date | None
     extracted_supplier: str | None
@@ -90,7 +89,6 @@ class StatementImportRead(BaseModel):
     id: int
     uploader_user_id: int | None
     source_filename: str
-    storage_path: str | None
     statement_date: date | None
     period_start: date | None
     period_end: date | None
@@ -269,12 +267,14 @@ class ReportRunRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    statement_import_id: int
+    statement_import_id: int | None
     template_name: str
     status: str
-    output_workbook_path: str | None
-    output_pdf_path: str | None
     created_at: datetime
+
+
+class ReportRunListRead(BaseModel):
+    items: list[ReportRunRead]
 
 
 class ReportCreate(BaseModel):

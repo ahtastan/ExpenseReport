@@ -210,7 +210,7 @@ def _row_payload(tx: StatementTransaction, receipt: ReceiptDocument, decision: M
         "amount": amount,
         "currency": currency,
         "business_or_personal": receipt.business_or_personal,
-        "report_bucket": receipt.report_bucket,
+        "report_bucket": receipt.report_bucket or suggest_bucket(tx.supplier_raw),
         "business_reason": receipt.business_reason,
         "attendees": receipt.attendees,
         "match_confidence": decision.confidence,

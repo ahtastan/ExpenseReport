@@ -238,8 +238,8 @@ def get_or_create_review_session(session: Session, statement_import_id: int) -> 
 
 
 def _sync_review_rows(session: Session, review: ReviewSession) -> None:
-    existing_transaction_ids = {
-        row.statement_transaction_id
+    existing_rows_by_tx = {
+        row.statement_transaction_id: row
         for row in review_rows(session, review.id or 0)
     }
     transactions = [
@@ -260,8 +260,6 @@ def _sync_review_rows(session: Session, review: ReviewSession) -> None:
     for tx in transactions:
         if tx.id is None:
             continue
-        if tx.id in existing_transaction_ids:
-            continue
         decisions = sorted(approved_by_transaction.get(tx.id, []), key=lambda item: item.id or 0)
         decision = decisions[0] if decisions else None
         receipt = session.get(ReceiptDocument, decision.receipt_document_id) if decision else None
@@ -276,19 +274,43 @@ def _sync_review_rows(session: Session, review: ReviewSession) -> None:
             decision_id = None
             match_confidence = None
         missing = _missing_required_fields(suggested)
-        row = ReviewRow(
-            review_session_id=review.id or 0,
-            statement_transaction_id=tx.id,
-            receipt_document_id=receipt_id,
-            match_decision_id=decision_id,
-            status="needs_review" if missing or match_confidence != "high" else "suggested",
-            attention_required=bool(missing) or decision is None,
-            attention_note=", ".join(f"missing {field}" for field in missing) or None,
-            source_json=_dumps(source),
-            suggested_json=_dumps(suggested),
-            confirmed_json=_dumps(suggested),
-        )
-        session.add(row)
+        status = "needs_review" if missing or match_confidence != "high" else "suggested"
+        attention_required = bool(missing) or decision is None
+        attention_note = ", ".join(f"missing {field}" for field in missing) or None
+
+        existing_row = existing_rows_by_tx.get(tx.id)
+        if existing_row is None:
+            row = ReviewRow(
+                review_session_id=review.id or 0,
+                statement_transaction_id=tx.id,
+                receipt_document_id=receipt_id,
+                match_decision_id=decision_id,
+                status=status,
+                attention_required=attention_required,
+                attention_note=attention_note,
+                source_json=_dumps(source),
+                suggested_json=_dumps(suggested),
+                confirmed_json=_dumps(suggested),
+            )
+            session.add(row)
+            continue
+
+        if (
+            review.status == "draft"
+            and existing_row.status not in ("edited", "confirmed")
+            and existing_row.receipt_document_id is None
+            and receipt_id is not None
+        ):
+            existing_row.source_json = _dumps(source)
+            existing_row.suggested_json = _dumps(suggested)
+            existing_row.confirmed_json = _dumps(suggested)
+            existing_row.receipt_document_id = receipt_id
+            existing_row.match_decision_id = decision_id
+            existing_row.status = status
+            existing_row.attention_required = attention_required
+            existing_row.attention_note = attention_note
+            existing_row.updated_at = datetime.now(timezone.utc)
+            session.add(existing_row)
     session.commit()
 
 

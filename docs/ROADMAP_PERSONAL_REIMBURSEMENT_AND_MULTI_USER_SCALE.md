@@ -211,6 +211,15 @@ Order of operations for M1:
 
 This is the pre-seed data for the M4 policy engine. Every rule is modeled as `(trigger_condition, severity, message)`. Soft flags attach to a report/line but do not block submission; hard blocks must be cleared or justified before submit.
 
+### 8.0 EG / MR workbook flags (user-judgement → M4 auto-suggest)
+The EDT workbook's `Week 1B`/`Week 2B` meals-and-entertainment detail sheet has two single-letter columns:
+- **EG** — *Exceeds EDT spending guidelines.* User flags voluntarily when an expense crosses any of the §8.1 per-head caps.
+- **MR** — *Missing receipt.* User flags when an expense appears on the Diners statement but no paper/PDF receipt exists.
+
+Today (M1 scope) both are **user-judgement toggles** — surfaced in the review UI (pill toggles inside the Meals & Entertainment expanded panel; glance badges on the main row) and written straight to `meal_eg` / `meal_mr` on the `ReviewRow.confirmed_json`, which the report generator emits as the literal `x` the template expects.
+
+Under M4 the **policy engine will auto-suggest `EG=true`** whenever an expense line crosses a threshold in §8.1 (per-head meal caps, 18% tip ceiling, unusual-items list). The suggestion lands as a soft flag on the row — the user can accept it (persisting `meal_eg=true`) or dismiss it with a justification that becomes part of the audit trail. MR stays a pure user toggle since it's a factual statement about receipt availability, not a policy violation.
+
 ### 8.1 Meal caps (per head, soft flags)
 Source: *EDT Travel Tips — Food, Drink, and Entertainment*.
 

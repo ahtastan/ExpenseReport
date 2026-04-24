@@ -81,6 +81,11 @@ const REPORT_BUCKETS = [
   'Lab Supplies','Field Service Supplies','Assets','Other',
   'Meals/Snacks','Breakfast','Lunch','Dinner','Entertainment',
 ];
+// Meals & entertainment buckets map to the Week 1B/2B detail sheet in the EDT
+// workbook, where the single-letter EG / MR columns live. Keep in sync with
+// backend MEAL_BUCKETS in app/services/review_sessions.py.
+const MEAL_BUCKETS = ['Meals/Snacks','Breakfast','Lunch','Dinner','Entertainment'];
+const isMealBucket = b => MEAL_BUCKETS.includes(b);
 const CATEGORY_GROUPS = [
   { key:'Hotel & Travel',       buckets:['Hotel/Lodging/Laundry','Auto Rental','Auto Gasoline','Taxi/Parking/Tolls/Uber','Other Travel Related'] },
   { key:'Meals & Entertainment',buckets:['Meals/Snacks','Breakfast','Lunch','Dinner','Entertainment'] },
@@ -156,6 +161,8 @@ function apiRowToLocal(apiRow) {
     category:    c.report_bucket ? (BUCKET_TO_CATEGORY[c.report_bucket] || null) : null,
     meReason:    c.business_reason || '',
     meParticipants: c.attendees || '',
+    mealEg:      !!c.meal_eg,
+    mealMr:      !!c.meal_mr,
     atDate:      c.air_travel_date || '',
     atReturn:    c.air_travel_return_date || '',
     atFrom:      c.air_travel_from || '',
@@ -177,6 +184,8 @@ function buildApiFields(changes) {
     supplier:    v => ({ supplier: v }),
     meReason:    v => ({ business_reason: v }),
     meParticipants: v => ({ attendees: v }),
+    mealEg:      v => ({ meal_eg: !!v }),
+    mealMr:      v => ({ meal_mr: !!v }),
     atDate:      v => ({ air_travel_date: v || null }),
     atReturn:    v => ({ air_travel_return_date: v || null }),
     atFrom:      v => ({ air_travel_from: v || null }),
@@ -960,9 +969,33 @@ function AirTravelExpanded({ row, onSave }) {
   );
 }
 
+function MEFlagToggle({ label, tooltip, active, onToggle }) {
+  // Small pill-style toggle that matches the existing badge/button visual language.
+  // Active: accent background + white text. Inactive: surface + muted text.
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      title={tooltip}
+      aria-pressed={active}
+      style={{
+        padding:'3px 10px', borderRadius:4,
+        border:'1px solid ' + (active ? 'var(--accent)' : 'var(--border)'),
+        background: active ? 'var(--accent)' : 'var(--surface)',
+        color:      active ? '#fff'         : 'var(--text-3)',
+        fontSize:11, fontWeight:700, letterSpacing:'0.04em',
+        cursor:'pointer', minWidth:34,
+      }}>{label}</button>
+  );
+}
+
 function MEExpanded({ row, onSave }) {
   const [f, setF] = useState({ meReason:row.meReason||'', meParticipants:row.meParticipants||'' });
   const upd = (k,v) => setF(p=>({...p,[k]:v}));
+  // EG / MR toggle immediately — no Save button, because they're booleans and
+  // match the single-letter columns the EDT workbook expects on Week 1B / 2B.
+  const toggleEg = () => onSave(row.id, { mealEg: !row.mealEg });
+  const toggleMr = () => onSave(row.id, { mealMr: !row.mealMr });
   return (
     <div style={{ background:'var(--surface-2)', borderTop:'1px solid var(--border)', padding:'12px 16px 12px 44px' }}>
       <div style={{ fontSize:11, fontWeight:700, color:'var(--warning)', textTransform:'uppercase', letterSpacing:'0.06em', marginBottom:10 }}>Meals &amp; Entertainment Documentation</div>
@@ -974,6 +1007,15 @@ function MEExpanded({ row, onSave }) {
         <div style={{ display:'flex', flexDirection:'column', gap:3 }}>
           <span style={{ fontSize:10, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'0.04em', fontWeight:600 }}>Participants</span>
           <input value={f.meParticipants} onChange={e=>upd('meParticipants',e.target.value)} placeholder="Names, comma-separated" style={inp({width:240})}/>
+        </div>
+        <div style={{ display:'flex', flexDirection:'column', gap:3 }}>
+          <span style={{ fontSize:10, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'0.04em', fontWeight:600 }}>Flags</span>
+          <div style={{ display:'flex', gap:6 }}>
+            <MEFlagToggle label="EG" active={!!row.mealEg} onToggle={toggleEg}
+              tooltip="EG = Exceeds EDT spending guidelines (see travel & expense policy)"/>
+            <MEFlagToggle label="MR" active={!!row.mealMr} onToggle={toggleMr}
+              tooltip="MR = Missing receipt for this expense"/>
+          </div>
         </div>
         <button onClick={()=>onSave(row.id,f)} style={{ padding:'4px 14px', borderRadius:5, border:'none', background:'var(--accent)',
           color:'#fff', fontSize:12, fontWeight:600, cursor:'pointer', alignSelf:'flex-end', marginBottom:1 }}>Save</button>
@@ -1059,6 +1101,18 @@ function ReviewRowItem({ row, categoryMap, onToggleFlag, onSave, onLocalUpdate, 
         <div style={{ fontSize:13, fontWeight:500, paddingRight:6, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
           {row.supplier}
           {row.attention && <span title={row.attnNote} style={{ marginLeft:5, fontSize:10, color:'var(--danger)' }}>⚠</span>}
+          {/* Glance badges for EG/MR when active on a meal-bucket row. Toggled in the
+              expanded M&E panel; rendered here so flagged rows are scannable. */}
+          {isMealBucket(row.bucket) && row.mealEg && (
+            <span title="Exceeds EDT spending guidelines"
+              style={{ marginLeft:6, fontSize:9, fontWeight:700, letterSpacing:'0.04em',
+                padding:'1px 5px', borderRadius:3, background:'var(--warning-subtle)', color:'var(--warning)' }}>EG</span>
+          )}
+          {isMealBucket(row.bucket) && row.mealMr && (
+            <span title="Missing receipt for this expense"
+              style={{ marginLeft:4, fontSize:9, fontWeight:700, letterSpacing:'0.04em',
+                padding:'1px 5px', borderRadius:3, background:'var(--danger-subtle)', color:'var(--danger)' }}>MR</span>
+          )}
         </div>
         {/* Amount */}
         <div style={{ fontSize:12, fontWeight:600, textAlign:'right', paddingRight:10, whiteSpace:'nowrap' }}>{fmtAmt(row)}</div>

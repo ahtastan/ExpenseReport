@@ -1,3 +1,4 @@
+import mimetypes
 import os
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -42,7 +43,10 @@ def get_receipt_file(receipt_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="receipt has no attached file")
     if not os.path.isfile(receipt.storage_path):
         raise HTTPException(status_code=404, detail="attached file missing on disk")
-    media_type = receipt.mime_type or "application/octet-stream"
+    media_type = receipt.mime_type
+    if not media_type:
+        guessed, _ = mimetypes.guess_type(receipt.original_file_name or receipt.storage_path or "")
+        media_type = guessed or "application/octet-stream"
     filename = receipt.original_file_name or f"receipt_{receipt_id}"
     return FileResponse(
         path=receipt.storage_path,

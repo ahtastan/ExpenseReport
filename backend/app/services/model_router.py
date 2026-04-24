@@ -20,6 +20,7 @@ can point at fakes/stubs without code changes.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import os
@@ -56,6 +57,8 @@ _VISION_PROMPT = (
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
+_PDF_EXTENSIONS = {".pdf"}
+
 _MEDIA_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -63,6 +66,9 @@ _MEDIA_TYPES = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+
+_PDF_RASTER_DPI = 180
+_PDF_MAX_PAGES = 10
 
 
 @dataclass(frozen=True)
@@ -110,12 +116,83 @@ def _read_image_b64(path: Path) -> tuple[str, str] | None:
     return media, data
 
 
-def _call_openai(model: str, media_type: str, b64: str) -> dict[str, Any] | None:
-    """Invoke the OpenAI chat-completions vision API for a single image.
+def _read_pdf_pages_b64(
+    path: str,
+    dpi: int = _PDF_RASTER_DPI,
+    max_pages: int = _PDF_MAX_PAGES,
+) -> list[str] | None:
+    """Render each page of a PDF to PNG, return list of base64-encoded images.
 
-    Returns ``None`` when the key is unset, the SDK is unavailable, or the
-    response cannot be parsed as JSON. Callers handle fallback.
+    Returns ``None`` if the file isn't a PDF, doesn't exist, is empty, or
+    cannot be opened. Caps at ``max_pages`` to protect against pathologically
+    large files; pages past the cap are skipped with a warning.
     """
+    pdf_path = Path(path)
+    if not pdf_path.exists() or pdf_path.suffix.lower() not in _PDF_EXTENSIONS:
+        return None
+    try:
+        import pypdfium2 as pdfium  # deferred import
+    except Exception as exc:
+        logger.warning("pypdfium2 unavailable: %s", exc)
+        return None
+
+    scale = dpi / 72.0
+    pages_b64: list[str] = []
+    try:
+        document = pdfium.PdfDocument(str(pdf_path))
+    except Exception as exc:
+        logger.warning("Failed to open PDF %s: %s", pdf_path, exc)
+        return None
+    try:
+        page_count = len(document)
+        if page_count <= 0:
+            return None
+        if page_count > max_pages:
+            logger.warning(
+                "PDF %s has %d pages; rasterizing only the first %d.",
+                pdf_path,
+                page_count,
+                max_pages,
+            )
+        render_count = min(page_count, max_pages)
+        for index in range(render_count):
+            page = document[index]
+            try:
+                bitmap = page.render(scale=scale)
+                pil_image = bitmap.to_pil()
+                buffer = io.BytesIO()
+                pil_image.save(buffer, format="PNG")
+                pages_b64.append(base64.standard_b64encode(buffer.getvalue()).decode())
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.warning("Failed to rasterize PDF %s: %s", pdf_path, exc)
+        return None
+    finally:
+        try:
+            document.close()
+        except Exception:
+            pass
+
+    return pages_b64 or None
+
+
+def _call_openai(model: str, images: list[tuple[str, str]]) -> dict[str, Any] | None:
+    """Invoke the OpenAI chat-completions vision API for one or more images.
+
+    ``images`` is a list of ``(media_type, base64_payload)`` tuples. All
+    images are sent in a single user message as separate ``image_url``
+    content blocks so the model sees them together (preserves cross-page
+    context for multi-page PDFs).
+
+    Returns ``None`` when the key is unset, the SDK is unavailable, the
+    images list is empty, or the response cannot be parsed as JSON.
+    """
+    if not images:
+        return None
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -125,22 +202,17 @@ def _call_openai(model: str, media_type: str, b64: str) -> dict[str, Any] | None
         return None
     try:
         client = OpenAI(api_key=api_key)
-        data_url = f"data:{media_type};base64,{b64}"
+        content: list[dict[str, Any]] = [{"type": "text", "text": _VISION_PROMPT}]
+        for media_type, b64 in images:
+            data_url = f"data:{media_type};base64,{b64}"
+            content.append({"type": "image_url", "image_url": {"url": data_url}})
         response = client.chat.completions.create(
             model=model,
             max_completion_tokens=256,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _VISION_PROMPT},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
         )
-        content = response.choices[0].message.content or ""
-        return _extract_json(content)
+        content_text = response.choices[0].message.content or ""
+        return _extract_json(content_text)
     except Exception as exc:  # pragma: no cover - depends on live API
         logger.warning("OpenAI vision call failed on %s: %s", model, exc)
         return None
@@ -278,17 +350,34 @@ def synthesize_report_summary(report: dict[str, Any]) -> str | None:
 
 
 def vision_extract(storage_path: str) -> VisionResult | None:
-    """Run the staged vision pipeline (mini → full) for one image.
+    """Run the staged vision pipeline (mini → full) for one image or PDF.
+
+    For PDFs, every page (capped at ``_PDF_MAX_PAGES``) is rasterized once
+    and all page images are sent together in each model call, preserving
+    cross-page context (e.g. totals on a later page referencing bookings
+    on the first).
 
     Returns ``None`` when the file is unsupported or no model responded.
     """
-    encoded = _read_image_b64(Path(storage_path))
-    if encoded is None:
-        return None
-    media_type, b64 = encoded
-
+    path = Path(storage_path)
+    suffix = path.suffix.lower()
     notes: list[str] = []
-    mini_fields = _vision_call(MINI_MODEL, media_type, b64)
+
+    if suffix in _PDF_EXTENSIONS:
+        pages_b64 = _read_pdf_pages_b64(storage_path)
+        if not pages_b64:
+            return None
+        images: list[tuple[str, str]] = [("image/png", b64) for b64 in pages_b64]
+        notes.append(f"Rasterized PDF into {len(images)} page image(s) at {_PDF_RASTER_DPI} DPI.")
+    elif suffix in _IMAGE_EXTENSIONS:
+        encoded = _read_image_b64(path)
+        if encoded is None:
+            return None
+        images = [encoded]
+    else:
+        return None
+
+    mini_fields = _vision_call(MINI_MODEL, images)
     if mini_fields is not None:
         missing = _count_missing(mini_fields)
         if not missing:
@@ -300,7 +389,7 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     else:
         notes.append(f"Mini model ({MINI_MODEL}) unavailable or invalid; escalating.")
 
-    full_fields = _vision_call(FULL_MODEL, media_type, b64)
+    full_fields = _vision_call(FULL_MODEL, images)
     if full_fields is not None:
         notes.append(f"Vision extraction escalated to full model ({FULL_MODEL}).")
         return VisionResult(fields=full_fields, model=FULL_MODEL, escalated=True, notes=notes)

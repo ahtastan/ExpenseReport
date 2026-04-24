@@ -238,8 +238,8 @@ def get_or_create_review_session(session: Session, statement_import_id: int) -> 
 
 
 def _sync_review_rows(session: Session, review: ReviewSession) -> None:
-    existing_transaction_ids = {
-        row.statement_transaction_id
+    existing_rows_by_tx: dict[int, ReviewRow] = {
+        row.statement_transaction_id: row
         for row in review_rows(session, review.id or 0)
     }
     transactions = [
@@ -257,15 +257,53 @@ def _sync_review_rows(session: Session, review: ReviewSession) -> None:
         if decision.statement_transaction_id in transaction_by_id:
             approved_by_transaction.setdefault(decision.statement_transaction_id, []).append(decision)
 
+    # Late-match upgrades only fire while the session itself is still a draft.
+    # Confirmed sessions carry a snapshot; rewriting their rows would silently
+    # drift from the snapshot hash.
+    session_is_draft = review.status == "draft"
+
     for tx in transactions:
         if tx.id is None:
-            continue
-        if tx.id in existing_transaction_ids:
             continue
         decisions = sorted(approved_by_transaction.get(tx.id, []), key=lambda item: item.id or 0)
         decision = decisions[0] if decisions else None
         receipt = session.get(ReceiptDocument, decision.receipt_document_id) if decision else None
-        if decision and receipt and receipt.id is not None and decision.id is not None:
+        has_full_match = bool(
+            decision and receipt and receipt.id is not None and decision.id is not None
+        )
+
+        existing_row = existing_rows_by_tx.get(tx.id)
+        if existing_row is not None:
+            # Upgrade an existing row only when it is still untouched and a
+            # match has since been approved. Rows the user has edited or that
+            # belong to a confirmed session are left alone.
+            upgradable = (
+                session_is_draft
+                and existing_row.status not in ("edited", "confirmed")
+                and existing_row.receipt_document_id is None
+                and has_full_match
+            )
+            if not upgradable:
+                continue
+            source, suggested = _row_payload(tx, receipt, decision)
+            missing = _missing_required_fields(suggested)
+            existing_row.receipt_document_id = receipt.id
+            existing_row.match_decision_id = decision.id
+            existing_row.status = (
+                "needs_review" if missing or decision.confidence != "high" else "suggested"
+            )
+            existing_row.attention_required = bool(missing)
+            existing_row.attention_note = (
+                ", ".join(f"missing {field}" for field in missing) or None
+            )
+            existing_row.source_json = _dumps(source)
+            existing_row.suggested_json = _dumps(suggested)
+            existing_row.confirmed_json = _dumps(suggested)
+            existing_row.updated_at = datetime.now(timezone.utc)
+            session.add(existing_row)
+            continue
+
+        if has_full_match:
             source, suggested = _row_payload(tx, receipt, decision)
             receipt_id = receipt.id
             decision_id = decision.id

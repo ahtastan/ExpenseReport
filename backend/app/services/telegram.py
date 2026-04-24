@@ -8,7 +8,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from app.config import get_settings
-from app.models import AppUser, ReceiptDocument
+from app.models import AppUser, ClarificationQuestion, ReceiptDocument
 from app.services.clarifications import (
     answer_question,
     ensure_receipt_review_questions,
@@ -203,6 +203,56 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     content_type = "photo" if photo else "document"
     file_id = file_payload.get("file_id")
     original_name = file_payload.get("file_name") or f"telegram_{content_type}_{message.get('message_id')}.jpg"
+
+    # B10 idempotency — Telegram retries the webhook on timeout/error. Without
+    # a dedupe check we would redownload, re-OCR, and create a clone row for
+    # the same file_unique_id. Only treat as duplicate if the prior row made
+    # it past the download stage; "received_download_failed" /
+    # "received_metadata_only" rows represent failed first attempts, so the
+    # retry is the user's real chance to get the file stored — fall through
+    # to create-new.
+    file_unique_id = file_payload.get("file_unique_id")
+    if file_unique_id:
+        existing = session.exec(
+            select(ReceiptDocument).where(
+                ReceiptDocument.uploader_user_id == user.id,
+                ReceiptDocument.telegram_file_unique_id == file_unique_id,
+                ReceiptDocument.status.in_(["received", "extracted", "needs_extraction_review"]),
+            )
+        ).first()
+        if existing is not None:
+            print(
+                f"Telegram retry dedupe: returning existing receipt {existing.id} "
+                f"for file_unique_id={file_unique_id}"
+            )
+            open_questions = session.exec(
+                select(ClarificationQuestion)
+                .where(
+                    ClarificationQuestion.receipt_document_id == existing.id,
+                    ClarificationQuestion.status == "open",
+                )
+                .order_by(ClarificationQuestion.id)
+            ).all()
+            if open_questions:
+                if existing.ocr_confidence is not None and existing.ocr_confidence >= 0.6:
+                    summary = (
+                        f"I read: {existing.extracted_date or '?'} | "
+                        f"{existing.extracted_supplier or '?'} | "
+                        f"{existing.extracted_local_amount or '?'} {existing.extracted_currency or ''}."
+                    )
+                    client.send_message(chat_id, f"{summary}\n{open_questions[0].question_text}")
+                else:
+                    client.send_message(chat_id, open_questions[0].question_text)
+            else:
+                client.send_message(chat_id, "Receipt saved.")
+            return {
+                "ok": True,
+                "action": "receipt_duplicate",
+                "receipt_id": existing.id,
+                "user_id": user.id,
+                "questions_created": 0,
+            }
+
     storage_path = None
     status = "received"
     try:

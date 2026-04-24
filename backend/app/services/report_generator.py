@@ -5,10 +5,10 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import load_workbook
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 from app.config import get_settings
-from app.models import MatchDecision, ReceiptDocument, ReportRun, StatementTransaction
+from app.models import ReportRun
 from app.services import model_router
 from app.services.receipt_annotations import ReceiptAnnotationLine, create_annotated_receipts_pdf
 from app.services.report_validation import ReportValidation, validate_report_readiness
@@ -136,53 +136,6 @@ class ReportLine:
     meal_location: str | None = None
     meal_eg: bool = False
     meal_mr: bool = False
-
-
-def _approved_lines(session: Session, statement_import_id: int) -> list[ReportLine]:
-    transactions = {
-        tx.id: tx
-        for tx in session.exec(
-            select(StatementTransaction).where(StatementTransaction.statement_import_id == statement_import_id)
-        ).all()
-        if tx.id is not None
-    }
-    decisions = [
-        decision
-        for decision in session.exec(select(MatchDecision).where(MatchDecision.approved == True)).all()  # noqa: E712
-        if decision.statement_transaction_id in transactions
-    ]
-    lines: list[ReportLine] = []
-    for decision in decisions:
-        tx = transactions.get(decision.statement_transaction_id)
-        receipt = session.get(ReceiptDocument, decision.receipt_document_id)
-        if not tx or not receipt or tx.id is None or receipt.id is None:
-            continue
-        tx_date = tx.transaction_date or receipt.extracted_date
-        amount = tx.usd_amount if tx.usd_amount is not None else tx.local_amount
-        if not tx_date or amount is None:
-            continue
-        business_reason = (
-            receipt.business_reason
-            or DEFAULT_BUSINESS_REASONS.get(tx_date)
-            or ("Personal spending on Diners card" if (receipt.business_or_personal or "").lower() != "business" else "")
-        )
-        lines.append(
-            ReportLine(
-                transaction_id=tx.id,
-                receipt_id=receipt.id,
-                receipt_path=receipt.storage_path,
-                receipt_file_name=receipt.original_file_name or f"receipt_{receipt.id}",
-                transaction_date=tx_date,
-                supplier=tx.supplier_raw,
-                amount=float(amount),
-                currency="USD" if tx.usd_amount is not None else tx.local_currency,
-                business_or_personal=receipt.business_or_personal or "",
-                report_bucket=receipt.report_bucket or "",
-                business_reason=business_reason,
-                attendees=receipt.attendees or "",
-            )
-        )
-    return sorted(lines, key=lambda line: (line.transaction_date, line.transaction_id))
 
 
 def _parse_optional_date(value: object) -> date | None:

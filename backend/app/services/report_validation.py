@@ -4,7 +4,7 @@ import json
 
 from sqlmodel import Session, select
 
-from app.models import ClarificationQuestion, MatchDecision, PolicyDecision, ReceiptDocument, ReviewSession, StatementTransaction
+from app.models import ClarificationQuestion, MatchDecision, PolicyDecision, ReceiptDocument, ReviewRow, ReviewSession, StatementTransaction
 
 
 AIRFARE_BUCKET = "Airfare/Bus/Ferry/Other"
@@ -254,8 +254,39 @@ def validate_report_readiness(session: Session, statement_import_id: int) -> Rep
             )
         )
 
+    # B5: ReviewRow.confirmed_json is the canonical source for report_bucket and
+    # business_or_personal. Build a {receipt_id -> confirmed dict} lookup from the
+    # latest review session. Any approved receipt without a confirmed review row
+    # is a divided-ownership hazard and gets a structured error.
+    confirmed_by_receipt_id: dict[int, dict] = {}
+    latest_review = _latest_review_session(session, statement_import_id)
+    if latest_review and latest_review.id is not None:
+        for row in session.exec(
+            select(ReviewRow).where(ReviewRow.review_session_id == latest_review.id)
+        ).all():
+            if row.receipt_document_id is None:
+                continue
+            try:
+                confirmed_by_receipt_id[row.receipt_document_id] = json.loads(row.confirmed_json or "{}")
+            except json.JSONDecodeError:
+                confirmed_by_receipt_id[row.receipt_document_id] = {}
+
     for receipt in receipts:
-        bp = (receipt.business_or_personal or "").strip().lower()
+        if receipt.id is None or receipt.id not in confirmed_by_receipt_id:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="missing_review_row",
+                    message=(
+                        f"Receipt {receipt.id} has no confirmed review row "
+                        "— build or re-sync the review session before validating"
+                    ),
+                    receipt_id=receipt.id,
+                )
+            )
+            continue
+        confirmed = confirmed_by_receipt_id[receipt.id]
+        bp = (confirmed.get("business_or_personal") or "").strip().lower()
         if not bp:
             issues.append(
                 ValidationIssue(
@@ -267,7 +298,8 @@ def validate_report_readiness(session: Session, statement_import_id: int) -> Rep
             )
             continue
         if bp == "business":
-            if not (receipt.report_bucket or "").strip():
+            bucket_value = (confirmed.get("report_bucket") or "").strip()
+            if not bucket_value:
                 issues.append(
                     ValidationIssue(
                         severity="error",
@@ -285,7 +317,7 @@ def validate_report_readiness(session: Session, statement_import_id: int) -> Rep
                         receipt_id=receipt.id,
                     )
                 )
-            bucket = (receipt.report_bucket or "").lower()
+            bucket = bucket_value.lower()
             if any(token in bucket for token in ("meal", "breakfast", "lunch", "dinner", "entertainment")):
                 if not (receipt.attendees or "").strip():
                     issues.append(
@@ -336,8 +368,18 @@ def validate_report_readiness(session: Session, statement_import_id: int) -> Rep
 
     error_count = sum(1 for issue in issues if issue.severity == "error")
     warning_count = sum(1 for issue in issues if issue.severity == "warning")
-    business_receipts = sum(1 for receipt in receipts if (receipt.business_or_personal or "").lower() == "business")
-    personal_receipts = sum(1 for receipt in receipts if (receipt.business_or_personal or "").lower() == "personal")
+    business_receipts = sum(
+        1
+        for receipt in receipts
+        if receipt.id is not None
+        and (confirmed_by_receipt_id.get(receipt.id, {}).get("business_or_personal") or "").lower() == "business"
+    )
+    personal_receipts = sum(
+        1
+        for receipt in receipts
+        if receipt.id is not None
+        and (confirmed_by_receipt_id.get(receipt.id, {}).get("business_or_personal") or "").lower() == "personal"
+    )
     return ReportValidation(
         statement_import_id=statement_import_id,
         ready=error_count == 0,

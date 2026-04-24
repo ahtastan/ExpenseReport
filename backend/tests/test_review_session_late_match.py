@@ -27,6 +27,9 @@ os.environ.pop("ANTHROPIC_API_KEY", None)
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 
 from sqlmodel import Session  # noqa: E402
 
@@ -44,6 +47,7 @@ from app.services.review_sessions import (  # noqa: E402
     review_rows,
     update_review_row,
 )
+from _pivot_helpers import ensure_expense_report_for_statement  # noqa: E402
 
 
 create_db_and_tables()
@@ -58,11 +62,13 @@ def _seed_import_and_receipt(session: Session) -> tuple[int, int, int]:
         telegram_user_id=1001,
         display_name="Test Reviewer",
     )
+    session.add(user)
+    session.flush()
     statement = StatementImport(
         source_filename=f"late_match_{uuid4().hex[:8]}.xlsx",
         row_count=1,
+        uploader_user_id=user.id,
     )
-    session.add(user)
     session.add(statement)
     session.commit()
     session.refresh(statement)
@@ -117,7 +123,10 @@ def test_review_session_picks_up_late_approved_match() -> None:
         statement_id, tx_id, receipt_id = _seed_import_and_receipt(session)
 
         # First sync: no decisions yet, the single row must be unmatched.
-        review = get_or_create_review_session(session, statement_id)
+        review = get_or_create_review_session(
+            session,
+            expense_report_id=ensure_expense_report_for_statement(session, statement_id),
+        )
         rows = review_rows(session, review.id)
         assert len(rows) == 1, "expected a single review row for the single txn"
         row_before = rows[0]
@@ -130,7 +139,10 @@ def test_review_session_picks_up_late_approved_match() -> None:
 
         # Second sync: same session (get_or_create must return the existing
         # draft and re-sync rather than create a new one).
-        review_again = get_or_create_review_session(session, statement_id)
+        review_again = get_or_create_review_session(
+            session,
+            expense_report_id=ensure_expense_report_for_statement(session, statement_id),
+        )
         assert review_again.id == review.id, "must reuse the draft session"
 
         rows_after = review_rows(session, review_again.id)
@@ -152,7 +164,10 @@ def test_edited_row_is_not_overwritten_by_late_match() -> None:
     with Session(engine) as session:
         statement_id, tx_id, receipt_id = _seed_import_and_receipt(session)
 
-        review = get_or_create_review_session(session, statement_id)
+        review = get_or_create_review_session(
+            session,
+            expense_report_id=ensure_expense_report_for_statement(session, statement_id),
+        )
         rows = review_rows(session, review.id)
         assert len(rows) == 1
         row = rows[0]
@@ -184,7 +199,10 @@ def test_edited_row_is_not_overwritten_by_late_match() -> None:
 
         # Re-sync: must NOT clobber the user's edit. Row stays edited and
         # unlinked to a receipt (the user chose to leave it that way).
-        review_again = get_or_create_review_session(session, statement_id)
+        review_again = get_or_create_review_session(
+            session,
+            expense_report_id=ensure_expense_report_for_statement(session, statement_id),
+        )
         assert review_again.id == review.id
 
         rows_after = review_rows(session, review_again.id)
@@ -207,11 +225,13 @@ def test_matched_row_falls_back_to_suggest_bucket_when_receipt_has_no_bucket() -
 
     with Session(engine) as session:
         user = AppUser(telegram_user_id=2002, display_name="B3 Tester")
+        session.add(user)
+        session.flush()
         statement = StatementImport(
             source_filename=f"b3_bucket_{uuid4().hex[:8]}.xlsx",
             row_count=1,
+            uploader_user_id=user.id,
         )
-        session.add(user)
         session.add(statement)
         session.commit()
         session.refresh(statement)
@@ -245,7 +265,10 @@ def test_matched_row_falls_back_to_suggest_bucket_when_receipt_has_no_bucket() -
 
         _approve_match(session, tx.id, receipt.id)
 
-        review = get_or_create_review_session(session, statement.id)
+        review = get_or_create_review_session(
+            session,
+            expense_report_id=ensure_expense_report_for_statement(session, statement.id),
+        )
         rows = review_rows(session, review.id)
         assert len(rows) == 1
         row = rows[0]

@@ -116,7 +116,8 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Live browser smoke now covers the Add Statement modal: it opens `/review`, uploads a deterministic filename receipt, verifies extracted date/supplier/amount/currency prefill, edits supplier and amount, saves, and verifies the new manual row appears before continuing the existing bulk/validation smoke path.
 - Add Statement validation UX is hardened narrowly: missing date, supplier, and positive amount now show field-level messages and highlights; extraction that returns no usable statement prefill shows a clear operator-facing banner. The live smoke verifies the no-prefill banner, required-field messages, editability, save, new manual row, selected-visible bulk path, and validation path.
 - `/review` Import Statement upload now posts to the mounted backend route `POST /statements/import-excel` instead of the stale `/statements/import` path that returned Not Found. The live browser smoke generates a deterministic one-row Diners-format workbook, opens Import Statement, uploads it through the modal, waits for the import success state, and verifies `Smoke Import Market` appears after the review state refreshes.
-- Addition B annotated receipt PDF adjustment completed locally, not yet committed or pushed. `ReceiptAnnotationLine` and `ReportLine` now carry `review_row_id`; receipt color assignment now keys by `review_row_id` instead of `transaction_id`; report lines sort by `transaction_date` and `review_row_id`. Carolyn clarified that one receipt per page is not required: receipt evidence pages now use date-ordered packing with the existing 9-receipt cap, low-volume receipts from different dates may share a page, and same-day groups above 9 receipts split across pages. Existing legend/page-header behavior is currently treated as sufficient for date + subtotal/total labeling. Regression/full suite: `python -m pytest tests/ -x --tb=short` -> 84 passed, 1 skipped.
+- Addition B annotated receipt PDF adjustment committed in two checkpoints: `4b5aa22` (`Fix receipt PDF review-row grouping`) and `45ca67b` (`Improve multi-date receipt subtotal labels`). `ReceiptAnnotationLine` and `ReportLine` now carry `review_row_id`; receipt color assignment keys by `review_row_id` instead of `transaction_id`; report lines sort by `transaction_date` and `review_row_id`. Receipt evidence pages use date-ordered packing with the existing 9-receipt cap, low-volume receipts from different dates may share a page, and same-day groups above 9 receipts split across pages. Multi-date receipt evidence pages now add a compact `Date subtotals:` header line while retaining the existing date range and combined total. Full suite: `python -m pytest tests/ -x --tb=short` -> 87 passed, 1 skipped.
+- Addition B PDF visual verification generated `backend/.verify_data/pdf_visual_sample/receipt_evidence_multidate_subtotals.pdf`, plus rendered checks `receipt_evidence_page.png` and `receipt_legend_page.png`. Confirmed: 4 receipts packed onto one evidence page; receipt dates are in order (`2026-04-01`, `2026-04-01`, `2026-04-05`, `2026-04-06`); page header shows the date range; combined total is visible; `Date subtotals:` is visible/readable; first two receipts share the same border color because they share `review_row_id`; no layout/readability issue was found in the sample. `.claude/` and `cleanup_receipts.sql` remain untracked and unrelated.
 
 ## Not Implemented Yet
 - Personal expense report categories, including Personal Car mileage reimbursement, are intentionally out of scope for now.
@@ -127,10 +128,10 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Authentication/admin web UI.
 
 ## Recommended Next Step
-Commit and push the focused Addition B PDF color/layout adjustment after reviewing the diff. Do not start M0.5.3, storage-path hardening, VPS work, or unrelated UI hardening in the same commit.
+Push the focused Addition B PDF color/layout commits when ready. Do not start M0.5.3, storage-path hardening, VPS work, or unrelated UI hardening in the same commit.
 
 Strict next-model handoff: `docs/PDF_REVIEW_ROW_COLOR_GROUPING_HANDOFF_2026-04-24.md`.
 
 Immediate commands are listed in that handoff. The short version is:
-- Re-run `python -m pytest tests/ -x --tb=short` from `backend/`.
-- If still green, commit only the Addition B PDF color/layout files.
+- Re-run `python -m pytest tests/ -x --tb=short` from `backend/` if another change is made.
+- If still green and no further edits are needed, push the existing Addition B commits.

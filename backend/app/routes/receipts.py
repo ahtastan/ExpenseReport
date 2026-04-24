@@ -1,4 +1,7 @@
+import os
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 
 from app.db import get_session
@@ -28,6 +31,25 @@ def get_receipt(receipt_id: int, session: Session = Depends(get_session)):
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
     return receipt
+
+
+@router.get("/{receipt_id}/file")
+def get_receipt_file(receipt_id: int, session: Session = Depends(get_session)):
+    receipt = session.get(ReceiptDocument, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="receipt not found")
+    if not receipt.storage_path:
+        raise HTTPException(status_code=404, detail="receipt has no attached file")
+    if not os.path.isfile(receipt.storage_path):
+        raise HTTPException(status_code=404, detail="attached file missing on disk")
+    media_type = receipt.mime_type or "application/octet-stream"
+    filename = receipt.original_file_name or f"receipt_{receipt_id}"
+    return FileResponse(
+        path=receipt.storage_path,
+        media_type=media_type,
+        filename=filename,
+        content_disposition_type="inline",
+    )
 
 
 @router.patch("/{receipt_id}", response_model=ReceiptRead)

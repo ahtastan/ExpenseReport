@@ -105,6 +105,14 @@ def _assert_vision_supplier_wins_over_placeholder() -> None:
     assert "supplier" not in result.missing_fields
 
 
+def test_placeholder_rejected() -> None:
+    _assert_placeholder_rejected()
+
+
+def test_vision_supplier_wins_over_placeholder() -> None:
+    _assert_vision_supplier_wins_over_placeholder()
+
+
 def main() -> None:
     _assert_placeholder_rejected()
     _assert_vision_supplier_wins_over_placeholder()

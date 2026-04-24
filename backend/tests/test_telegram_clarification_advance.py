@@ -47,6 +47,10 @@ class _FakeTelegramClient:
         return None
 
 
+def test_clarification_advance_full_flow() -> None:
+    main()
+
+
 def main() -> None:
     get_settings.cache_clear()
     create_db_and_tables()

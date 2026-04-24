@@ -228,6 +228,7 @@ def test_report_bucket_allocation_uses_template_categories() -> None:
     detail_lines = defaultdict(list)
     base = dict(
         transaction_id=1,
+        review_row_id=1,
         receipt_id=None,
         receipt_path=None,
         receipt_file_name="missing_receipt",

@@ -83,6 +83,7 @@ LINE_COLOR_NAMES: tuple[str, ...] = (
 class ReceiptAnnotationLine:
     receipt_id: int | None
     transaction_id: int
+    review_row_id: int | None
     receipt_path: str | None
     receipt_file_name: str
     transaction_date: date
@@ -115,27 +116,21 @@ FONT_LEGEND_ENTRY = _font("arial.ttf", 42)
 
 # ─── Line keys, color assignment, grouping ────────────────────────────────────
 
-def _line_key(line: ReceiptAnnotationLine) -> int:
-    """Stable identifier of the report line a receipt backs.
-
-    Today the data model is 1-receipt-per-transaction so ``transaction_id``
-    is the right key. If future work allows multiple receipts per transaction
-    (one ReviewRow = one line = many receipts), this is the single place
-    to change.
-    """
-    return line.transaction_id
+def _line_key(line: ReceiptAnnotationLine) -> int | None:
+    """Stable ReviewRow/report-line identifier for the receipt's color group."""
+    return line.review_row_id
 
 
 def assign_colors_to_lines(
     lines: list[ReceiptAnnotationLine],
-) -> dict[int, str]:
+) -> dict[int | None, str]:
     """Assign a palette color to each distinct line in input order.
 
     Order is the order ``lines`` are given. Duplicates (multiple receipts
     sharing a line key) reuse the same color. Palette cycles past 10 lines.
     """
-    colors: dict[int, str] = {}
-    ordered_keys: list[int] = []
+    colors: dict[int | None, str] = {}
+    ordered_keys: list[int | None] = []
     for line in lines:
         k = _line_key(line)
         if k not in colors:
@@ -163,42 +158,32 @@ def consolidate_consecutive_days(
     by_day: dict[date, list[ReceiptAnnotationLine]],
     max_per_group: int = MAX_RECEIPTS_PER_DAY_GROUP,
 ) -> list[list[ReceiptAnnotationLine]]:
-    """Merge adjacent days whose combined receipt count fits on one page.
+    """Pack date-ordered receipt groups without exceeding the page cap.
 
-    - Days that aren't calendar-adjacent never merge.
-    - A single day whose own count exceeds ``max_per_group`` gets its own
-      group as-is (no mid-day splitting — simplifies header semantics).
+    - Receipts stay in transaction-date order, and same-date receipts stay
+      together unless that day exceeds ``max_per_group``.
+    - Multiple dates may share one page when the combined receipt count fits.
     - Multi-page PDF receipts count as 1 toward the cap (each
       ``ReceiptAnnotationLine`` is one receipt by construction).
     """
     dates = sorted(by_day.keys())
     groups: list[list[ReceiptAnnotationLine]] = []
     current: list[ReceiptAnnotationLine] = []
-    current_days: list[date] = []
 
     for d in dates:
         day_lines = by_day[d]
-        if len(day_lines) > max_per_group:
-            if current:
+        for offset in range(0, len(day_lines), max_per_group):
+            chunk = day_lines[offset : offset + max_per_group]
+            if current and (len(current) + len(chunk)) > max_per_group:
                 groups.append(current)
                 current = []
-                current_days = []
-            groups.append(list(day_lines))
-            continue
-
-        if (
-            current
-            and (d - current_days[-1]).days == 1
-            and (len(current) + len(day_lines)) <= max_per_group
-        ):
-            current.extend(day_lines)
-            current_days.append(d)
-            continue
-
-        if current:
-            groups.append(current)
-        current = list(day_lines)
-        current_days = [d]
+            if len(chunk) == max_per_group:
+                if current:
+                    groups.append(current)
+                    current = []
+                groups.append(list(chunk))
+                continue
+            current.extend(chunk)
 
     if current:
         groups.append(current)
@@ -372,11 +357,11 @@ def _apply_color_border(img: Image.Image, hex_color: str) -> Image.Image:
 
 def _per_line_summaries(
     lines: list[ReceiptAnnotationLine],
-    colors: dict[int, str],
+    colors: dict[int | None, str],
 ) -> list[dict]:
     """One summary entry per distinct line in color-assignment order."""
-    by_key: dict[int, dict] = {}
-    ordered_keys: list[int] = []
+    by_key: dict[int | None, dict] = {}
+    ordered_keys: list[int | None] = []
     for line in lines:
         k = _line_key(line)
         if k not in by_key:
@@ -398,7 +383,7 @@ def _per_line_summaries(
 
 def render_legend_page(
     lines: list[ReceiptAnnotationLine],
-    colors: dict[int, str],
+    colors: dict[int | None, str],
 ) -> list[Image.Image]:
     """Render the color legend. Flows to multiple pages if >20 lines."""
     summaries = _per_line_summaries(lines, colors)
@@ -464,7 +449,7 @@ def _group_total_by_currency(
 
 def render_day_page(
     group: list[ReceiptAnnotationLine],
-    colors: dict[int, str],
+    colors: dict[int | None, str],
 ) -> list[Image.Image]:
     """Render a single day-group. Returns 1+ pages.
 

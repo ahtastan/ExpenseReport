@@ -116,6 +116,7 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Live browser smoke now covers the Add Statement modal: it opens `/review`, uploads a deterministic filename receipt, verifies extracted date/supplier/amount/currency prefill, edits supplier and amount, saves, and verifies the new manual row appears before continuing the existing bulk/validation smoke path.
 - Add Statement validation UX is hardened narrowly: missing date, supplier, and positive amount now show field-level messages and highlights; extraction that returns no usable statement prefill shows a clear operator-facing banner. The live smoke verifies the no-prefill banner, required-field messages, editability, save, new manual row, selected-visible bulk path, and validation path.
 - `/review` Import Statement upload now posts to the mounted backend route `POST /statements/import-excel` instead of the stale `/statements/import` path that returned Not Found. The live browser smoke generates a deterministic one-row Diners-format workbook, opens Import Statement, uploads it through the modal, waits for the import success state, and verifies `Smoke Import Market` appears after the review state refreshes.
+- Addition B annotated receipt PDF adjustment completed locally, not yet committed or pushed. `ReceiptAnnotationLine` and `ReportLine` now carry `review_row_id`; receipt color assignment now keys by `review_row_id` instead of `transaction_id`; report lines sort by `transaction_date` and `review_row_id`. Carolyn clarified that one receipt per page is not required: receipt evidence pages now use date-ordered packing with the existing 9-receipt cap, low-volume receipts from different dates may share a page, and same-day groups above 9 receipts split across pages. Existing legend/page-header behavior is currently treated as sufficient for date + subtotal/total labeling. Regression/full suite: `python -m pytest tests/ -x --tb=short` -> 84 passed, 1 skipped.
 
 ## Not Implemented Yet
 - Personal expense report categories, including Personal Car mileage reimbursement, are intentionally out of scope for now.
@@ -126,9 +127,10 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Authentication/admin web UI.
 
 ## Recommended Next Step
-Continue UI-only hardening by adding an operator-facing invalid-statement upload message in the Import Statement modal, only if a live smoke or manual check shows the current generic error is too vague.
+Commit and push the focused Addition B PDF color/layout adjustment after reviewing the diff. Do not start M0.5.3, storage-path hardening, VPS work, or unrelated UI hardening in the same commit.
 
-Strict next-model handoff: `docs/IMPORT_STATEMENT_UPLOAD_HANDOFF_2026-04-23.md`.
+Strict next-model handoff: `docs/PDF_REVIEW_ROW_COLOR_GROUPING_HANDOFF_2026-04-24.md`.
 
 Immediate commands are listed in that handoff. The short version is:
-- Keep Import Statement narrow. Do not change statement import parsing, Add Statement, selected-visible bulk behavior, confirmation, snapshots, or report generation unless a focused UI smoke exposes a path-specific mismatch.
+- Re-run `python -m pytest tests/ -x --tb=short` from `backend/`.
+- If still green, commit only the Addition B PDF color/layout files.

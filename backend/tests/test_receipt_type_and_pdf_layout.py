@@ -82,12 +82,14 @@ def _make_line(
     currency: str = "USD",
     bucket: str = "Other",
     receipt_id: int | None = None,
+    review_row_id: int | None = None,
     receipt_path: str | None = None,
     bp: str = "Business",
 ) -> ReceiptAnnotationLine:
     return ReceiptAnnotationLine(
         receipt_id=receipt_id if receipt_id is not None else transaction_id,
         transaction_id=transaction_id,
+        review_row_id=review_row_id if review_row_id is not None else transaction_id,
         receipt_path=receipt_path,
         receipt_file_name=f"tx_{transaction_id}.jpg",
         transaction_date=tx_date,
@@ -454,15 +456,20 @@ def test_classifier_script_dry_run_and_apply(isolated_db, monkeypatch, capsys):
 # Part 5 — PDF layout
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def test_group_receipts_for_pdf_one_line_per_page_groups_by_transaction():
-    # 3 different transaction_ids on 3 different days.
+def test_group_receipts_for_pdf_packs_date_ordered_receipts_without_overcrowding():
+    # Low-volume receipts can share a page even across date gaps, in date order.
     lines = [
         _make_line(transaction_id=1, tx_date=date(2026, 4, 1)),
-        _make_line(transaction_id=2, tx_date=date(2026, 4, 5)),  # 4-day gap → no merge
+        _make_line(transaction_id=2, tx_date=date(2026, 4, 5)),
         _make_line(transaction_id=3, tx_date=date(2026, 4, 10)),
     ]
     groups = group_receipts_for_pdf(lines, strategy="day_grouped_colored")
-    assert len(groups) == 3
+    assert len(groups) == 1
+    assert [line.transaction_date for line in groups[0]] == [
+        date(2026, 4, 1),
+        date(2026, 4, 5),
+        date(2026, 4, 10),
+    ]
 
     # Grid strategy: single group
     grid_groups = group_receipts_for_pdf(lines, strategy="grid")
@@ -505,6 +512,20 @@ def test_day_grouping_splits_when_over_nine():
     assert len(groups[1]) == 5
 
 
+def test_day_grouping_splits_large_same_day_to_avoid_overcrowding():
+    lines = [
+        _make_line(transaction_id=600 + i, tx_date=date(2026, 4, 1))
+        for i in range(10)
+    ]
+
+    groups = group_receipts_for_pdf(lines, strategy="day_grouped_colored")
+
+    assert len(groups) == 2
+    assert len(groups[0]) == 9
+    assert len(groups[1]) == 1
+    assert all(line.transaction_date == date(2026, 4, 1) for group in groups for line in group)
+
+
 def test_color_assignment_sequential_to_palette():
     lines = [
         _make_line(transaction_id=1, tx_date=date(2026, 4, 1)),
@@ -515,6 +536,60 @@ def test_color_assignment_sequential_to_palette():
     assert colors[1] == LINE_COLOR_PALETTE[0]
     assert colors[2] == LINE_COLOR_PALETTE[1]
     assert colors[3] == LINE_COLOR_PALETTE[2]
+
+
+def test_color_assignment_uses_review_row_id_not_transaction_id():
+    shared_line_a = ReceiptAnnotationLine(
+        receipt_id=101,
+        transaction_id=1,
+        review_row_id=900,
+        receipt_path=None,
+        receipt_file_name="tx_1.jpg",
+        transaction_date=date(2026, 4, 1),
+        supplier="Supplier",
+        amount=50.0,
+        currency="USD",
+        business_or_personal="Business",
+        report_bucket="Other",
+        business_reason="Test reason",
+        attendees="self",
+    )
+    shared_line_b = ReceiptAnnotationLine(
+        receipt_id=102,
+        transaction_id=2,
+        review_row_id=900,
+        receipt_path=None,
+        receipt_file_name="tx_2.jpg",
+        transaction_date=date(2026, 4, 1),
+        supplier="Supplier",
+        amount=50.0,
+        currency="USD",
+        business_or_personal="Business",
+        report_bucket="Other",
+        business_reason="Test reason",
+        attendees="self",
+    )
+    next_line = ReceiptAnnotationLine(
+        receipt_id=103,
+        transaction_id=3,
+        review_row_id=901,
+        receipt_path=None,
+        receipt_file_name="tx_3.jpg",
+        transaction_date=date(2026, 4, 1),
+        supplier="Supplier",
+        amount=50.0,
+        currency="USD",
+        business_or_personal="Business",
+        report_bucket="Other",
+        business_reason="Test reason",
+        attendees="self",
+    )
+
+    colors = assign_colors_to_lines([shared_line_a, shared_line_b, next_line])
+
+    assert colors[900] == LINE_COLOR_PALETTE[0]
+    assert colors[901] == LINE_COLOR_PALETTE[1]
+    assert len(colors) == 2
 
 
 def test_color_assignment_cycles_palette_beyond_ten():

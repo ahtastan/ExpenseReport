@@ -26,6 +26,8 @@ async def telegram_webhook(
     session: Session = Depends(get_session),
 ):
     settings = get_settings()
+    if not settings.telegram_webhook_secret:
+        raise HTTPException(status_code=503, detail="Telegram webhook is unavailable")
     if settings.telegram_webhook_secret and x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
         raise HTTPException(status_code=401, detail="Invalid Telegram webhook secret")
     payload = await request.json()

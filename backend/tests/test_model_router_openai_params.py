@@ -51,7 +51,7 @@ def main() -> None:
     os.environ["OPENAI_API_KEY"] = "test-key"
     _FakeOpenAI.calls = []
     try:
-        vision = model_router._call_openai(model_router.MINI_MODEL, "image/png", "ZmFrZQ==")
+        vision = model_router._call_openai(model_router.MINI_MODEL, [("image/png", "ZmFrZQ==")])
         text = model_router._call_openai_text(model_router.SYNTHESIS_MODEL, "prompt", "{}")
     finally:
         if old_openai_module is None:

@@ -23,6 +23,9 @@ os.environ.pop("ANTHROPIC_API_KEY", None)
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 
 from sqlmodel import Session  # noqa: E402
 
@@ -44,6 +47,7 @@ from app.services.review_sessions import (  # noqa: E402
     review_rows,
     update_review_row,
 )
+from _pivot_helpers import ensure_expense_report_for_statement  # noqa: E402
 
 
 create_db_and_tables()
@@ -53,11 +57,13 @@ def _seed(session: Session) -> tuple[int, int, int]:
     """Seed one statement + one transaction + one receipt whose ORIGINAL
     extraction says report_bucket='Other' and business_or_personal='Business'."""
     user = AppUser(telegram_user_id=5005, display_name="B5 Tester")
+    session.add(user)
+    session.flush()
     statement = StatementImport(
         source_filename=f"b5_{uuid4().hex[:8]}.xlsx",
         row_count=1,
+        uploader_user_id=user.id,
     )
-    session.add(user)
     session.add(statement)
     session.commit()
     session.refresh(statement)
@@ -109,7 +115,10 @@ def test_report_generator_uses_confirmed_json_over_receipt_columns() -> None:
     with Session(engine) as session:
         statement_id, tx_id, receipt_id = _seed(session)
 
-        review = get_or_create_review_session(session, statement_id)
+        expense_report_id = ensure_expense_report_for_statement(session, statement_id)
+        review = get_or_create_review_session(
+            session, expense_report_id=expense_report_id
+        )
         rows = review_rows(session, review.id)
         assert len(rows) == 1
         row = rows[0]
@@ -144,7 +153,7 @@ def test_report_generator_uses_confirmed_json_over_receipt_columns() -> None:
         confirm_review_session(session, review.id)
 
         # Report-generation pipeline: lines must reflect confirmed_json.
-        lines = _confirmed_lines(session, statement_id)
+        lines = _confirmed_lines(session, expense_report_id=expense_report_id)
         assert len(lines) == 1
         line = lines[0]
         assert line.report_bucket == "Meals/Snacks", (
@@ -157,7 +166,9 @@ def test_report_generator_uses_confirmed_json_over_receipt_columns() -> None:
         # Validation pipeline: bp='Personal' on confirmed → personal_receipts
         # count must be 1 (counted from confirmed_by_receipt_id, NOT from the
         # receipt.business_or_personal='Business' column).
-        validation = validate_report_readiness(session, statement_id)
+        validation = validate_report_readiness(
+            session, expense_report_id=expense_report_id
+        )
         assert validation.personal_receipts == 1, (
             f"validation must count bp from confirmed_json; got personal_receipts={validation.personal_receipts}"
         )
@@ -172,11 +183,13 @@ def test_validate_report_readiness_errors_when_receipt_has_no_review_row() -> No
     to the receipt columns."""
     with Session(engine) as session:
         user = AppUser(telegram_user_id=5006, display_name="B5 Orphan Tester")
+        session.add(user)
+        session.flush()
         statement = StatementImport(
             source_filename=f"b5_orphan_{uuid4().hex[:8]}.xlsx",
             row_count=1,
+            uploader_user_id=user.id,
         )
-        session.add(user)
         session.add(statement)
         session.commit()
         session.refresh(statement)
@@ -220,7 +233,10 @@ def test_validate_report_readiness_errors_when_receipt_has_no_review_row() -> No
         session.commit()
 
         # Deliberately do NOT build a ReviewSession.
-        validation = validate_report_readiness(session, statement.id)
+        validation = validate_report_readiness(
+            session,
+            expense_report_id=ensure_expense_report_for_statement(session, statement.id),
+        )
         codes = [issue.code for issue in validation.issues]
         assert "missing_review_row" in codes, (
             f"expected missing_review_row error when no ReviewRow exists; issue codes={codes}"

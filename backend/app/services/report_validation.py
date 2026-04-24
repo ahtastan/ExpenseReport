@@ -4,7 +4,16 @@ import json
 
 from sqlmodel import Session, select
 
-from app.models import ClarificationQuestion, MatchDecision, PolicyDecision, ReceiptDocument, ReviewRow, ReviewSession, StatementTransaction
+from app.models import (
+    ClarificationQuestion,
+    ExpenseReport,
+    MatchDecision,
+    PolicyDecision,
+    ReceiptDocument,
+    ReviewRow,
+    ReviewSession,
+    StatementTransaction,
+)
 
 
 AIRFARE_BUCKET = "Airfare/Bus/Ferry/Other"
@@ -61,10 +70,12 @@ def _approved_decisions_for_statement(session: Session, statement_import_id: int
     ]
 
 
-def _latest_review_session(session: Session, statement_import_id: int) -> ReviewSession | None:
+def _latest_review_session(
+    session: Session, *, expense_report_id: int
+) -> ReviewSession | None:
     return session.exec(
         select(ReviewSession)
-        .where(ReviewSession.statement_import_id == statement_import_id)
+        .where(ReviewSession.expense_report_id == expense_report_id)
         .order_by(ReviewSession.created_at.desc())
     ).first()
 
@@ -100,8 +111,10 @@ def _air_travel_issue_context(row: dict, travel_date: date | None, return_date: 
     return context
 
 
-def _review_snapshot_issues(session: Session, statement_import_id: int) -> tuple[list[ValidationIssue], int | None]:
-    review = _latest_review_session(session, statement_import_id)
+def _review_snapshot_issues(
+    session: Session, *, expense_report_id: int
+) -> tuple[list[ValidationIssue], int | None]:
+    review = _latest_review_session(session, expense_report_id=expense_report_id)
     if not review or review.status != "confirmed" or not review.snapshot_json:
         return [
             ValidationIssue(
@@ -159,7 +172,24 @@ def _review_snapshot_issues(session: Session, statement_import_id: int) -> tuple
     return issues, len(snapshot)
 
 
-def validate_report_readiness(session: Session, statement_import_id: int) -> ReportValidation:
+def validate_report_readiness(
+    session: Session, *, expense_report_id: int
+) -> ReportValidation:
+    report = session.get(ExpenseReport, expense_report_id)
+    if report is None:
+        raise ValueError(f"ExpenseReport {expense_report_id} not found")
+    if report.report_kind == "personal_reimbursement":
+        raise NotImplementedError(
+            "Personal reimbursement report template coming in M1 Day 8-9"
+        )
+    if report.report_kind != "diners_statement":
+        raise ValueError(f"Unknown report_kind: {report.report_kind}")
+    if report.statement_import_id is None:
+        raise ValueError(
+            f"Diners-statement report {expense_report_id} has no statement_import_id"
+        )
+    statement_import_id = report.statement_import_id
+
     transactions = session.exec(
         select(StatementTransaction).where(StatementTransaction.statement_import_id == statement_import_id)
     ).all()
@@ -171,7 +201,9 @@ def validate_report_readiness(session: Session, statement_import_id: int) -> Rep
     ]
     decisions = [decision for decision in all_decisions if decision.approved]
     issues: list[ValidationIssue] = []
-    review_issue_list, confirmed_review_rows = _review_snapshot_issues(session, statement_import_id)
+    review_issue_list, confirmed_review_rows = _review_snapshot_issues(
+        session, expense_report_id=expense_report_id
+    )
     issues.extend(review_issue_list)
 
     if not transactions:
@@ -259,7 +291,7 @@ def validate_report_readiness(session: Session, statement_import_id: int) -> Rep
     # latest review session. Any approved receipt without a confirmed review row
     # is a divided-ownership hazard and gets a structured error.
     confirmed_by_receipt_id: dict[int, dict] = {}
-    latest_review = _latest_review_session(session, statement_import_id)
+    latest_review = _latest_review_session(session, expense_report_id=expense_report_id)
     if latest_review and latest_review.id is not None:
         for row in session.exec(
             select(ReviewRow).where(ReviewRow.review_session_id == latest_review.id)

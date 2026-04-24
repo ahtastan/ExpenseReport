@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from sqlmodel import Session
 
 from app.config import get_settings
-from app.models import ReportRun
+from app.models import ExpenseReport, ReportRun
 from app.services import model_router
 from app.services.receipt_annotations import ReceiptAnnotationLine, create_annotated_receipts_pdf
 from app.services.report_validation import ReportValidation, validate_report_readiness
@@ -164,8 +164,10 @@ def _parse_bool(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "eg", "mr"}
 
 
-def _confirmed_lines(session: Session, statement_import_id: int) -> list[ReportLine]:
-    _review, snapshot = confirmed_snapshot(session, statement_import_id)
+def _confirmed_lines(
+    session: Session, *, expense_report_id: int
+) -> list[ReportLine]:
+    _review, snapshot = confirmed_snapshot(session, expense_report_id=expense_report_id)
     lines: list[ReportLine] = []
     for row in snapshot:
         tx_date_raw = row.get("transaction_date")
@@ -484,16 +486,32 @@ def _annotation_lines(lines: list[ReportLine]) -> list[ReceiptAnnotationLine]:
 
 def generate_report_package(
     session: Session,
-    statement_import_id: int,
+    *,
+    expense_report_id: int,
     employee_name: str,
     title_prefix: str,
     allow_warnings: bool = True,
 ) -> ReportRun:
+    report = session.get(ExpenseReport, expense_report_id)
+    if report is None:
+        raise ValueError(f"ExpenseReport {expense_report_id} not found")
+    if report.report_kind == "personal_reimbursement":
+        raise NotImplementedError(
+            "Personal reimbursement report template coming in M1 Day 8-9"
+        )
+    if report.report_kind != "diners_statement":
+        raise ValueError(f"Unknown report_kind: {report.report_kind}")
+    if report.statement_import_id is None:
+        raise ValueError(
+            f"Diners-statement report {expense_report_id} has no statement_import_id"
+        )
+    statement_import_id = report.statement_import_id
+
     settings = get_settings()
     if not settings.report_template_path or not settings.report_template_path.exists():
         raise FileNotFoundError("Expense report template was not found. Set EXPENSE_REPORT_TEMPLATE_PATH.")
 
-    validation = validate_report_readiness(session, statement_import_id)
+    validation = validate_report_readiness(session, expense_report_id=expense_report_id)
     if validation.issue_count:
         if any(issue.code == "review_not_confirmed" for issue in validation.issues):
             raise ValueError("Report generation requires confirmed review data")
@@ -501,11 +519,16 @@ def generate_report_package(
     if validation.warning_count and not allow_warnings:
         raise ValueError(f"Report has {validation.warning_count} validation warning(s)")
 
-    lines = _confirmed_lines(session, statement_import_id)
+    lines = _confirmed_lines(session, expense_report_id=expense_report_id)
     if not lines:
         raise ValueError("No confirmed review rows are available for report generation")
 
-    run = ReportRun(statement_import_id=statement_import_id, template_name=settings.report_template_path.name, status="running")
+    run = ReportRun(
+        statement_import_id=statement_import_id,
+        expense_report_id=expense_report_id,
+        template_name=settings.report_template_path.name,
+        status="running",
+    )
     session.add(run)
     session.commit()
     session.refresh(run)

@@ -16,6 +16,14 @@ AMOUNT_RE = re.compile(
 ISO_DATE_RE = re.compile(r"(?<!\d)(?P<year>20\d{2})[-_.](?P<month>\d{1,2})[-_.](?P<day>\d{1,2})(?!\d)")
 LOCAL_DATE_RE = re.compile(r"(?<!\d)(?P<day>\d{1,2})[-_.\/](?P<month>\d{1,2})[-_.\/](?P<year>20\d{2})(?!\d)")
 MERCHANT_HINT_RE = re.compile(r"(?:merchant|vendor|supplier|store|restaurant)\s*[:=-]\s*(?P<merchant>[^|,\n]+)", re.IGNORECASE)
+# Platform-generated placeholder stems produced by services/telegram.py when a
+# user-supplied file name is not available (e.g. "telegram_photo_42.jpg",
+# "telegram_document_17.pdf", "telegram_statement_5.xlsx"). These carry no
+# real merchant signal and must NOT shadow vision-extracted supplier names.
+TELEGRAM_PLACEHOLDER_STEM_RE = re.compile(
+    r"^telegram[_\s-]*(?:photo|document|statement)(?:[_\s-]*\d+)?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -94,7 +102,12 @@ def _parse_merchant(text: str, filename: str | None) -> str | None:
     if hint:
         return _clean_merchant(hint.group("merchant"))
     if filename:
-        return _clean_merchant(Path(filename).stem)
+        stem = Path(filename).stem
+        # Reject Telegram-generated placeholder stems that would otherwise
+        # shadow the real merchant name produced by the vision pipeline.
+        if TELEGRAM_PLACEHOLDER_STEM_RE.match(stem):
+            return None
+        return _clean_merchant(stem)
     return None
 
 

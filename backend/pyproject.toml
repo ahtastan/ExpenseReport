@@ -19,3 +19,12 @@ dependencies = [
 factory = false
 host = "127.0.0.1"
 port = 8080
+
+# Tell setuptools which directories are installable packages.
+# Without this, flat-layout auto-discovery picks up both ``app`` and
+# ``migrations`` as top-level packages and refuses to build.
+# The migrations/ directory contains standalone migration scripts, NOT
+# an installable package.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]

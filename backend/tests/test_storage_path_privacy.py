@@ -168,6 +168,9 @@ def test_receipt_read_does_not_expose_storage_path(client):
     fetched = client.get(f"/receipts/{receipt_id}")
     assert fetched.status_code == 200, fetched.text
     _assert_no_public_path_leaks(fetched.json())
+    assert "receipt_type" in fetched.json(), (
+        "ReceiptRead must expose the receipt_type classification field"
+    )
 
     patched = client.patch(
         f"/receipts/{receipt_id}",

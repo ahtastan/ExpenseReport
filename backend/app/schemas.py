@@ -33,6 +33,7 @@ class ReceiptRead(BaseModel):
     extracted_currency: str | None
     business_or_personal: str | None
     report_bucket: str | None
+    receipt_type: str | None
     business_reason: str | None
     attendees: str | None
     needs_clarification: bool

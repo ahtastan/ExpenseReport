@@ -117,6 +117,29 @@ class StatementTransactionRead(BaseModel):
     created_at: datetime
 
 
+class ManualStatementDraft(BaseModel):
+    receipt_id: int
+    status: str
+    extracted_date: date | None
+    extracted_supplier: str | None
+    extracted_local_amount: float | None
+    extracted_currency: str | None
+    business_or_personal: str | None
+    confidence: float | None
+    missing_fields: list[str]
+    notes: list[str]
+
+
+class ManualStatementCreate(BaseModel):
+    statement_import_id: int | None = None
+    receipt_id: int | None = None
+    transaction_date: date
+    supplier: str
+    amount: float
+    currency: str = "TRY"
+    business_reason: str | None = None
+
+
 class MatchDecisionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -168,6 +191,7 @@ class ReviewRowUpdate(BaseModel):
 class ReviewBulkUpdateRequest(BaseModel):
     fields: dict[str, Any]
     scope: str = "attention_required"
+    row_ids: list[int] | None = None
 
 
 class ReviewBulkUpdateResult(BaseModel):
@@ -201,6 +225,11 @@ class ReviewSessionRead(BaseModel):
     rows: list[ReviewRowRead]
 
 
+class ManualStatementCreateResult(BaseModel):
+    transaction: StatementTransactionRead
+    review_session: ReviewSessionRead
+
+
 class ReportValidationIssue(BaseModel):
     severity: str
     code: str
@@ -212,6 +241,9 @@ class ReportValidationIssue(BaseModel):
     supplier: str | None = None
     transaction_date: str | None = None
     report_bucket: str | None = None
+    air_travel_date: str | None = None
+    air_travel_return_date: str | None = None
+    air_travel_rt_or_oneway: str | None = None
 
 
 class ReportValidationResult(BaseModel):
@@ -249,6 +281,8 @@ class TelegramWebhookResult(BaseModel):
     ok: bool
     action: str
     receipt_id: int | None = None
+    statement_import_id: int | None = None
     user_id: int | None = None
     questions_created: int = 0
+    transactions_imported: int = 0
     message: str | None = None

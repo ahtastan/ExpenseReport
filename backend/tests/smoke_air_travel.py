@@ -262,6 +262,8 @@ def main() -> None:
         assert missing_issue.supplier == "ROUNDTRIP AIR"
         assert missing_issue.transaction_date == "2026-03-20"
         assert missing_issue.report_bucket == AIRFARE_BUCKET
+        assert missing_issue.air_travel_date == "2026-03-20"
+        assert missing_issue.air_travel_rt_or_oneway == "RT"
         print("validation: OK  RT air travel requires return date")
 
         early_return_imp = StatementImport(source_filename="air_travel_early_return.xlsx", storage_path="(memory)")
@@ -297,14 +299,10 @@ def main() -> None:
         )
         confirm_review_session(session, early_return_review.id, confirmed_by_label="air-early-return-smoke")
         early_return_validation = validate_report_readiness(session, early_return_imp.id)
-        assert early_return_validation.issue_count == 1
-        early_issue = early_return_validation.issues[0]
-        assert early_issue.code == "air_travel_return_date_before_travel_date"
-        assert early_issue.review_row_id == early_return_row.id
-        assert early_issue.supplier == "EARLY RETURN AIR"
-        assert early_issue.transaction_date == "2026-03-20"
-        assert early_issue.report_bucket == AIRFARE_BUCKET
-        print("validation: OK  RT return date cannot be before travel date")
+        assert early_return_validation.issue_count == 0, (
+            "Return date earlier than travel date is allowed; no validation error expected."
+        )
+        print("validation: OK  RT return date earlier than travel date is accepted")
 
         print("AIR TRAVEL SMOKE TEST PASSED")
 

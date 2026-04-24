@@ -157,6 +157,7 @@ function apiRowToLocal(apiRow) {
     meReason:    c.business_reason || '',
     meParticipants: c.attendees || '',
     atDate:      c.air_travel_date || '',
+    atReturn:    c.air_travel_return_date || '',
     atFrom:      c.air_travel_from || '',
     atTo:        c.air_travel_to || '',
     atAirline:   c.air_travel_airline || '',
@@ -177,6 +178,7 @@ function buildApiFields(changes) {
     meReason:    v => ({ business_reason: v }),
     meParticipants: v => ({ attendees: v }),
     atDate:      v => ({ air_travel_date: v || null }),
+    atReturn:    v => ({ air_travel_return_date: v || null }),
     atFrom:      v => ({ air_travel_from: v || null }),
     atTo:        v => ({ air_travel_to: v || null }),
     atAirline:   v => ({ air_travel_airline: v || null }),
@@ -650,7 +652,7 @@ function ImportModal({ onClose, onImported }) {
     try {
       const fd = new FormData();
       fd.append('file', file);
-      await apiForm('/statements/import', fd);
+      await apiForm('/statements/import-excel', fd);
       setStep('done');
       setTimeout(() => { onImported(); onClose(); }, 1400);
     } catch(e) { setErr(e.message); setBusy(false); }
@@ -714,9 +716,200 @@ function ImportModal({ onClose, onImported }) {
   );
 }
 
+function AddStatementModal({ statementId, onClose, onCreated }) {
+  const [file, setFile] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [fields, setFields] = useState({
+    date:'',
+    supplier:'',
+    amount:'',
+    currency:'TRY',
+    businessReason:'',
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [done, setDone] = useState(false);
+  const [touched, setTouched] = useState({});
+  const fileRef = useRef();
+
+  function setField(key, value) {
+    setFields(prev => ({ ...prev, [key]:value }));
+    setTouched(prev => ({ ...prev, [key]:true }));
+  }
+
+  async function uploadAndExtract() {
+    if (!file) {
+      setErr('Choose a receipt file first.');
+      return;
+    }
+    setBusy(true); setErr('');
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const result = await apiForm('/statements/manual/receipt', fd);
+      setDraft(result);
+      setFields({
+        date: result.extracted_date || '',
+        supplier: result.extracted_supplier || '',
+        amount: result.extracted_local_amount != null ? String(result.extracted_local_amount) : '',
+        currency: result.extracted_currency || 'TRY',
+        businessReason:'',
+      });
+    } catch(e) {
+      setErr('Extraction failed: '+e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveStatement() {
+    const amount = parseFloat(fields.amount);
+    const validation = {
+      date: !fields.date,
+      supplier: !fields.supplier.trim(),
+      amount: !Number.isFinite(amount) || amount <= 0,
+    };
+    if (validation.date || validation.supplier || validation.amount) {
+      setTouched(prev => ({ ...prev, date:true, supplier:true, amount:true }));
+      setErr('Complete the highlighted statement fields before saving.');
+      return;
+    }
+    setBusy(true); setErr('');
+    try {
+      await api('/statements/manual/transactions', {
+        method:'POST',
+        body:JSON.stringify({
+          statement_import_id: statementId || null,
+          receipt_id: draft?.receipt_id || null,
+          transaction_date: fields.date,
+          supplier: fields.supplier.trim(),
+          amount,
+          currency: (fields.currency || 'TRY').trim(),
+          business_reason: fields.businessReason.trim() || null,
+        }),
+      });
+      setDone(true);
+      setTimeout(() => { onCreated(); onClose(); }, 900);
+    } catch(e) {
+      setErr('Save failed: '+e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const inputStyle = extra => ({ ...inp({ width:'100%' }), padding:'7px 9px', fontSize:13, ...extra });
+  const missing = draft?.missing_fields || [];
+  const amountValue = parseFloat(fields.amount);
+  const fieldErrors = {
+    date: !fields.date ? 'Transaction date is required.' : '',
+    supplier: !fields.supplier.trim() ? 'Supplier is required.' : '',
+    amount: !Number.isFinite(amountValue) || amountValue <= 0 ? 'Positive amount is required.' : '',
+  };
+  const noUsablePrefill = !!draft && !fields.date && !fields.supplier.trim() && !fields.amount;
+  const validationText = key => touched[key] && fieldErrors[key]
+    ? <span style={{ fontSize:11, color:'var(--danger)', textTransform:'none', letterSpacing:0, fontWeight:500 }}>{fieldErrors[key]}</span>
+    : null;
+  const validationInputStyle = key => inputStyle(touched[key] && fieldErrors[key]
+    ? { borderColor:'var(--danger)', background:'var(--danger-subtle)' }
+    : {});
+
+  return (
+    <div onClick={onClose} style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.5)',
+      zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div onClick={e=>e.stopPropagation()} style={{ background:'var(--surface)', border:'1px solid var(--border)',
+        borderRadius:10, width:500, boxShadow:'0 20px 60px rgba(0,0,0,0.25)' }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'14px 18px', borderBottom:'1px solid var(--border)' }}>
+          <div>
+            <div style={{ fontSize:14, fontWeight:600 }}>Add Statement Entry</div>
+            <div style={{ fontSize:11, color:'var(--text-3)', marginTop:2 }}>Upload a receipt, review the extracted values, then save.</div>
+          </div>
+          <button onClick={onClose} style={{ background:'none', border:'none', cursor:'pointer', fontSize:18, color:'var(--text-3)' }}>x</button>
+        </div>
+        <div style={{ padding:18 }}>
+          {done ? (
+            <div style={{ textAlign:'center', padding:'22px 0' }}>
+              <div style={{ fontSize:24, marginBottom:8, color:'var(--success)' }}>Saved</div>
+              <div style={{ fontSize:12, color:'var(--text-2)' }}>Refreshing review queue...</div>
+            </div>
+          ) : (
+            <>
+              <div style={{ display:'flex', gap:8, alignItems:'center', marginBottom:12 }}>
+                <input ref={fileRef} type="file" accept="image/*,.pdf,application/pdf" style={{ display:'none' }}
+                  onChange={e=>{ setFile(e.target.files[0]); setDraft(null); setErr(''); }}/>
+                <button onClick={()=>fileRef.current.click()} style={{ padding:'7px 12px', borderRadius:6,
+                  border:'1px solid var(--border)', background:'var(--surface-2)', color:'var(--text-2)',
+                  fontSize:12, fontWeight:600, cursor:'pointer' }}>
+                  Choose receipt
+                </button>
+                <div style={{ flex:1, minWidth:0, fontSize:12, color:file?'var(--text-2)':'var(--text-3)',
+                  whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>
+                  {file ? `${file.name} (${Math.max(1, Math.round(file.size/1024))} KB)` : 'Image or PDF receipt'}
+                </div>
+                <button onClick={uploadAndExtract} disabled={!file||busy} style={{ padding:'7px 12px',
+                  borderRadius:6, border:'none', background:!file||busy?'var(--surface-2)':'var(--accent)',
+                  color:!file||busy?'var(--text-3)':'#fff', fontSize:12, fontWeight:600,
+                  cursor:!file||busy?'default':'pointer' }}>
+                  {busy && !draft ? 'Extracting...' : 'Extract'}
+                </button>
+              </div>
+              {draft && (
+                <div style={{ background:noUsablePrefill?'var(--danger-subtle)':missing.length?'var(--warning-subtle)':'var(--success-subtle)',
+                  border:`1px solid ${noUsablePrefill?'var(--danger)':missing.length?'var(--warning)':'var(--success)'}`, borderRadius:6,
+                  padding:'8px 10px', fontSize:12, color:'var(--text-2)', marginBottom:12 }}>
+                  {noUsablePrefill
+                    ? 'Extraction finished, but no usable statement fields were found. Enter date, supplier, and amount manually.'
+                    : missing.length
+                    ? `Extraction needs review: ${missing.join(', ')}. Edit the fields before saving.`
+                    : 'Extraction filled the statement fields. Edit anything that looks off before saving.'}
+                </div>
+              )}
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:10 }}>
+                <label style={{ display:'flex', flexDirection:'column', gap:4, fontSize:11, color:'var(--text-3)', fontWeight:600, textTransform:'uppercase', letterSpacing:'0.04em' }}>
+                  Date
+                  <input type="date" value={fields.date} onBlur={()=>setTouched(prev=>({...prev,date:true}))} onChange={e=>setField('date',e.target.value)} style={validationInputStyle('date')}/>
+                  {validationText('date')}
+                </label>
+                <label style={{ display:'flex', flexDirection:'column', gap:4, fontSize:11, color:'var(--text-3)', fontWeight:600, textTransform:'uppercase', letterSpacing:'0.04em' }}>
+                  Amount
+                  <input type="number" step="0.01" value={fields.amount} onBlur={()=>setTouched(prev=>({...prev,amount:true}))} onChange={e=>setField('amount',e.target.value)} style={validationInputStyle('amount')}/>
+                  {validationText('amount')}
+                </label>
+                <label style={{ display:'flex', flexDirection:'column', gap:4, fontSize:11, color:'var(--text-3)', fontWeight:600, textTransform:'uppercase', letterSpacing:'0.04em' }}>
+                  Supplier
+                  <input value={fields.supplier} onBlur={()=>setTouched(prev=>({...prev,supplier:true}))} onChange={e=>setField('supplier',e.target.value)} style={validationInputStyle('supplier')}/>
+                  {validationText('supplier')}
+                </label>
+                <label style={{ display:'flex', flexDirection:'column', gap:4, fontSize:11, color:'var(--text-3)', fontWeight:600, textTransform:'uppercase', letterSpacing:'0.04em' }}>
+                  Currency
+                  <input value={fields.currency} onChange={e=>setField('currency',e.target.value.toUpperCase())} style={inputStyle()}/>
+                </label>
+              </div>
+              <label style={{ display:'flex', flexDirection:'column', gap:4, fontSize:11, color:'var(--text-3)', fontWeight:600, textTransform:'uppercase', letterSpacing:'0.04em', marginBottom:12 }}>
+                Business purpose
+                <input value={fields.businessReason} onChange={e=>setField('businessReason',e.target.value)} placeholder="Optional note for the review row" style={inputStyle()}/>
+              </label>
+              {err && <div style={{ fontSize:12, color:'var(--danger)', marginBottom:10 }}>{err}</div>}
+              <div style={{ display:'flex', gap:8 }}>
+                <button onClick={onClose} disabled={busy} style={{ flex:1, padding:'8px', borderRadius:6,
+                  border:'1px solid var(--border)', background:'var(--surface-2)', color:'var(--text-2)',
+                  fontSize:12, cursor:'pointer' }}>Cancel</button>
+                <button onClick={saveStatement} disabled={busy} style={{ flex:2, padding:'8px', borderRadius:6,
+                  border:'none', background:'var(--accent)', color:'#fff', fontSize:13, fontWeight:600,
+                  cursor:'pointer', opacity:busy?0.7:1 }}>
+                  {busy && draft ? 'Saving...' : 'Save statement entry'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AirTravelExpanded({ row, onSave }) {
   const [f, setF] = useState({
-    atDate: row.atDate||'', atFrom:row.atFrom||'', atTo:row.atTo||'',
+    atDate: row.atDate||'', atReturn:row.atReturn||'', atFrom:row.atFrom||'', atTo:row.atTo||'',
     atAirline:row.atAirline||'', atRt:row.atRt||'one_way',
     atPaidBy:row.atPaidBy||'DC Card',
     atTotalCost:row.atTotalCost!==''?row.atTotalCost:'',
@@ -725,23 +918,28 @@ function AirTravelExpanded({ row, onSave }) {
   });
   const [err, setErr] = useState('');
   const upd = (k,v) => setF(p=>({...p,[k]:v}));
-  function save() { setErr(''); onSave(row.id, f); }
+  const isRoundTrip = String(f.atRt||'').trim().toLowerCase() === 'rt';
+  function save() {
+    setErr('');
+    onSave(row.id, f);
+  }
   const field = (label, content) => (
-    <div style={{ display:'flex', flexDirection:'column', gap:3 }}>
+    <div style={{ display:'flex', flexDirection:'column', gap:3, flex:'0 0 auto' }}>
       <span style={{ fontSize:10, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'0.04em', fontWeight:600 }}>{label}</span>
       {content}
     </div>
   );
   return (
-    <div style={{ background:'var(--surface-2)', borderTop:'1px solid var(--border)', padding:'12px 16px 12px 44px' }}>
+    <div data-testid="air-travel-panel" style={{ background:'var(--surface-2)', borderTop:'1px solid var(--border)', padding:'12px 16px 12px 44px' }}>
       <div style={{ fontSize:11, fontWeight:700, color:'var(--accent)', textTransform:'uppercase', letterSpacing:'0.06em', marginBottom:10 }}>Air Travel Reconciliation</div>
-      <div style={{ display:'flex', flexWrap:'wrap', gap:'10px 16px', alignItems:'flex-end' }}>
-        {field('Travel date',<input type="date" value={f.atDate} onChange={e=>upd('atDate',e.target.value)} style={inp({width:120})}/>)}
-        {field('From',<input value={f.atFrom} onChange={e=>upd('atFrom',e.target.value)} placeholder="IST" style={inp({width:60})}/>)}
-        {field('To',<input value={f.atTo} onChange={e=>upd('atTo',e.target.value)} placeholder="ESB" style={inp({width:60})}/>)}
-        {field('Airline',<input value={f.atAirline} onChange={e=>upd('atAirline',e.target.value)} placeholder="THY" style={inp({width:130})}/>)}
+      <div style={{ display:'flex', flexWrap:'nowrap', gap:10, alignItems:'flex-end', overflowX:'auto', paddingBottom:2 }}>
+        {field('Travel date',<input type="date" value={f.atDate} onChange={e=>upd('atDate',e.target.value)} style={inp({width:118})}/>)}
+        {isRoundTrip && field('Return date',<input type="date" value={f.atReturn} onChange={e=>upd('atReturn',e.target.value)} style={inp({width:118})}/>)}
+        {field('From',<input value={f.atFrom} onChange={e=>upd('atFrom',e.target.value)} placeholder="IST" style={inp({width:58})}/>)}
+        {field('To',<input value={f.atTo} onChange={e=>upd('atTo',e.target.value)} placeholder="ESB" style={inp({width:58})}/>)}
+        {field('Airline',<input value={f.atAirline} onChange={e=>upd('atAirline',e.target.value)} placeholder="THY" style={inp({width:120})}/>)}
         {field('RT / One way',(
-          <select value={f.atRt} onChange={e=>upd('atRt',e.target.value)} style={inp({width:100})}>
+          <select value={String(f.atRt||'one_way').toLowerCase()} onChange={e=>upd('atRt',e.target.value)} style={inp({width:110})}>
             <option value="one_way">One way</option>
             <option value="rt">Round trip</option>
           </select>
@@ -753,7 +951,7 @@ function AirTravelExpanded({ row, onSave }) {
         ))}
         {field('Total ticket cost',<input type="number" value={f.atTotalCost} onChange={e=>upd('atTotalCost',e.target.value)} placeholder="0.00" style={inp({width:110})}/>)}
         {field('Prior ticket value',<input type="number" value={f.atPriorValue} onChange={e=>upd('atPriorValue',e.target.value)} placeholder="—" style={inp({width:110})}/>)}
-        {field('Comments',<input value={f.atComments} onChange={e=>upd('atComments',e.target.value)} placeholder="Optional" style={inp({width:180})}/>)}
+        {field('Comments',<input value={f.atComments} onChange={e=>upd('atComments',e.target.value)} placeholder="Optional" style={inp({width:160})}/>)}
         <button onClick={save} style={{ padding:'4px 14px', borderRadius:5, border:'none', background:'var(--accent)',
           color:'#fff', fontSize:12, fontWeight:600, cursor:'pointer', alignSelf:'flex-end', marginBottom:1 }}>Save</button>
       </div>
@@ -822,18 +1020,23 @@ function ExpandedRow({ row, onSave }) {
 // grid columns: flag | date | supplier | amount | match | B/P | category | bucket | receipt | status | actions
 const GRID = '24px 100px 1fr 105px 52px 88px 132px 114px 52px 90px 64px';
 
-function ReviewRowItem({ row, categoryMap, onToggleFlag, onSave, onPreview, saving }) {
+function ReviewRowItem({ row, categoryMap, onToggleFlag, onSave, onLocalUpdate, onPreview, saving }) {
   const [expanded, setExpanded] = useState(false);
   const fmtAmt = r => r.localAmount!=null
     ? `${r.localAmount.toLocaleString('tr-TR',{minimumFractionDigits:2})} ${r.localCurrency}`
     : (r.usdAmount!=null ? `$${r.usdAmount.toFixed(2)}` : '—');
 
   function handleBP(val)       { onSave(row.id,{bp:val}); }
-  function handleCategory(val) { onSave(row.id,{category:val, bucket:null}); }
+  // Category is a derived/local-only concept — update local state only, no API call.
+  // The bucket dropdown will repopulate; the user then picks a bucket (which IS persisted).
+  function handleCategory(val) { onLocalUpdate(row.id,{category:val, bucket:null}); }
   function handleBucket(val)   { onSave(row.id,{bucket:val}); }
   function handleDate(val)     { onSave(row.id,{date:val}); }
 
-  const categories = Object.keys(categoryMap||{});
+  // Only show categories that have at least one selectable bucket. This hides
+  // "Personal Car" (buckets:[]) from the dropdown while keeping the entry in
+  // CATEGORY_GROUPS for a future personal-expense reinstate.
+  const categories = Object.keys(categoryMap||{}).filter(k => (categoryMap[k]||[]).length > 0);
   const buckets = row.category ? (categoryMap[row.category]||[]) : [];
 
   const rowBg = expanded ? 'var(--surface-2)'
@@ -948,12 +1151,18 @@ function WorkflowBar({ sessionStatus, onConfirm, onValidate, hasErrors, download
   );
 }
 
-function ReviewQueue({ session, localRows, categoryMap, onSave, onToggleFlag, onConfirmSession, onValidate, onImported, addAudit, sessionStatus, downloadUrl, reportRunId }) {
+function ReviewQueue({ session, localRows, categoryMap, onSave, onLocalUpdate, onToggleFlag, onConfirmSession, onValidate, onImported, addAudit, sessionStatus, downloadUrl, reportRunId }) {
   const [filter, setFilter] = useState('all');
   const [showImport, setShowImport] = useState(false);
+  const [showAddStatement, setShowAddStatement] = useState(false);
   const [previewRow, setPreviewRow] = useState(null);
   const [savingIds, setSavingIds] = useState(new Set());
   const [toast, setToast] = useState(null);
+  const [bulkScope, setBulkScope] = useState('attention_required');
+  const [bulkBp, setBulkBp] = useState('');
+  const [bulkCategory, setBulkCategory] = useState('');
+  const [bulkBucket, setBulkBucket] = useState('');
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   function showToast(msg) { setToast(msg); setTimeout(()=>setToast(null),3500); }
 
@@ -985,6 +1194,36 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onToggleFlag, on
     }
   }
 
+  async function handleBulkApply() {
+    if (!session?.id) return;
+    const localChanges = {};
+    if (bulkBp) localChanges.bp = bulkBp;
+    if (bulkBucket) localChanges.bucket = bulkBucket;
+    if (Object.keys(localChanges).length === 0) {
+      showToast('Choose B/P or bucket first');
+      return;
+    }
+    setBulkBusy(true);
+    try {
+      const scopeVal = bulkScope === 'selected (visible)' ? 'selected' : bulkScope;
+      const payload = { fields:buildApiFields(localChanges), scope:scopeVal };
+      if (scopeVal === 'selected') {
+        payload.row_ids = filtered.map(r => r.id);
+      }
+      const result = await api(`/reviews/report/${session.id}/bulk-update`, {
+        method:'POST',
+        body:JSON.stringify(payload),
+      });
+      addAudit('row_edited', 'Bulk classify', `${result.updated_rows} row${result.updated_rows===1?'':'s'}`);
+      if (onImported) await onImported();
+      showToast(`Bulk updated ${result.updated_rows} row${result.updated_rows===1?'':'s'}`);
+    } catch(e) {
+      showToast('Bulk update failed: '+e.message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   const tabStyle = active => ({
     padding:'5px 11px', borderRadius:5, border:'none', cursor:'pointer', fontSize:12, fontWeight:500,
     background:active?'var(--surface)':'transparent', color:active?'var(--text)':'var(--text-3)',
@@ -995,6 +1234,10 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onToggleFlag, on
     background:active?'var(--accent-subtle)':'var(--border)',
     color:active?'var(--accent)':'var(--text-3)' });
   const colH = (label, extra={}) => <div style={{ fontSize:10, fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'0.05em', ...extra }}>{label}</div>;
+  const bulkCategories = Object.keys(categoryMap||{}).filter(k => (categoryMap[k]||[]).length > 0);
+  const bulkBuckets = bulkCategory ? (categoryMap[bulkCategory]||[]) : [];
+  const visibleScopeCount = filtered.length;
+  const bulkDisabled = bulkBusy || (!bulkBp && !bulkBucket) || (bulkScope === 'selected (visible)' && visibleScopeCount === 0);
 
   return (
     <div style={{ display:'flex', flexDirection:'column', height:'100%', position:'relative' }}>
@@ -1010,6 +1253,11 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onToggleFlag, on
             background:'var(--surface-2)', fontSize:12, fontWeight:500, color:'var(--text-2)', cursor:'pointer' }}>
             ⬆ Import Statement
           </button>
+          <button onClick={()=>setShowAddStatement(true)} style={{ display:'flex', alignItems:'center', gap:5,
+            padding:'5px 10px', borderRadius:5, border:'1px solid var(--border)',
+            background:'var(--accent-subtle)', fontSize:12, fontWeight:600, color:'var(--accent)', cursor:'pointer' }}>
+            Add Statement
+          </button>
         </div>
         <div style={{ display:'flex', gap:3, background:'var(--surface-2)', padding:3, borderRadius:7 }}>
           {[{key:'all',label:'All'},{key:'attention',label:'⚑ Attention'},{key:'review',label:'Needs review'},{key:'low',label:'Low / missing'},{key:'confirmed',label:'Confirmed'}].map(({key,label})=>(
@@ -1019,6 +1267,34 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onToggleFlag, on
             </button>
           ))}
         </div>
+      </div>
+      {/* Bulk classify */}
+      <div style={{ padding:'8px 14px', borderBottom:'1px solid var(--border)', background:'var(--surface)',
+        display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', flexShrink:0 }}>
+        <span style={{ fontSize:12, fontWeight:600, color:'var(--text-2)', marginRight:2 }}>Bulk classify</span>
+        <Dropdown value={bulkScope} options={['attention_required','all','selected (visible)']} onChange={setBulkScope}
+          placeholder="Scope" width={140}/>
+        <span style={{ fontSize:11, color:'var(--text-3)' }}>
+          {bulkScope==='attention_required'?'Flagged rows':bulkScope==='all'?'All rows':'Currently visible rows'}
+        </span>
+        <Dropdown value={bulkBp} options={['business','personal']} onChange={setBulkBp}
+          placeholder="B/P" width={96}/>
+        <Dropdown value={bulkCategory} options={bulkCategories} onChange={val=>{ setBulkCategory(val); setBulkBucket(''); }}
+          placeholder="Category" width={154}/>
+        <Dropdown value={bulkBucket} options={bulkBuckets} onChange={setBulkBucket}
+          placeholder={bulkCategory?'Bucket':'Pick category'} width={176} danger={!!bulkCategory&&!bulkBucket}/>
+        {bulkScope === 'selected (visible)' && (
+          <span style={{ fontSize:11, color:'var(--text-3)', padding:'0 4px' }}>
+            {visibleScopeCount} visible row{visibleScopeCount === 1 ? '' : 's'}
+          </span>
+        )}
+        <button onClick={handleBulkApply} disabled={bulkDisabled}
+          style={{ padding:'6px 12px', borderRadius:5, border:'none',
+            background:bulkDisabled?'var(--surface-2)':'var(--accent)',
+            color:bulkDisabled?'var(--text-3)':'#fff', fontSize:12, fontWeight:600,
+            cursor:bulkDisabled?'default':'pointer', opacity:bulkBusy?0.7:1 }}>
+          {bulkBusy?'Applying...':`Apply to ${bulkScope==='attention_required'?'flagged':bulkScope==='all'?'all':'visible'}`}
+        </button>
       </div>
       {/* Column headers */}
       <div style={{ display:'grid', gridTemplateColumns:GRID, padding:'6px 10px',
@@ -1041,8 +1317,8 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onToggleFlag, on
           ? <div style={{ padding:36, textAlign:'center', color:'var(--text-3)', fontSize:13 }}>No rows match this filter.</div>
           : filtered.map(row=>(
             <ReviewRowItem key={row.id} row={row} categoryMap={categoryMap}
-              onToggleFlag={onToggleFlag} onSave={handleSave} onPreview={r=>setPreviewRow(r)}
-              saving={savingIds.has(row.id)}/>
+              onToggleFlag={onToggleFlag} onSave={handleSave} onLocalUpdate={onLocalUpdate}
+              onPreview={r=>setPreviewRow(r)} saving={savingIds.has(row.id)}/>
           ))
         }
       </div>
@@ -1055,6 +1331,9 @@ function ReviewQueue({ session, localRows, categoryMap, onSave, onToggleFlag, on
         <span>Unclassified: <strong style={{ color:'var(--warning)' }}>{localRows.filter(r=>!r.bp).length}</strong></span>
       </div>
       {showImport && <ImportModal onClose={()=>setShowImport(false)} onImported={onImported}/>}
+      {showAddStatement && <AddStatementModal statementId={session?.statement_import_id}
+        onClose={()=>setShowAddStatement(false)}
+        onCreated={async()=>{ addAudit('statement_imported','Manual statement entry'); if (onImported) await onImported(); }}/>}
       {previewRow && <ReceiptModal row={previewRow} onClose={()=>setPreviewRow(null)}/>}
       <Toast msg={toast}/>
     </div>
@@ -1096,19 +1375,38 @@ function ValidationPanel({ statementId, sessionStatus, onGenerate, onNavigateRev
   const warnings = (result?.issues||[]).filter(i=>i.severity==='warning');
   const ready    = result?.ready;
 
-  const IssueRow = ({ issue }) => (
-    <div style={{ display:'flex', gap:12, padding:'10px 16px', alignItems:'flex-start', borderBottom:'1px solid var(--border)' }}>
-      <span style={{ fontSize:11, fontWeight:700, padding:'2px 7px', borderRadius:99, flexShrink:0, marginTop:1,
-        background:issue.severity==='error'?'var(--danger-subtle)':'var(--warning-subtle)',
-        color:issue.severity==='error'?'var(--danger)':'var(--warning)' }}>
-        {issue.severity.toUpperCase()}
-      </span>
-      <div style={{ flex:1 }}>
-        <div style={{ fontSize:13, fontWeight:500 }}>{issue.message}</div>
-        <div style={{ fontSize:11, color:'var(--text-3)', marginTop:2 }}>Code: {issue.code}</div>
+  const IssueRow = ({ issue }) => {
+    const context = [
+      issue.review_row_id ? `Row #${issue.review_row_id}` : null,
+      issue.supplier || null,
+      issue.transaction_date || null,
+      issue.report_bucket || null,
+      issue.air_travel_date ? `Travel ${issue.air_travel_date}` : null,
+      issue.air_travel_return_date ? `Return ${issue.air_travel_return_date}` : null,
+      issue.air_travel_rt_or_oneway || null,
+    ].filter(Boolean);
+    return (
+      <div style={{ display:'flex', gap:12, padding:'10px 16px', alignItems:'flex-start', borderBottom:'1px solid var(--border)' }}>
+        <span style={{ fontSize:11, fontWeight:700, padding:'2px 7px', borderRadius:99, flexShrink:0, marginTop:1,
+          background:issue.severity==='error'?'var(--danger-subtle)':'var(--warning-subtle)',
+          color:issue.severity==='error'?'var(--danger)':'var(--warning)' }}>
+          {issue.severity.toUpperCase()}
+        </span>
+        <div style={{ flex:1, minWidth:0 }}>
+          <div style={{ fontSize:13, fontWeight:500 }}>{issue.message}</div>
+          {context.length>0 && (
+            <div style={{ display:'flex', flexWrap:'wrap', gap:6, marginTop:6 }}>
+              {context.map(item=>(
+                <span key={item} style={{ fontSize:11, color:'var(--text-2)', background:'var(--surface-2)',
+                  border:'1px solid var(--border)', borderRadius:5, padding:'2px 6px' }}>{item}</span>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize:11, color:'var(--text-3)', marginTop:4 }}>Code: {issue.code}</div>
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   return (
     <div style={{ padding:'28px 32px', maxWidth:780, margin:'0 auto' }}>
@@ -1300,6 +1598,12 @@ function App() {
       Object.keys(localChanges).join(', '));
   }
 
+  // Local-only state update — no API call. Used for derived UI fields like category
+  // that are not persisted on the backend (category is derived from report_bucket).
+  function handleLocalUpdate(rowId, changes) {
+    setLocalRows(prev => prev.map(r => r.id === rowId ? { ...r, ...changes } : r));
+  }
+
   async function handleToggleFlag(rowId) {
     const row = localRows.find(r=>r.id===rowId);
     if (!row) return;
@@ -1380,7 +1684,7 @@ function App() {
           )}
           {screen==='review' && (
             <ReviewQueue session={session} localRows={localRows} categoryMap={CATEGORY_MAP}
-              onSave={handleSave} onToggleFlag={handleToggleFlag}
+              onSave={handleSave} onLocalUpdate={handleLocalUpdate} onToggleFlag={handleToggleFlag}
               onConfirmSession={handleConfirmSession} onValidate={handleValidate}
               onImported={loadData} addAudit={addAudit}
               sessionStatus={sessionStatus} downloadUrl={downloadUrl} reportRunId={reportRunId}/>

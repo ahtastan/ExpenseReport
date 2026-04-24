@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.models import MatchDecision, ReceiptDocument, ReportRun, StatementTransaction
+from app.services import model_router
 from app.services.receipt_annotations import ReceiptAnnotationLine, create_annotated_receipts_pdf
 from app.services.report_validation import ReportValidation, validate_report_readiness
 from app.services.review_sessions import confirmed_snapshot
@@ -415,6 +416,99 @@ def _write_summary(path: Path, validation: ReportValidation, lines: list[ReportL
     path.write_text("\n".join(summary_lines), encoding="utf-8")
 
 
+def _bucket_totals(lines: list[ReportLine]) -> dict[str, float]:
+    totals: dict[str, float] = defaultdict(float)
+    for line in lines:
+        amount = line.air_travel_total_tkt_cost if _bucket_key(line.report_bucket) == _bucket_key(AIRFARE_BUCKET) and line.air_travel_total_tkt_cost is not None else line.amount
+        totals[line.report_bucket or "Other"] += float(amount)
+    return dict(sorted(totals.items()))
+
+
+def _summary_payload(
+    validation: ReportValidation,
+    lines: list[ReportLine],
+    workbook_paths: list[Path],
+    employee_name: str,
+    title_prefix: str,
+) -> dict:
+    business_reasons = sorted({line.business_reason for line in lines if line.business_reason})
+    anomalies = [
+        {
+            "severity": issue.severity,
+            "code": issue.code,
+            "message": issue.message,
+            "review_row_id": issue.review_row_id,
+            "supplier": issue.supplier,
+            "transaction_date": issue.transaction_date,
+        }
+        for issue in validation.issues
+    ]
+    anomalies.extend(
+        {
+            "severity": "warning",
+            "code": "missing_receipt",
+            "message": "Report line has no attached receipt file.",
+            "transaction_id": line.transaction_id,
+            "supplier": line.supplier,
+            "transaction_date": line.transaction_date.isoformat(),
+        }
+        for line in lines
+        if line.receipt_id is None or not line.receipt_path
+    )
+    return {
+        "statement_import_id": validation.statement_import_id,
+        "employee_name": employee_name,
+        "title_prefix": title_prefix,
+        "date_range": {
+            "start": min((line.transaction_date for line in lines), default=None),
+            "end": max((line.transaction_date for line in lines), default=None),
+        },
+        "trip_purpose_candidates": business_reasons,
+        "totals_by_bucket": _bucket_totals(lines),
+        "currency": sorted({line.currency for line in lines if line.currency}),
+        "line_count": len(lines),
+        "workbooks": [path.name for path in workbook_paths],
+        "anomalies": anomalies,
+    }
+
+
+def _fallback_summary_markdown(payload: dict) -> str:
+    purposes = payload.get("trip_purpose_candidates") or []
+    totals = payload.get("totals_by_bucket") or {}
+    anomalies = payload.get("anomalies") or []
+    currencies = ", ".join(payload.get("currency") or [])
+    lines = [
+        "# Expense Report Summary",
+        "",
+        f"Trip purpose: {', '.join(purposes) if purposes else 'Not specified'}.",
+        "",
+        "Totals by bucket:",
+    ]
+    if totals:
+        lines.extend(f"- {bucket}: {amount:.2f}{(' ' + currencies) if currencies else ''}" for bucket, amount in totals.items())
+    else:
+        lines.append("- No report lines.")
+    lines.extend(["", "Flagged anomalies:"])
+    if anomalies:
+        lines.extend(f"- {item.get('severity', 'warning')}: {item.get('message', '')}" for item in anomalies)
+    else:
+        lines.append("- None.")
+    return "\n".join(lines)
+
+
+def _write_synthesis_summary(
+    path: Path,
+    validation: ReportValidation,
+    lines: list[ReportLine],
+    workbook_paths: list[Path],
+    employee_name: str,
+    title_prefix: str,
+) -> None:
+    payload = _summary_payload(validation, lines, workbook_paths, employee_name, title_prefix)
+    summary = model_router.synthesize_report_summary(payload) or _fallback_summary_markdown(payload)
+    path.write_text(summary + "\n", encoding="utf-8")
+
+
 def _annotation_lines(lines: list[ReportLine]) -> list[ReceiptAnnotationLine]:
     return [
         ReceiptAnnotationLine(
@@ -479,6 +573,8 @@ def generate_report_package(
 
     summary_path = output_dir / "validation_summary.txt"
     _write_summary(summary_path, validation, lines, workbook_paths)
+    synthesis_summary_path = output_dir / "summary.md"
+    _write_synthesis_summary(synthesis_summary_path, validation, lines, workbook_paths, employee_name, title_prefix)
     annotated_pdf_path = output_dir / "annotated_receipts.pdf"
     create_annotated_receipts_pdf(_annotation_lines(lines), annotated_pdf_path)
 
@@ -490,6 +586,7 @@ def generate_report_package(
             for workbook_path in workbook_paths:
                 zf.write(workbook_path, workbook_path.name)
             zf.write(summary_path, summary_path.name)
+            zf.write(synthesis_summary_path, synthesis_summary_path.name)
             zf.write(annotated_pdf_path, annotated_pdf_path.name)
 
     run.status = "completed"

@@ -38,6 +38,56 @@ def _parse_amount(value: str) -> float | None:
         return None
 
 
+def _looks_like_meta_question(value: str) -> bool:
+    text = value.strip().lower()
+    if not text:
+        return False
+    starters = ("why", "how", "what", "where", "when", "can you", "can't you", "could you")
+    return text.endswith("?") or text.startswith(starters)
+
+
+def _looks_like_non_answer(value: str) -> bool:
+    text = value.strip().lower()
+    if _looks_like_meta_question(text):
+        return True
+    normalized = text.strip(" .,!?:;-")
+    return normalized in {"hello", "hi", "hey", "yo", "selam", "merhaba"}
+
+
+def _keep_open_with_helper(
+    session: Session,
+    question: ClarificationQuestion,
+    helper_key: str,
+    helper_text: str,
+) -> list[ClarificationQuestion]:
+    existing = session.exec(
+        select(ClarificationQuestion).where(
+            ClarificationQuestion.receipt_document_id == question.receipt_document_id,
+            ClarificationQuestion.user_id == question.user_id,
+            ClarificationQuestion.question_key == helper_key,
+            ClarificationQuestion.status == "open",
+        )
+    ).first()
+    if existing:
+        return [existing]
+
+    receipt = session.get(ReceiptDocument, question.receipt_document_id) if question.receipt_document_id else None
+    helper = ClarificationQuestion(
+        receipt_document_id=question.receipt_document_id,
+        user_id=question.user_id,
+        question_key=helper_key,
+        question_text=helper_text,
+    )
+    session.add(helper)
+    if receipt:
+        receipt.needs_clarification = True
+        receipt.updated_at = datetime.now(timezone.utc)
+        session.add(receipt)
+    session.commit()
+    session.refresh(helper)
+    return [helper]
+
+
 def ensure_initial_receipt_question(
     session: Session,
     receipt: ReceiptDocument,
@@ -138,7 +188,33 @@ def next_open_question_for_user(session: Session, user_id: int) -> Clarification
 
 
 def answer_question(session: Session, question: ClarificationQuestion, answer: str) -> list[ClarificationQuestion]:
-    question.answer_text = answer.strip()
+    answer_text = answer.strip()
+    if question.question_key in {"receipt_date", "receipt_date_retry"} and _looks_like_non_answer(answer_text):
+        return _keep_open_with_helper(
+            session,
+            question,
+            "receipt_date_help",
+            (
+                "I tried to read the printed receipt date, but OCR was not confident enough. "
+                "Please send the date like 2025-09-04."
+            ),
+        )
+    if question.question_key in {"local_amount", "local_amount_retry"} and _looks_like_non_answer(answer_text):
+        return _keep_open_with_helper(
+            session,
+            question,
+            "local_amount_help",
+            "I need the total amount from the receipt. Please send it like 419.58 TRY.",
+        )
+    if question.question_key in {"business_or_personal", "business_or_personal_retry"} and _looks_like_non_answer(answer_text):
+        return _keep_open_with_helper(
+            session,
+            question,
+            "business_or_personal_help",
+            "I need to classify this receipt. Please reply Business or Personal.",
+        )
+
+    question.answer_text = answer_text
     question.status = "answered"
     question.answered_at = datetime.now(timezone.utc)
     session.add(question)

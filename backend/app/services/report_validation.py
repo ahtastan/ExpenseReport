@@ -26,6 +26,9 @@ class ValidationIssue:
     supplier: str | None = None
     transaction_date: str | None = None
     report_bucket: str | None = None
+    air_travel_date: str | None = None
+    air_travel_return_date: str | None = None
+    air_travel_rt_or_oneway: str | None = None
 
 
 @dataclass
@@ -85,6 +88,18 @@ def _snapshot_issue_context(row: dict) -> dict:
     }
 
 
+def _air_travel_issue_context(row: dict, travel_date: date | None, return_date: date | None) -> dict:
+    context = _snapshot_issue_context(row)
+    context.update(
+        {
+            "air_travel_date": travel_date.isoformat() if travel_date else None,
+            "air_travel_return_date": return_date.isoformat() if return_date else None,
+            "air_travel_rt_or_oneway": (row.get("air_travel_rt_or_oneway") or "").strip() or None,
+        }
+    )
+    return context
+
+
 def _review_snapshot_issues(session: Session, statement_import_id: int) -> tuple[list[ValidationIssue], int | None]:
     review = _latest_review_session(session, statement_import_id)
     if not review or review.status != "confirmed" or not review.snapshot_json:
@@ -119,16 +134,7 @@ def _review_snapshot_issues(session: Session, statement_import_id: int) -> tuple
                     severity="error",
                     code="air_travel_return_date_missing",
                     message="An RT air travel row is missing its return date.",
-                    **_snapshot_issue_context(row),
-                )
-            )
-        elif travel_date and return_date and return_date < travel_date:
-            issues.append(
-                ValidationIssue(
-                    severity="error",
-                    code="air_travel_return_date_before_travel_date",
-                    message="An RT air travel row has a return date before its travel date.",
-                    **_snapshot_issue_context(row),
+                    **_air_travel_issue_context(row, travel_date, return_date),
                 )
             )
         if tx_date in first7:

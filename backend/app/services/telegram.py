@@ -15,7 +15,9 @@ from app.services.clarifications import (
     next_open_question_for_user,
 )
 from app.services.receipt_extraction import apply_receipt_extraction
+from app.services.review_sessions import get_or_create_review_session
 from app.services.storage import save_bytes
+from app.services.statement_import import import_diners_excel
 
 
 class TelegramClient:
@@ -92,6 +94,24 @@ def _document_is_receipt(document: dict[str, Any]) -> bool:
     return mime.startswith("image/") or mime == "application/pdf" or name.endswith((".jpg", ".jpeg", ".png", ".webp", ".pdf"))
 
 
+def _document_is_statement(document: dict[str, Any]) -> bool:
+    mime = (document.get("mime_type") or "").lower()
+    name = (document.get("file_name") or "").lower()
+    excel_mimes = {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel.sheet.macroenabled.12",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+        "application/vnd.ms-excel.template.macroenabled.12",
+    }
+    return mime in excel_mimes or name.endswith((".xlsx", ".xlsm", ".xltx", ".xltm"))
+
+
+def _statement_period_text(statement) -> str:
+    if statement.period_start and statement.period_end:
+        return f" for {statement.period_start.isoformat()} to {statement.period_end.isoformat()}"
+    return ""
+
+
 def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     settings = get_settings()
     client = TelegramClient(settings.telegram_bot_token)
@@ -134,6 +154,37 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     if not photo and not document:
         client.send_message(chat_id, "I can currently capture receipt photos, receipt PDFs, and clarification replies.")
         return {"ok": True, "action": "unsupported_message", "user_id": user.id}
+
+    if document and _document_is_statement(document):
+        file_id = document.get("file_id")
+        original_name = document.get("file_name") or f"telegram_statement_{message.get('message_id')}.xlsx"
+        try:
+            downloaded = client.download_file(file_id, user.id, original_name) if file_id else None
+        except Exception as exc:
+            print(f"Telegram statement download failed for file_id={file_id}: {exc}")
+            downloaded = None
+        if downloaded is None:
+            text = "I received the statement, but could not download it from Telegram. Please try again."
+            client.send_message(chat_id, text)
+            return {"ok": False, "action": "statement_download_failed", "user_id": user.id, "message": text}
+        try:
+            statement = import_diners_excel(session, downloaded, original_name, uploader_user_id=user.id)
+            get_or_create_review_session(session, statement.id)
+        except ValueError as exc:
+            text = f"I received the statement, but could not import it: {exc}"
+            client.send_message(chat_id, text)
+            return {"ok": False, "action": "statement_import_failed", "user_id": user.id, "message": str(exc)}
+        period = _statement_period_text(statement)
+        text = f"Imported Diners statement{period}: {statement.row_count} transactions. Review is ready in /review."
+        client.send_message(chat_id, text)
+        return {
+            "ok": True,
+            "action": "statement_imported",
+            "user_id": user.id,
+            "statement_import_id": statement.id,
+            "transactions_imported": statement.row_count,
+            "message": text,
+        }
 
     if document and not _document_is_receipt(document):
         client.send_message(chat_id, "I received a document, but it does not look like a receipt image or PDF yet.")

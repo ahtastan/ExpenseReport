@@ -169,31 +169,51 @@ Manual generated workbook inspection also passed:
   - `J47 = '=H47-I47'`
   - `E7 = 500`
 
+## Review UI Redesign (commit 437478d)
+`frontend/review-table.html` was replaced with a full React 18 SPA:
+- Login screen: demo users `ahmet/demo` (admin) and `deniz/demo` (reviewer). Dark mode toggled and persisted in localStorage.
+- Sidebar: 4-section nav (Dashboard, Review Queue, Validation, Audit Log).
+- Dashboard: stat cards, category spend bars, live activity feed from client-side audit log.
+- Review Queue: grid table with inline B/P and category/bucket dropdowns, expand-per-row for Air Travel / M&E / generic panels, receipt preview modal, import modal, filter tabs.
+- Workflow bar: draft → confirmed → validated → generated with context-appropriate action buttons.
+- Validation panel: hits `GET /reports/validate/:id`, renders errors/warnings with Generate button.
+- Audit log: client-side localStorage entries grouped by date.
+- All field changes PATCH `/reviews/report/rows/:id` immediately.
+
+## Category Dropdown Bug Fix (this session)
+**Root cause**: `handleCategory` called `onSave` → `buildApiFields({category, bucket:null})` → API PATCH `{report_bucket:null}` → server cleared bucket → `apiRowToLocal` re-derived `category:null` from null bucket. Category selection was immediately lost.
+
+**Fix** (`frontend/review-table.html`, +14/−6 lines):
+1. `App.handleLocalUpdate(rowId, changes)` — calls `setLocalRows` only, no API.
+2. `ReviewQueue` accepts `onLocalUpdate` prop and passes it to `ReviewRowItem`.
+3. `ReviewRowItem.handleCategory` calls `onLocalUpdate` (local state only). Bucket selection still goes through `onSave` → API.
+
+HTML parse: passed. Not yet browser-tested live.
+
 ## Not Yet Verified In Browser
+- The entire React SPA (never opened in a live browser).
 - Compact Air Travel row visual fit at user's current viewport.
 - Return-date show/hide in live browser.
 - Return-date `min` behavior in live browser.
-- Contextual validation messages rendered in the live browser, although HTML parse and backend smoke pass.
+- Contextual validation messages rendered in the live browser.
+- Category → bucket selection flow end-to-end.
+
+## Known Pre-Existing Issues In Committed Code
+- `Personal Car` is present in `CATEGORY_GROUPS` with `buckets:[]`. It will appear in the category dropdown with no sub-options. Should be filtered out of the dropdown (not removed from data structure, in case it is needed later for Personal Car mileage).
+- Bulk-classify bar (was in old HTML table) is absent from the new React SPA. With 91 flagged rows this will be missed.
 
 ## Suggested Next Step
-Run one live-browser validation pass:
-1. Start backend.
-2. Open `/review`.
-3. Pick/create an Air Travel row.
-4. Select `RT`.
-5. Leave return date blank or set it before travel date.
-6. Confirm reviewed data if needed.
-7. Click `Validate before generate`.
-8. Confirm message includes row/date/supplier/bucket context.
-
-If that works, the next build step should be either:
-- improve visual row highlighting for validation issues; or
-- move to the next report section needing template-specific detail handling.
+Live browser smoke pass:
+1. Start backend (`uvicorn app.main:app --host 127.0.0.1 --port 8080 --reload` from `backend/`).
+2. Open `http://127.0.0.1:8080/review`, log in as `ahmet/demo`.
+3. Verify review queue loads, category dropdown works (pick category → bucket dropdown repopulates → pick bucket → persists on reload).
+4. Expand an Air Travel row, expand a M&E row.
+5. Click `Validate before generate` and confirm contextual messages appear.
+6. After that: re-add bulk-classify to the new SPA, and/or fix the Personal Car empty-bucket issue.
 
 ## Do Not Do Next
 - Do not add Personal Car yet.
-- Do not add auth/admin UI.
-- Do not redesign `/review`.
+- Do not add auth/admin UI beyond the demo login.
 - Do not overwrite Air Travel column J.
 - Do not bypass validation/confirmation gates.
 - Do not broaden into OCR/model routing unless explicitly asked.

@@ -1,10 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from difflib import SequenceMatcher
 
 from sqlmodel import Session, select
 
 from app.models import MatchDecision, ReceiptDocument, StatementTransaction
+from app.services import model_router
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,8 @@ class MatchRunStats:
     low_confidence: int = 0
     auto_approved: int = 0
     skipped_receipts: int = 0
+    llm_disambiguated: int = 0  # hard cases resolved by the matching model
+    llm_abstained: int = 0  # hard cases where the model declined to pick
 
 
 def normalize_text(value: str | None) -> str:
@@ -190,29 +193,108 @@ def run_matching(
 
         high_scores = [score for score in scores if score.confidence == "high"]
         unique_high = len(high_scores) == 1
+
+        # LLM disambiguation: when deterministic scoring cannot pick a unique
+        # high candidate but there are multiple plausible candidates (high or
+        # medium), ask the matching model. A confident pick promotes that
+        # candidate to "high" and demotes the competing plausible picks to
+        # "medium" so only one high remains. Low-confidence scores are left
+        # untouched.
+        promoted_transaction_id: int | None = None
+        if not unique_high:
+            plausible_scores = [
+                s for s in scores[:5] if s.confidence in {"high", "medium"}
+            ]
+            if len(plausible_scores) >= 2:
+                candidates_payload = [
+                    {
+                        "transaction_id": s.transaction.id,
+                        "supplier": s.transaction.supplier_raw,
+                        "date": s.transaction.transaction_date.isoformat()
+                        if s.transaction.transaction_date
+                        else None,
+                        "local_amount": s.transaction.local_amount,
+                        "local_currency": s.transaction.local_currency,
+                        "deterministic_reason": s.reason,
+                    }
+                    for s in plausible_scores
+                    if s.transaction.id is not None
+                ]
+                receipt_payload = {
+                    "supplier": receipt.extracted_supplier,
+                    "date": receipt.extracted_date.isoformat()
+                    if receipt.extracted_date
+                    else None,
+                    "local_amount": receipt.extracted_local_amount,
+                    "local_currency": receipt.extracted_currency,
+                }
+                dis = model_router.match_disambiguate(receipt_payload, candidates_payload)
+                if dis is not None and dis.transaction_id is not None and dis.confidence == "high":
+                    promoted_transaction_id = dis.transaction_id
+                    new_scores: list[MatchScore] = []
+                    for s in scores:
+                        if s.transaction.id == dis.transaction_id:
+                            new_scores.append(
+                                replace(
+                                    s,
+                                    confidence="high",
+                                    reason=f"{s.reason}; llm({dis.model}): {dis.reasoning}",
+                                )
+                            )
+                        elif s.confidence == "high":
+                            # Demote rival highs so the LLM's pick is the
+                            # unique high for this receipt.
+                            new_scores.append(
+                                replace(
+                                    s,
+                                    confidence="medium",
+                                    reason=f"{s.reason}; llm({dis.model}) preferred another candidate",
+                                )
+                            )
+                        else:
+                            new_scores.append(s)
+                    scores = new_scores
+                    scores_by_receipt_id[receipt.id] = new_scores
+                    unique_high = True
+                    stats.llm_disambiguated += 1
+                else:
+                    stats.llm_abstained += 1
+
         for score in scores[:5]:
             transaction = score.transaction
             if transaction.id is None:
                 continue
             decision = _existing_decision(session, receipt.id, transaction.id)
+            method = (
+                "llm_disambiguated_v1"
+                if transaction.id == promoted_transaction_id
+                else "date_amount_merchant_v1"
+            )
             if decision:
                 decision.confidence = score.confidence
                 decision.reason = score.reason
-                decision.match_method = "date_amount_merchant_v1"
+                decision.match_method = method
                 decision.updated_at = now
             else:
                 decision = MatchDecision(
                     receipt_document_id=receipt.id,
                     statement_transaction_id=transaction.id,
                     confidence=score.confidence,
-                    match_method="date_amount_merchant_v1",
+                    match_method=method,
                     reason=score.reason,
                 )
             unique_transaction_high = (
                 transaction.id is not None
                 and high_receipt_count_by_transaction_id.get(transaction.id, 0) == 1
             )
-            if auto_approve_high_confidence and score.confidence == "high" and unique_high and unique_transaction_high:
+            # LLM-promoted picks should not auto-approve on transaction
+            # uniqueness alone because ``high_receipt_count_by_transaction_id``
+            # was computed before the promotion. Require deterministic
+            # uniqueness OR a confident LLM pick for auto-approval.
+            llm_promoted_here = transaction.id == promoted_transaction_id
+            if auto_approve_high_confidence and score.confidence == "high" and unique_high and (
+                unique_transaction_high or llm_promoted_here
+            ):
                 decision.approved = True
                 decision.rejected = False
                 stats.auto_approved += 1

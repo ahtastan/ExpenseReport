@@ -256,7 +256,8 @@ def main() -> None:
     status, headers, body = asyncio.run(asgi_get("/review"))
     assert status == 200
     assert "text/html" in headers["content-type"]
-    assert "Expense Review" in body
+    assert "Review Queue" in body
+    assert "ExpenseReport" in body
     assert "/statements/latest" in body
 
     with Session(engine) as session:
@@ -376,6 +377,23 @@ def main() -> None:
         assert bulk_result["updated_rows"] == 1
         mixed_rows_after_bulk = review_rows(session, mixed_review.id)
         assert sum(1 for row in mixed_rows_after_bulk if row.attention_required) == 0
+
+        import json
+        selected_row_id = mixed_rows_after_bulk[0].id
+        unselected_row_id = mixed_rows_after_bulk[1].id
+        bulk_selected_result = bulk_update_review_rows(
+            session,
+            review_session_id=mixed_review.id,
+            fields={"business_or_personal": "Personal", "report_bucket": "Personal"},
+            scope="selected",
+            row_ids=[selected_row_id],
+        )
+        assert bulk_selected_result["updated_rows"] == 1
+        mixed_rows_after_selected = review_rows(session, mixed_review.id)
+        selected_row = next(r for r in mixed_rows_after_selected if r.id == selected_row_id)
+        unselected_row = next(r for r in mixed_rows_after_selected if r.id == unselected_row_id)
+        assert json.loads(selected_row.confirmed_json).get("business_or_personal") == "Personal"
+        assert json.loads(unselected_row.confirmed_json).get("business_or_personal") == "Business"
 
         for row in review_rows(session, statement_only_review.id):
             update_review_row(

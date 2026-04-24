@@ -1,0 +1,37 @@
+# Caddyfile for app.dcexpense.com
+#
+# M0.5.1: basic auth gate for web UI + API routes.
+# /health and /telegram/webhook stay open — monitoring and the Telegram
+# bot cannot authenticate via HTTP basic auth.
+#
+# This file is a proposal checked into the repo. The live file at
+# /etc/caddy/Caddyfile on the VPS is updated manually after PR merge,
+# validated with `caddy validate`, and reloaded with `systemctl reload caddy`.
+
+app.dcexpense.com {
+	# ── Open routes — NO auth ─────────────────────────────────────────────
+	# Monitoring + deploy script poll /health; must stay unauthenticated.
+	handle /health {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# Telegram verifies requests via the X-Telegram-Bot-Api-Secret-Token
+	# header. Adding HTTP basic auth here would cause Telegram to stop
+	# delivering updates.
+	handle /telegram/webhook {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle /telegram/webhook/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# ── Everything else requires basic auth ───────────────────────────────
+	# Default-deny: covers /review, /receipts/*, /reports/*,
+	# /review-sessions/*, and any future endpoint.
+	handle {
+		basicauth {
+			ahmet $2a$14$WuW.GOAH3L2gfd48qJAK9uCFKHz6SRxufNKMoBwXByIxF4Xi8xRra
+		}
+		reverse_proxy 127.0.0.1:8080
+	}
+}

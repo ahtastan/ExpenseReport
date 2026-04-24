@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class AppUserRead(BaseModel):
@@ -275,6 +275,66 @@ class ReportRunRead(BaseModel):
     output_workbook_path: str | None
     output_pdf_path: str | None
     created_at: datetime
+
+
+class ReportCreate(BaseModel):
+    owner_user_id: int
+    report_kind: str
+    title: str
+    report_currency: str = "USD"
+    period_start: date | None = None
+    period_end: date | None = None
+    notes: str | None = None
+
+    @field_validator("report_kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        if v not in {"diners_statement", "personal_reimbursement"}:
+            raise ValueError(
+                f"report_kind must be diners_statement or personal_reimbursement, got {v}"
+            )
+        return v
+
+    @field_validator("report_currency")
+    @classmethod
+    def _validate_currency(cls, v: str) -> str:
+        if v not in {"USD", "EUR"}:
+            raise ValueError(f"report_currency must be USD or EUR, got {v}")
+        return v
+
+
+class ReportRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    owner_user_id: int
+    report_kind: str
+    title: str
+    status: str
+    report_currency: str
+    period_start: date | None
+    period_end: date | None
+    statement_import_id: int | None
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReportDetail(ReportRead):
+    receipt_count: int
+    review_session_id: int | None
+    report_run_ids: list[int]
+
+
+class ReceiptAttachResponse(BaseModel):
+    receipt_id: int
+    expense_report_id: int
+    message: str
+
+
+class ReceiptDetachResponse(BaseModel):
+    receipt_id: int
+    message: str
 
 
 class TelegramWebhookResult(BaseModel):

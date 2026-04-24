@@ -22,6 +22,41 @@ AIR_TRAVEL_DETAIL_ROWS_BY_SHEET = {
     "Week 2A": 3,
 }
 
+# Buckets that EDT treats as meals and therefore require attendees.
+# Spec lists the first five; "Entertainment" matches the canonical bucket name
+# used elsewhere in the codebase (``review_sessions.MEAL_BUCKETS``).
+MEAL_BUCKETS_REQUIRING_ATTENDEES = {
+    "Dinner",
+    "Lunch",
+    "Breakfast",
+    "Meals/Snacks",
+    "Meals & Entertainment",
+    "Entertainment",
+}
+
+CUSTOMER_ENTERTAINMENT_BUCKET = "Customer Entertainment"
+
+# Dinner per-head caps (USD). FX conversion is not live until M1 Day 7, so
+# the cap check only applies to rows already denominated in USD.
+DINNER_CAP_WITH_CUSTOMER_USD = 60
+DINNER_CAP_SOLO_USD = 30
+
+
+def _split_attendees(value: object) -> list[str]:
+    raw = (value or "").strip() if isinstance(value, str) else ""
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _is_solo_attendee_list(entries: list[str]) -> bool:
+    return len(entries) == 1 and entries[0].lower() == "self"
+
+
+def _has_coo_preapproval_reference(business_reason: object) -> bool:
+    text = (business_reason or "").lower() if isinstance(business_reason, str) else ""
+    return "coo" in text or "approved by" in text
+
 
 @dataclass(frozen=True)
 class ValidationIssue:
@@ -291,6 +326,7 @@ def validate_report_readiness(
     # latest review session. Any approved receipt without a confirmed review row
     # is a divided-ownership hazard and gets a structured error.
     confirmed_by_receipt_id: dict[int, dict] = {}
+    row_id_by_receipt_id: dict[int, int] = {}
     latest_review = _latest_review_session(session, expense_report_id=expense_report_id)
     if latest_review and latest_review.id is not None:
         for row in session.exec(
@@ -302,6 +338,8 @@ def validate_report_readiness(
                 confirmed_by_receipt_id[row.receipt_document_id] = json.loads(row.confirmed_json or "{}")
             except json.JSONDecodeError:
                 confirmed_by_receipt_id[row.receipt_document_id] = {}
+            if row.id is not None:
+                row_id_by_receipt_id[row.receipt_document_id] = row.id
 
     for receipt in receipts:
         if receipt.id is None or receipt.id not in confirmed_by_receipt_id:
@@ -331,6 +369,14 @@ def validate_report_readiness(
             continue
         if bp == "business":
             bucket_value = (confirmed.get("report_bucket") or "").strip()
+            row_id = row_id_by_receipt_id.get(receipt.id) if receipt.id is not None else None
+            supplier = (confirmed.get("supplier") or "").strip() or None
+            transaction_date = confirmed.get("transaction_date")
+            amount_value = confirmed.get("amount")
+            currency_value = (confirmed.get("currency") or "").strip()
+            business_reason_value = confirmed.get("business_reason")
+            attendees_entries = _split_attendees(confirmed.get("attendees"))
+
             if not bucket_value:
                 issues.append(
                     ValidationIssue(
@@ -338,26 +384,113 @@ def validate_report_readiness(
                         code="missing_report_bucket",
                         message="A business receipt is missing an expense report bucket.",
                         receipt_id=receipt.id,
+                        review_row_id=row_id,
+                        statement_transaction_id=confirmed.get("transaction_id"),
+                        supplier=supplier,
                     )
                 )
-            if not (receipt.business_reason or "").strip():
+
+            # Addition A: hard-block missing business reason. Reads confirmed_json
+            # (canonical after M1 Day 2 pivot), not receipt column scaffolding.
+            if not (business_reason_value or "").strip():
                 issues.append(
                     ValidationIssue(
-                        severity="warning",
+                        severity="error",
                         code="missing_business_reason",
-                        message="A business receipt is missing a business reason/project note.",
+                        message=(
+                            f"Business row {row_id} ({supplier or 'unknown supplier'}) is "
+                            "missing a business reason. Fill in before generating."
+                        ),
                         receipt_id=receipt.id,
+                        review_row_id=row_id,
+                        statement_transaction_id=confirmed.get("transaction_id"),
+                        supplier=supplier,
+                        transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                        report_bucket=bucket_value or None,
                     )
                 )
-            bucket = bucket_value.lower()
-            if any(token in bucket for token in ("meal", "breakfast", "lunch", "dinner", "entertainment")):
-                if not (receipt.attendees or "").strip():
+
+            # Addition A: hard-block meal rows missing attendees. Bucket check
+            # uses the explicit spec list (MEAL_BUCKETS_REQUIRING_ATTENDEES)
+            # rather than substring matching to avoid false positives.
+            if bucket_value in MEAL_BUCKETS_REQUIRING_ATTENDEES and not attendees_entries:
+                amount_display = (
+                    f"{amount_value} {currency_value}".strip()
+                    if amount_value is not None
+                    else "amount unknown"
+                )
+                issues.append(
+                    ValidationIssue(
+                        severity="error",
+                        code="missing_attendees_on_meal",
+                        message=(
+                            f"Meal row {row_id} ({supplier or 'unknown supplier'}, "
+                            f"{amount_display}) is missing attendees. "
+                            "EDT requires attendees on all meal expenses."
+                        ),
+                        receipt_id=receipt.id,
+                        review_row_id=row_id,
+                        statement_transaction_id=confirmed.get("transaction_id"),
+                        supplier=supplier,
+                        transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                        report_bucket=bucket_value,
+                    )
+                )
+
+            # Addition A: Customer Entertainment requires a COO / "approved by"
+            # reference in the business reason. Full pre-approval modeling
+            # arrives in M3; this scaffolds the gate so unapproved customer
+            # entertainment cannot slip into a generated report.
+            if bucket_value == CUSTOMER_ENTERTAINMENT_BUCKET:
+                if not _has_coo_preapproval_reference(business_reason_value):
+                    issues.append(
+                        ValidationIssue(
+                            severity="error",
+                            code="customer_entertainment_no_preapproval",
+                            message=(
+                                f"Customer entertainment row {row_id} has no COO "
+                                "pre-approval reference. Note the approval reference "
+                                "in the business reason field."
+                            ),
+                            receipt_id=receipt.id,
+                            review_row_id=row_id,
+                            statement_transaction_id=confirmed.get("transaction_id"),
+                            supplier=supplier,
+                            transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                            report_bucket=bucket_value,
+                        )
+                    )
+
+            # Addition A: Dinner per-head cap. Soft flag. USD-only until FX
+            # lookup lands (M1 Day 7). Skipped when attendees is empty —
+            # missing_attendees_on_meal already covers that case.
+            if (
+                bucket_value == "Dinner"
+                and currency_value == "USD"
+                and attendees_entries
+                and isinstance(amount_value, (int, float))
+                and amount_value > 0
+            ):
+                solo = _is_solo_attendee_list(attendees_entries)
+                cap = DINNER_CAP_SOLO_USD if solo else DINNER_CAP_WITH_CUSTOMER_USD
+                per_head = float(amount_value) / len(attendees_entries)
+                if per_head > cap:
+                    with_without = "without" if solo else "with"
                     issues.append(
                         ValidationIssue(
                             severity="warning",
-                            code="missing_attendees",
-                            message="A meal/entertainment business receipt is missing attendees.",
+                            code="dinner_exceeds_cap",
+                            message=(
+                                f"Dinner row {row_id} is ${per_head:.2f}/head. "
+                                f"Exceeds EDT guideline of ${cap}/head {with_without} customer. "
+                                "Add justification if warranted."
+                            ),
                             receipt_id=receipt.id,
+                            review_row_id=row_id,
+                            statement_transaction_id=confirmed.get("transaction_id"),
+                            supplier=supplier,
+                            transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                            report_bucket=bucket_value,
                         )
                     )
         elif bp not in {"personal", "unclear"}:

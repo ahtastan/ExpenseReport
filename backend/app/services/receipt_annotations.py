@@ -447,6 +447,30 @@ def _group_total_by_currency(
     return ", ".join(parts) or "—"
 
 
+def _date_subtotals_text(
+    group: list[ReceiptAnnotationLine],
+    *,
+    width: int = 135,
+) -> str:
+    days = sorted({line.transaction_date for line in group})
+    if len(days) <= 1:
+        return ""
+
+    totals_by_day: dict[date, dict[str, float]] = {}
+    for line in group:
+        day_totals = totals_by_day.setdefault(line.transaction_date, {})
+        day_totals[line.currency] = day_totals.get(line.currency, 0.0) + float(line.amount or 0)
+
+    parts: list[str] = []
+    for day in days:
+        currency_totals = totals_by_day.get(day, {})
+        totals = ", ".join(
+            f"{cur} {amt:,.2f}" for cur, amt in sorted(currency_totals.items())
+        )
+        parts.append(f"{day.isoformat()} {totals}")
+    return shorten("Date subtotals: " + " | ".join(parts), width=width, placeholder="...")
+
+
 def render_day_page(
     group: list[ReceiptAnnotationLine],
     colors: dict[int | None, str],
@@ -473,6 +497,14 @@ def render_day_page(
         fill="black",
         font=FONT_DAY_SUB,
     )
+    date_subtotals = _date_subtotals_text(group)
+    if date_subtotals:
+        draw.text(
+            (MARGIN_X, MARGIN_Y + 130),
+            date_subtotals,
+            fill="black",
+            font=FONT_SMALL,
+        )
 
     grid_origin_y = MARGIN_Y + DAY_HEADER_HEIGHT
     extra_pages: list[Image.Image] = []

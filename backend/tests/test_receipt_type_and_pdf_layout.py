@@ -56,6 +56,7 @@ from app.services import model_router, receipt_annotations  # noqa: E402
 from app.services.receipt_annotations import (  # noqa: E402
     LINE_COLOR_PALETTE,
     ReceiptAnnotationLine,
+    _date_subtotals_text,
     assign_colors_to_lines,
     consolidate_consecutive_days,
     create_annotated_receipts_pdf,
@@ -524,6 +525,39 @@ def test_day_grouping_splits_large_same_day_to_avoid_overcrowding():
     assert len(groups[0]) == 9
     assert len(groups[1]) == 1
     assert all(line.transaction_date == date(2026, 4, 1) for group in groups for line in group)
+
+
+def test_date_subtotals_text_lists_multi_date_same_currency_totals():
+    lines = [
+        _make_line(transaction_id=1, tx_date=date(2026, 4, 1), amount=20.0, currency="USD"),
+        _make_line(transaction_id=2, tx_date=date(2026, 4, 5), amount=35.0, currency="USD"),
+        _make_line(transaction_id=3, tx_date=date(2026, 4, 5), amount=5.5, currency="USD"),
+    ]
+
+    text = _date_subtotals_text(lines)
+
+    assert text == "Date subtotals: 2026-04-01 USD 20.00 | 2026-04-05 USD 40.50"
+
+
+def test_date_subtotals_text_lists_mixed_currencies_per_date():
+    lines = [
+        _make_line(transaction_id=1, tx_date=date(2026, 4, 1), amount=20.0, currency="USD"),
+        _make_line(transaction_id=2, tx_date=date(2026, 4, 1), amount=7.5, currency="EUR"),
+        _make_line(transaction_id=3, tx_date=date(2026, 4, 5), amount=35.0, currency="USD"),
+    ]
+
+    text = _date_subtotals_text(lines)
+
+    assert text == "Date subtotals: 2026-04-01 EUR 7.50, USD 20.00 | 2026-04-05 USD 35.00"
+
+
+def test_date_subtotals_text_omits_single_date_groups():
+    lines = [
+        _make_line(transaction_id=1, tx_date=date(2026, 4, 1), amount=20.0, currency="USD"),
+        _make_line(transaction_id=2, tx_date=date(2026, 4, 1), amount=35.0, currency="USD"),
+    ]
+
+    assert _date_subtotals_text(lines) == ""
 
 
 def test_color_assignment_sequential_to_palette():

@@ -591,6 +591,20 @@ function Dashboard({ statement, localRows, auditLog, onNavigate, onReload }) {
 }
 
 // ─── Review Queue sub-components ──────────────────────────────────────────────
+function effectiveMimeType(receipt) {
+  if (!receipt) return null;
+  if (receipt.mime_type) return receipt.mime_type;
+  if (receipt.content_type === 'photo') return 'image/jpeg';
+  if (receipt.content_type === 'document' && receipt.original_file_name) {
+    const name = receipt.original_file_name.toLowerCase();
+    if (name.endsWith('.pdf')) return 'application/pdf';
+    if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
+    if (name.endsWith('.png')) return 'image/png';
+    if (name.endsWith('.heic')) return 'image/heic';
+  }
+  return null;
+}
+
 function ReceiptModal({ row, onClose }) {
   const [meta, setMeta] = useState(null);
   const [metaError, setMetaError] = useState(null);
@@ -609,7 +623,7 @@ function ReceiptModal({ row, onClose }) {
     return () => { cancelled = true; };
   }, [row.receiptId]);
   const fileUrl = row.receiptId ? `/receipts/${row.receiptId}/file` : null;
-  const mime = meta?.mime_type || '';
+  const mime = effectiveMimeType(meta) || '';
   const isImage = mime.startsWith('image/');
   const isPdf = mime === 'application/pdf';
   return (

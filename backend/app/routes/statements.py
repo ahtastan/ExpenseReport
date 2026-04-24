@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app.models import MatchDecision, ReceiptDocument, ReviewSession, StatementImport, StatementTransaction
+from app.models import AppUser, MatchDecision, ReceiptDocument, ReviewSession, StatementImport, StatementTransaction
 from app.schemas import (
     ManualStatementCreate,
     ManualStatementCreateResult,
@@ -25,6 +25,24 @@ from app.services.storage import save_upload_file
 router = APIRouter()
 
 
+def _browser_demo_user(session: Session) -> AppUser:
+    user = session.exec(select(AppUser).where(AppUser.username == "demo-browser")).first()
+    if user:
+        return user
+    user = AppUser(username="demo-browser", display_name="Browser Demo User")
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+
+def _browser_demo_user_id(session: Session) -> int:
+    user = _browser_demo_user(session)
+    if user.id is None:
+        raise HTTPException(status_code=500, detail="Demo user could not be initialized")
+    return user.id
+
+
 def _latest_review(session: Session, statement_import_id: int) -> ReviewSession | None:
     return session.exec(
         select(ReviewSession)
@@ -33,14 +51,26 @@ def _latest_review(session: Session, statement_import_id: int) -> ReviewSession 
     ).first()
 
 
-def _statement_for_manual_entry(session: Session, statement_import_id: int | None) -> StatementImport:
+def _statement_for_manual_entry(
+    session: Session, statement_import_id: int | None, owner_user_id: int
+) -> StatementImport:
     if statement_import_id is not None:
         statement = session.get(StatementImport, statement_import_id)
         if not statement:
             raise HTTPException(status_code=404, detail="Statement import not found")
+        if statement.uploader_user_id is None:
+            statement.uploader_user_id = owner_user_id
+            session.add(statement)
+            session.commit()
+            session.refresh(statement)
         return statement
 
-    statement = StatementImport(source_filename="manual_statement_entries", storage_path=None, row_count=0)
+    statement = StatementImport(
+        uploader_user_id=owner_user_id,
+        source_filename="manual_statement_entries",
+        storage_path=None,
+        row_count=0,
+    )
     session.add(statement)
     session.commit()
     session.refresh(statement)
@@ -101,8 +131,14 @@ async def import_statement_excel(
     session: Session = Depends(get_session),
 ):
     stored_path = await save_upload_file(file, "statements")
+    owner_user_id = _browser_demo_user_id(session)
     try:
-        return import_diners_excel(session, stored_path, file.filename or stored_path.name)
+        return import_diners_excel(
+            session,
+            stored_path,
+            file.filename or stored_path.name,
+            uploader_user_id=owner_user_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -142,10 +178,14 @@ def create_manual_statement_transaction(
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than zero")
 
-    statement = _statement_for_manual_entry(session, payload.statement_import_id)
+    owner_user_id = _browser_demo_user_id(session)
+    statement = _statement_for_manual_entry(session, payload.statement_import_id, owner_user_id)
     receipt = session.get(ReceiptDocument, payload.receipt_id) if payload.receipt_id else None
     if payload.receipt_id and not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
+    if receipt and receipt.uploader_user_id is None:
+        receipt.uploader_user_id = owner_user_id
+        session.add(receipt)
     if receipt and payload.business_reason is not None:
         receipt.business_reason = payload.business_reason.strip() or None
         session.add(receipt)

@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
 from app.db import create_db_and_tables
-from app.routes import health, imports, matching, receipts, reports, reviews, statements, telegram, transactions
+from app.routes import expense_reports, health, imports, matching, receipts, reports, reviews, statements, telegram, transactions
 
 
 @asynccontextmanager
@@ -24,6 +24,7 @@ app.include_router(matching.router, prefix="/matching", tags=["matching"])
 app.include_router(reviews.router, prefix="/reviews", tags=["reviews"])
 app.include_router(telegram.router, prefix="/telegram", tags=["telegram"])
 app.include_router(reports.router, prefix="/reports", tags=["reports"])
+app.include_router(expense_reports.router, prefix="/expense-reports", tags=["expense-reports"])
 
 
 @app.get("/review", include_in_schema=False)

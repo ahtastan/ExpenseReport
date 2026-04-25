@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -100,7 +101,7 @@ def _assert_vision_supplier_wins_over_placeholder() -> None:
         f"expected vision supplier to win, got {result.extracted_supplier!r}"
     )
     assert result.extracted_date == date(2025, 8, 28)
-    assert result.extracted_local_amount == 145.0
+    assert result.extracted_local_amount == Decimal("145.0000")
     assert result.extracted_currency == "TRY"
     assert "supplier" not in result.missing_fields
 

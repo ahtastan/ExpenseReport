@@ -17,6 +17,7 @@ import json
 import os
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -35,6 +36,8 @@ if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 import pytest  # noqa: E402
+
+from app.json_utils import DecimalEncoder  # noqa: E402
 from sqlmodel import Session  # noqa: E402
 
 from app.models import (  # noqa: E402
@@ -57,7 +60,7 @@ def _seed_confirmed_row(
     business_or_personal: str,
     business_reason: str | None,
     attendees: str | None,
-    amount: float = 50.0,
+    amount: Decimal = Decimal("50.0"),
     currency: str = "USD",
     supplier: str = "Test Supplier",
 ) -> tuple[int, int]:
@@ -159,15 +162,15 @@ def _seed_confirmed_row(
         attention_required=False,
         attention_note=None,
         source_json=json.dumps({"statement": {}, "receipt": {}, "match": {"status": "matched"}}),
-        suggested_json=json.dumps(confirmed),
-        confirmed_json=json.dumps(confirmed),
+        suggested_json=json.dumps(confirmed, cls=DecimalEncoder),
+        confirmed_json=json.dumps(confirmed, cls=DecimalEncoder),
     )
     session.add(row)
     session.commit()
     session.refresh(row)
 
     review.status = "confirmed"
-    review.snapshot_json = json.dumps([{**confirmed, "review_row_id": row.id}])
+    review.snapshot_json = json.dumps([{**confirmed, "review_row_id": row.id}], cls=DecimalEncoder)
     session.add(review)
     session.commit()
 
@@ -220,7 +223,7 @@ def test_missing_attendees_on_dinner_blocks(isolated_db):
             business_or_personal="Business",
             business_reason="Team dinner after late shift",
             attendees=None,
-            amount=55.0,
+            amount=Decimal("55.0"),
             supplier="Trattoria",
         )
         validation = validate_report_readiness(session, expense_report_id=report_id)
@@ -242,7 +245,7 @@ def test_customer_entertainment_needs_preapproval_reference(isolated_db):
             business_or_personal="Business",
             business_reason="Took the client out for drinks",
             attendees="self, Client X",
-            amount=180.0,
+            amount=Decimal("180.0"),
             supplier="The Lobby Bar",
         )
         validation = validate_report_readiness(session, expense_report_id=report_id)
@@ -263,7 +266,7 @@ def test_customer_entertainment_with_coo_reference_passes(isolated_db):
             business_or_personal="Business",
             business_reason="Pre-approved by COO: ref-123; host dinner with Acme CFO",
             attendees="self, Jane Doe (Acme)",
-            amount=180.0,
+            amount=Decimal("180.0"),
             supplier="The Lobby Bar",
         )
         validation = validate_report_readiness(session, expense_report_id=report_id)
@@ -286,7 +289,7 @@ def test_dinner_exceeds_cap_soft_flags(isolated_db):
             business_or_personal="Business",
             business_reason="Client dinner",
             attendees="self, Acme CFO",
-            amount=140.0,  # 2 heads, $70/head, exceeds $60/head with-customer cap
+            amount=Decimal("140.0"),  # 2 heads, $70/head, exceeds $60/head with-customer cap
             currency="USD",
             supplier="Steakhouse",
         )
@@ -314,7 +317,7 @@ def test_personal_rows_not_validated(isolated_db):
             business_or_personal="Personal",
             business_reason=None,
             attendees=None,
-            amount=45.0,
+            amount=Decimal("45.0"),
             supplier="Corner Bistro",
         )
         validation = validate_report_readiness(session, expense_report_id=report_id)
@@ -336,7 +339,7 @@ def test_solo_dinner_cap_stricter(isolated_db):
             business_or_personal="Business",
             business_reason="Late-night work dinner",
             attendees="self",
-            amount=32.0,
+            amount=Decimal("32.0"),
             currency="USD",
             supplier="Diner",
         )

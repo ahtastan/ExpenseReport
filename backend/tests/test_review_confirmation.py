@@ -1,6 +1,7 @@
 import asyncio
 import os
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -111,7 +112,7 @@ def seed(session: Session) -> int:
         supplier_raw="Migros",
         supplier_normalized="MIGROS",
         local_currency="TRY",
-        local_amount=419.58,
+        local_amount=Decimal("419.58"),
     )
     receipt = ReceiptDocument(
         source="test",
@@ -120,7 +121,7 @@ def seed(session: Session) -> int:
         original_file_name="migros.jpg",
         extracted_date=date(2026, 3, 11),
         extracted_supplier="Migros",
-        extracted_local_amount=419.58,
+        extracted_local_amount=Decimal("419.58"),
         extracted_currency="TRY",
         business_or_personal="Personal",
         report_bucket="Personal",
@@ -151,7 +152,7 @@ def seed_statement_only(session: Session) -> int:
     session.commit()
     session.refresh(statement)
 
-    for supplier, amount in [("Migros", 419.58), ("Uber Trip", 120.00)]:
+    for supplier, amount in [("Migros", Decimal("419.58")), ("Uber Trip", Decimal("120.00"))]:
         tx = StatementTransaction(
             statement_import_id=statement.id,
             transaction_date=date(2026, 3, 11),
@@ -177,7 +178,7 @@ def seed_mixed_statement(session: Session) -> int:
         supplier_raw="Migros",
         supplier_normalized="MIGROS",
         local_currency="TRY",
-        local_amount=419.58,
+        local_amount=Decimal("419.58"),
     )
     unmatched_tx = StatementTransaction(
         statement_import_id=statement.id,
@@ -185,7 +186,7 @@ def seed_mixed_statement(session: Session) -> int:
         supplier_raw="Uber Trip",
         supplier_normalized="UBER TRIP",
         local_currency="TRY",
-        local_amount=120.00,
+        local_amount=Decimal("120.00"),
     )
     receipt = ReceiptDocument(
         source="test",
@@ -194,7 +195,7 @@ def seed_mixed_statement(session: Session) -> int:
         original_file_name="migros.jpg",
         extracted_date=date(2026, 3, 11),
         extracted_supplier="Migros",
-        extracted_local_amount=419.58,
+        extracted_local_amount=Decimal("419.58"),
         extracted_currency="TRY",
         business_or_personal="Personal",
         report_bucket="Personal",
@@ -240,14 +241,14 @@ def test_report_bucket_allocation_uses_template_categories() -> None:
         attendees="",
     )
 
-    _allocate(ReportLine(**base, amount=10.0, report_bucket="Business"), day_totals, detail_lines)
-    _allocate(ReportLine(**base, amount=20.0, report_bucket="Taxi/Parking/Tolls/Uber"), day_totals, detail_lines)
-    _allocate(ReportLine(**base, amount=30.0, report_bucket="Hotel/Lodging/Laundry"), day_totals, detail_lines)
+    _allocate(ReportLine(**base, amount=Decimal("10.0"), report_bucket="Business"), day_totals, detail_lines)
+    _allocate(ReportLine(**base, amount=Decimal("20.0"), report_bucket="Taxi/Parking/Tolls/Uber"), day_totals, detail_lines)
+    _allocate(ReportLine(**base, amount=Decimal("30.0"), report_bucket="Hotel/Lodging/Laundry"), day_totals, detail_lines)
 
     totals = day_totals[date(2026, 4, 1)]
-    assert totals["other"] == [10.0]
-    assert totals["ground"] == [20.0]
-    assert totals["hotel"] == [30.0]
+    assert totals["other"] == [Decimal("10.0")]
+    assert totals["ground"] == [Decimal("20.0")]
+    assert totals["hotel"] == [Decimal("30.0")]
     assert totals["airfare"] == []
 
 
@@ -284,7 +285,8 @@ def main() -> None:
         assert "statement" in row_payload["source"]
         assert "receipt" in row_payload["source"]
         assert "match" in row_payload["source"]
-        assert row_payload["suggested"]["amount"] == 419.58
+        # confirmed_json blobs serialize Decimals as fixed-point strings (M1 Day 2.5).
+        assert row_payload["suggested"]["amount"] == "419.5800"
         assert row_payload["confirmed"]["business_or_personal"] == "Personal"
 
         review = confirm_review_session(session, review.id, confirmed_by_label="test")
@@ -294,21 +296,21 @@ def main() -> None:
 
         tx = session.get(StatementTransaction, rows[0].statement_transaction_id)
         receipt = session.get(ReceiptDocument, rows[0].receipt_document_id)
-        tx.local_amount = 999.99
+        tx.local_amount = Decimal("999.99")
         receipt.report_bucket = "Changed Live Bucket"
         session.add(tx)
         session.add(receipt)
         session.commit()
 
         confirmed_line = _confirmed_lines(session, statement_id)[0]
-        assert confirmed_line.amount == 419.58
+        assert confirmed_line.amount == Decimal("419.5800")
         assert confirmed_line.report_bucket == "Personal"
 
         run = generate_report_package(session, statement_id, "Tester", "Test Report", True)
         assert run.status == "completed"
         assert run.output_workbook_path
 
-        update_review_row(session, rows[0].id, fields={"amount": 420.00})
+        update_review_row(session, rows[0].id, fields={"amount": Decimal("420.00")})
         try:
             generate_report_package(session, statement_id, "Tester", "Test Report", True)
             raise AssertionError("Report generation should require reconfirmation after edit")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -52,7 +53,8 @@ def main() -> None:
         model_router.vision_extract = original
 
     assert result.extracted_date == date(2025, 9, 4)
-    assert result.extracted_local_amount == 369.45
+    # Vision returns JSON number; service quantizes to 4-dp Decimal.
+    assert result.extracted_local_amount == Decimal("369.4500")
     assert "receipt_date" not in result.missing_fields
     print("receipt_extraction_vision_date_tests=passed")
 

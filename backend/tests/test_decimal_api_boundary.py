@@ -1,16 +1,9 @@
 """API-boundary precision test for the Decimal migration (M1 Day 2.5).
 
-Distinguishes "column is Decimal but the API still float-shapes it" from
-"column is Decimal AND the API preserves Decimal exactly."
-
-This test is xfailed today (post step 3): models.py uses Decimal columns,
-but schemas.py still declares ``extracted_local_amount: float | None``,
-so Pydantic coerces Decimal -> float at the response boundary and emits
-a JSON number with possible binary-precision drift.
-
-After step 5 (schemas migrated to Decimal + DecimalEncoder on the JSON
-response), the response should be the string "123.4567" exactly. At that
-point, drop the xfail marker.
+Asserts the API preserves Decimal precision end-to-end: a value inserted
+into the DB column comes back as the exact decimal string in the JSON
+response body (not a JSON number, which would lose precision through
+float64 representation).
 """
 
 from __future__ import annotations
@@ -29,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from app import db as app_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import ReceiptDocument  # noqa: E402
+from app.models import AppUser, ReceiptDocument, StatementTransaction  # noqa: E402
 
 
 @pytest.fixture
@@ -38,11 +31,6 @@ def client(isolated_db):
         yield test_client
 
 
-@pytest.mark.xfail(
-    reason="Pending step 5 schema migration: schemas.ReceiptRead still "
-    "declares extracted_local_amount as float, so Pydantic coerces the "
-    "Decimal back to a float at response time."
-)
 def test_get_receipt_preserves_decimal_as_string(client):
     with Session(app_db.engine) as session:
         receipt = ReceiptDocument(extracted_local_amount=Decimal("123.4567"))
@@ -60,3 +48,50 @@ def test_get_receipt_preserves_decimal_as_string(client):
         f"expected exact string '123.4567', got {body['extracted_local_amount']!r} "
         f"(type {type(body['extracted_local_amount']).__name__})"
     )
+
+
+def _post_manual_transaction(client, amount_value):
+    """POST to the manual statement endpoint with the given amount shape."""
+    return client.post(
+        "/statements/manual/transactions",
+        json={
+            "transaction_date": "2026-04-01",
+            "supplier": "Test Vendor",
+            "amount": amount_value,
+            "currency": "TRY",
+        },
+    )
+
+
+def _persisted_amount(transaction_id: int) -> Decimal:
+    with Session(app_db.engine) as session:
+        tx = session.get(StatementTransaction, transaction_id)
+        assert tx is not None
+        assert tx.local_amount is not None
+        return tx.local_amount
+
+
+def test_manual_transaction_accepts_string_amount(client):
+    response = _post_manual_transaction(client, "123.45")
+    assert response.status_code == 200, response.text
+    tx_id = response.json()["transaction"]["id"]
+    assert _persisted_amount(tx_id) == Decimal("123.45")
+
+
+def test_manual_transaction_accepts_numeric_amount(client):
+    response = _post_manual_transaction(client, 123.45)
+    assert response.status_code == 200, response.text
+    tx_id = response.json()["transaction"]["id"]
+    assert _persisted_amount(tx_id) == Decimal("123.45")
+
+
+def test_manual_transaction_string_and_numeric_produce_identical_decimals(client):
+    string_resp = _post_manual_transaction(client, "123.45")
+    numeric_resp = _post_manual_transaction(client, 123.45)
+    assert string_resp.status_code == 200
+    assert numeric_resp.status_code == 200
+    string_amount = _persisted_amount(string_resp.json()["transaction"]["id"])
+    numeric_amount = _persisted_amount(numeric_resp.json()["transaction"]["id"])
+    assert string_amount == numeric_amount == Decimal("123.45")
+    # Wire form must also be identical between both inputs.
+    assert string_resp.json()["transaction"]["local_amount"] == numeric_resp.json()["transaction"]["local_amount"]

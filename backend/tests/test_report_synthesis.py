@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 from zipfile import ZipFile
@@ -47,7 +48,7 @@ def main() -> None:
             transaction_date=date(2026, 4, 1),
             supplier_raw="Istanbul Airport",
             supplier_normalized="istanbul airport",
-            local_amount=500.0,
+            local_amount=Decimal("500.0"),
             local_currency="TRY",
             source_row_ref="synthesis-1",
         )

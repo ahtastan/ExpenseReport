@@ -8,6 +8,7 @@ Verifies:
 
 import os
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -48,9 +49,9 @@ def main() -> None:
             transaction_date=date(2026, 3, 12),
             supplier_raw="DINNER HOUSE",
             supplier_normalized="dinner house",
-            local_amount=86.25,
+            local_amount=Decimal("86.25"),
             local_currency="USD",
-            usd_amount=86.25,
+            usd_amount=Decimal("86.25"),
             source_row_ref="row-1",
         )
         tx2 = StatementTransaction(
@@ -58,9 +59,9 @@ def main() -> None:
             transaction_date=date(2026, 3, 12),
             supplier_raw="CAFE ADDON",
             supplier_normalized="cafe addon",
-            local_amount=4.85,
+            local_amount=Decimal("4.85"),
             local_currency="USD",
-            usd_amount=4.85,
+            usd_amount=Decimal("4.85"),
             source_row_ref="row-2",
         )
         session.add(tx)

@@ -1,12 +1,15 @@
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from sqlmodel import Session, select
 
 from app.models import ReceiptDocument
+
+_AMOUNT_QUANT = Decimal("0.0001")
 
 
 @dataclass
@@ -30,13 +33,13 @@ def _parse_date(value: Any) -> date | None:
     return None
 
 
-def _parse_float(value: Any) -> float | None:
+def _parse_amount(value: Any) -> Decimal | None:
     text = str(value or "").replace(",", "").strip()
     if not text:
         return None
     try:
-        return float(text)
-    except ValueError:
+        return Decimal(text).quantize(_AMOUNT_QUANT)
+    except (InvalidOperation, ValueError):
         return None
 
 
@@ -94,7 +97,7 @@ def import_legacy_receipt_mapping(
         receipt.caption = row.get("Reason / Notes") or None
         receipt.extracted_date = _parse_date(row.get("Receipt Date") or row.get("Statement Date"))
         receipt.extracted_supplier = row.get("Merchant (Receipt)") or row.get("Merchant (Statement Match)") or None
-        receipt.extracted_local_amount = _parse_float(row.get("Amount Local") or row.get("Statement Amount Local"))
+        receipt.extracted_local_amount = _parse_amount(row.get("Amount Local") or row.get("Statement Amount Local"))
         receipt.extracted_currency = row.get("Local Currency") or "TRY"
         receipt.ocr_confidence = 1.0 if row.get("Authoritative Source", "").startswith("VisionExtract") else None
         receipt.business_or_personal = row.get("Business or Personal") or None

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -74,7 +75,7 @@ def main() -> None:
                 uploader_user_id=user.id,
                 original_file_name="airport_slip.jpg",
                 extracted_date=date(2025, 8, 26),
-                extracted_local_amount=750.0,
+                extracted_local_amount=Decimal("750.0"),
                 extracted_currency="TRY",
                 extracted_supplier="IST Sey",
                 business_or_personal="Business",

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -39,6 +40,8 @@ if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 import pytest  # noqa: E402
+
+from app.json_utils import DecimalEncoder  # noqa: E402
 from PIL import Image  # noqa: E402
 from sqlmodel import Session, SQLModel, create_engine  # noqa: E402
 
@@ -131,8 +134,8 @@ def _seed_hotel_fixture(
         supplier_raw=supplier,
         supplier_normalized=supplier.upper(),
         local_currency="USD",
-        local_amount=350.0,
-        usd_amount=350.0,
+        local_amount=Decimal("350.0"),
+        usd_amount=Decimal("350.0"),
     )
     receipt = ReceiptDocument(
         source="test",
@@ -141,7 +144,7 @@ def _seed_hotel_fixture(
         original_file_name="hotel.jpg",
         extracted_date=date(2026, 4, 1),
         extracted_supplier=supplier,
-        extracted_local_amount=350.0,
+        extracted_local_amount=Decimal("350.0"),
         extracted_currency="USD",
         business_or_personal="Business",
         report_bucket="Hotel/Lodging/Laundry",
@@ -193,7 +196,7 @@ def _seed_hotel_fixture(
         "receipt_id": receipt.id,
         "transaction_date": "2026-04-01",
         "supplier": supplier,
-        "amount": 350.0,
+        "amount": Decimal("350.0"),
         "currency": "USD",
         "business_or_personal": "Business",
         "report_bucket": "Hotel/Lodging/Laundry",
@@ -208,15 +211,15 @@ def _seed_hotel_fixture(
         status="confirmed",
         attention_required=False,
         source_json=json.dumps({"statement": {}, "receipt": {}, "match": {"status": "matched"}}),
-        suggested_json=json.dumps(confirmed),
-        confirmed_json=json.dumps(confirmed),
+        suggested_json=json.dumps(confirmed, cls=DecimalEncoder),
+        confirmed_json=json.dumps(confirmed, cls=DecimalEncoder),
     )
     session.add(row)
     session.commit()
     session.refresh(row)
 
     review.status = "confirmed"
-    review.snapshot_json = json.dumps([{**confirmed, "review_row_id": row.id}])
+    review.snapshot_json = json.dumps([{**confirmed, "review_row_id": row.id}], cls=DecimalEncoder)
     session.add(review)
     session.commit()
 

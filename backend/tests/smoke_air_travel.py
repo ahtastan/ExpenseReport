@@ -10,6 +10,7 @@ Verifies:
 
 import os
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -57,9 +58,9 @@ def main() -> None:
             transaction_date=date(2026, 3, 12),
             supplier_raw="PEGASUS HAVA YOLLARI",
             supplier_normalized="pegasus hava yollari",
-            local_amount=0,
+            local_amount=Decimal("0"),
             local_currency="USD",
-            usd_amount=0,
+            usd_amount=Decimal("0"),
             source_row_ref="row-1",
         )
         # One non-airfare transaction to confirm the air-travel filler skips it
@@ -68,9 +69,9 @@ def main() -> None:
             transaction_date=date(2026, 3, 13),
             supplier_raw="HILTON ISTANBUL",
             supplier_normalized="hilton istanbul",
-            local_amount=812.34,
+            local_amount=Decimal("812.34"),
             local_currency="USD",
-            usd_amount=812.34,
+            usd_amount=Decimal("812.34"),
             source_row_ref="row-2",
         )
         session.add_all([tx1, tx2])
@@ -199,9 +200,9 @@ def main() -> None:
                     transaction_date=date(2026, 3, 14 + index),
                     supplier_raw=f"AIRLINE {index + 1}",
                     supplier_normalized=f"airline {index + 1}",
-                    local_amount=100 + index,
+                    local_amount=Decimal(100 + index),
                     local_currency="USD",
-                    usd_amount=100 + index,
+                    usd_amount=Decimal(100 + index),
                     source_row_ref=f"overflow-{index + 1}",
                 )
             )
@@ -234,9 +235,9 @@ def main() -> None:
                 transaction_date=date(2026, 3, 20),
                 supplier_raw="ROUNDTRIP AIR",
                 supplier_normalized="roundtrip air",
-                local_amount=250,
+                local_amount=Decimal("250"),
                 local_currency="USD",
-                usd_amount=250,
+                usd_amount=Decimal("250"),
                 source_row_ref="missing-return-1",
             )
         )
@@ -276,9 +277,9 @@ def main() -> None:
                 transaction_date=date(2026, 3, 20),
                 supplier_raw="EARLY RETURN AIR",
                 supplier_normalized="early return air",
-                local_amount=275,
+                local_amount=Decimal("275"),
                 local_currency="USD",
-                usd_amount=275,
+                usd_amount=Decimal("275"),
                 source_row_ref="early-return-1",
             )
         )

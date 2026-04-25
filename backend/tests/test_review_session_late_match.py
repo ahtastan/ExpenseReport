@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+from decimal import Decimal
 from datetime import date
 from pathlib import Path
 from uuid import uuid4
@@ -79,7 +80,7 @@ def _seed_import_and_receipt(session: Session) -> tuple[int, int, int]:
         supplier_raw="Migros",
         supplier_normalized="MIGROS",
         local_currency="TRY",
-        local_amount=250.00,
+        local_amount=Decimal("250.00"),
     )
     receipt = ReceiptDocument(
         source="test",
@@ -88,7 +89,7 @@ def _seed_import_and_receipt(session: Session) -> tuple[int, int, int]:
         original_file_name="migros.jpg",
         extracted_date=date(2026, 3, 15),
         extracted_supplier="Migros",
-        extracted_local_amount=250.00,
+        extracted_local_amount=Decimal("250.00"),
         extracted_currency="TRY",
         business_or_personal="Business",
         report_bucket="Meals/Snacks",
@@ -242,7 +243,7 @@ def test_matched_row_falls_back_to_suggest_bucket_when_receipt_has_no_bucket() -
             supplier_raw="SHELL PETROL",
             supplier_normalized="SHELL PETROL",
             local_currency="TRY",
-            local_amount=500.00,
+            local_amount=Decimal("500.00"),
         )
         receipt = ReceiptDocument(
             source="test",
@@ -251,7 +252,7 @@ def test_matched_row_falls_back_to_suggest_bucket_when_receipt_has_no_bucket() -
             original_file_name="shell.jpg",
             extracted_date=date(2026, 3, 15),
             extracted_supplier="Shell",
-            extracted_local_amount=500.00,
+            extracted_local_amount=Decimal("500.00"),
             extracted_currency="TRY",
             business_or_personal="Business",
             report_bucket=None,  # ← the B3 case: receipt has no stored bucket

@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 import re
@@ -7,6 +8,8 @@ from openpyxl import load_workbook
 from sqlmodel import Session
 
 from app.models import StatementImport, StatementTransaction
+
+_AMOUNT_QUANT = Decimal("0.0001")
 
 
 def _parse_date(value: Any) -> date | None:
@@ -49,19 +52,22 @@ def _repair_swapped_excel_date_outliers(records: list[dict[str, Any]]) -> None:
             record["transaction_date"] = swapped
 
 
-def _parse_amount(value: Any) -> float | None:
+def _parse_amount(value: Any) -> Decimal | None:
     if value is None:
         return None
+    if isinstance(value, bool):
+        return None
     if isinstance(value, (int, float)):
-        return float(value)
+        # str() avoids float-binary noise (Decimal(0.1) != Decimal("0.1")).
+        return Decimal(str(value)).quantize(_AMOUNT_QUANT)
     text = str(value).strip()
     if not text:
         return None
     text = text.replace("TRY", "").replace("USD", "").replace("$", "").replace(" ", "")
     text = text.replace(",", "")
     try:
-        return float(text)
-    except ValueError:
+        return Decimal(text).quantize(_AMOUNT_QUANT)
+    except (InvalidOperation, ValueError):
         return None
 
 

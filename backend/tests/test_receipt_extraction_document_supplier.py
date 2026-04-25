@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -75,7 +76,7 @@ def test_document_receipt_prefers_vision_supplier_over_filename():
     # Regression for B4 proper: the other fields the vision call returned
     # must still land as before (we only reordered supplier).
     assert result.extracted_date == date(2025, 8, 29)
-    assert result.extracted_local_amount == 3500.0
+    assert result.extracted_local_amount == Decimal("3500.0000")
     assert result.extracted_currency == "TRY"
     assert "supplier" not in result.missing_fields
 
@@ -109,5 +110,5 @@ def test_photo_receipt_still_prefers_deterministic_supplier_over_vision():
     )
     # Vision still fills date/amount/currency that deterministic couldn't.
     assert result.extracted_date == date(2025, 8, 29)
-    assert result.extracted_local_amount == 42.5
+    assert result.extracted_local_amount == Decimal("42.5000")
     assert result.extracted_currency == "TRY"

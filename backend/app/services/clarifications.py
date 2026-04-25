@@ -1,8 +1,11 @@
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 from sqlmodel import Session, select
 
 from app.models import ClarificationQuestion, ReceiptDocument
+
+_AMOUNT_QUANT = Decimal("0.0001")
 
 
 def _question_exists(session: Session, receipt_id: int | None, key: str) -> bool:
@@ -26,15 +29,15 @@ def _parse_date(value: str) -> date | None:
     return None
 
 
-def _parse_amount(value: str) -> float | None:
+def _parse_amount(value: str) -> Decimal | None:
     text = value.replace("TRY", "").replace("TL", "").replace("USD", "").replace("EUR", "").strip()
     if "," in text and "." in text:
         text = text.replace(".", "").replace(",", ".") if text.rfind(",") > text.rfind(".") else text.replace(",", "")
     elif "," in text:
         text = text.replace(",", ".")
     try:
-        return float(text)
-    except ValueError:
+        return Decimal(text).quantize(_AMOUNT_QUANT)
+    except (InvalidOperation, ValueError):
         return None
 
 

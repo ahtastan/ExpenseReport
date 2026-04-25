@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 from sqlmodel import Session, SQLModel, create_engine
@@ -35,9 +36,9 @@ def _seed_ambiguous(session: Session) -> tuple[ReceiptDocument, list[StatementTr
         transaction_date=date(2026, 4, 2),
         supplier_raw="STARBUCKS OTG POYRAZKOY",
         supplier_normalized="starbucks otg poyrazkoy",
-        local_amount=75.0,
+        local_amount=Decimal("75.0"),
         local_currency="TRY",
-        usd_amount=2.5,
+        usd_amount=Decimal("2.5"),
         source_row_ref="a",
     )
     tx_b = StatementTransaction(
@@ -45,9 +46,9 @@ def _seed_ambiguous(session: Session) -> tuple[ReceiptDocument, list[StatementTr
         transaction_date=date(2026, 4, 2),  # same date
         supplier_raw="STARBUCKS IST OTG",
         supplier_normalized="starbucks ist otg",
-        local_amount=75.0,  # same amount — deterministic cannot pick
+        local_amount=Decimal("75.0"),  # same amount — deterministic cannot pick
         local_currency="TRY",
-        usd_amount=2.5,
+        usd_amount=Decimal("2.5"),
         source_row_ref="b",
     )
     session.add(tx_a)
@@ -61,7 +62,7 @@ def _seed_ambiguous(session: Session) -> tuple[ReceiptDocument, list[StatementTr
         storage_path="(memory)",
         extracted_date=date(2026, 4, 2),
         extracted_supplier="Starbucks OTG Poyrazkoy",
-        extracted_local_amount=75.0,
+        extracted_local_amount=Decimal("75.0"),
         extracted_currency="TRY",
         status="extracted",
     )

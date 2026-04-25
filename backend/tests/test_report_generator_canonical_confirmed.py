@@ -10,6 +10,7 @@ import json
 import os
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -74,7 +75,7 @@ def _seed(session: Session) -> tuple[int, int, int]:
         supplier_raw="MIGROS",
         supplier_normalized="MIGROS",
         local_currency="TRY",
-        local_amount=250.00,
+        local_amount=Decimal("250.00"),
     )
     receipt = ReceiptDocument(
         source="test",
@@ -83,7 +84,7 @@ def _seed(session: Session) -> tuple[int, int, int]:
         original_file_name="migros.jpg",
         extracted_date=date(2026, 3, 15),
         extracted_supplier="Migros",
-        extracted_local_amount=250.00,
+        extracted_local_amount=Decimal("250.00"),
         extracted_currency="TRY",
         business_or_personal="Business",  # ← ORIGINAL extraction (will be overridden)
         report_bucket="Other",             # ← ORIGINAL extraction (will be overridden)
@@ -200,7 +201,7 @@ def test_validate_report_readiness_errors_when_receipt_has_no_review_row() -> No
             supplier_raw="SHELL",
             supplier_normalized="SHELL",
             local_currency="TRY",
-            local_amount=500.00,
+            local_amount=Decimal("500.00"),
         )
         receipt = ReceiptDocument(
             source="test",
@@ -209,7 +210,7 @@ def test_validate_report_readiness_errors_when_receipt_has_no_review_row() -> No
             original_file_name="shell.jpg",
             extracted_date=date(2026, 3, 15),
             extracted_supplier="Shell",
-            extracted_local_amount=500.00,
+            extracted_local_amount=Decimal("500.00"),
             extracted_currency="TRY",
             business_or_personal="Business",
             report_bucket="Auto Gasoline",

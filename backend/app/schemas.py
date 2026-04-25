@@ -1,7 +1,19 @@
 from datetime import date, datetime
-from typing import Any
+from decimal import Decimal
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, PlainSerializer, field_validator
+
+
+# All money amounts in API responses serialize as fixed-point strings to
+# preserve precision over the wire (M1 Day 2.5). when_used='json' keeps the
+# in-Python value as Decimal so callers can do Decimal arithmetic; only the
+# JSON wire form is stringified. Matches the convention enforced by
+# app.json_utils.DecimalEncoder for internal JSON blobs.
+MoneyAmount = Annotated[
+    Decimal,
+    PlainSerializer(lambda v: format(v, "f"), return_type=str, when_used="json"),
+]
 
 
 class AppUserRead(BaseModel):
@@ -29,7 +41,7 @@ class ReceiptRead(BaseModel):
     caption: str | None
     extracted_date: date | None
     extracted_supplier: str | None
-    extracted_local_amount: float | None
+    extracted_local_amount: MoneyAmount | None
     extracted_currency: str | None
     business_or_personal: str | None
     report_bucket: str | None
@@ -43,9 +55,9 @@ class ReceiptRead(BaseModel):
 class ReceiptUpdate(BaseModel):
     extracted_date: date | None = None
     extracted_supplier: str | None = None
-    extracted_local_amount: float | None = None
+    extracted_local_amount: MoneyAmount | None = None
     extracted_currency: str | None = None
-    ocr_confidence: float | None = None
+    ocr_confidence: float | None = None  # OCR confidence (0.0–1.0), not money
     business_or_personal: str | None = None
     report_bucket: str | None = None
     business_reason: str | None = None
@@ -58,7 +70,7 @@ class ReceiptExtractionRead(BaseModel):
     status: str
     extracted_date: date | None
     extracted_supplier: str | None
-    extracted_local_amount: float | None
+    extracted_local_amount: MoneyAmount | None
     extracted_currency: str | None
     business_or_personal: str | None
     confidence: float | None
@@ -109,8 +121,8 @@ class StatementTransactionRead(BaseModel):
     supplier_raw: str
     supplier_normalized: str
     local_currency: str
-    local_amount: float | None
-    usd_amount: float | None
+    local_amount: MoneyAmount | None
+    usd_amount: MoneyAmount | None
     source_row_ref: str | None
     source_kind: str
     created_at: datetime
@@ -121,7 +133,7 @@ class ManualStatementDraft(BaseModel):
     status: str
     extracted_date: date | None
     extracted_supplier: str | None
-    extracted_local_amount: float | None
+    extracted_local_amount: MoneyAmount | None
     extracted_currency: str | None
     business_or_personal: str | None
     confidence: float | None
@@ -134,7 +146,7 @@ class ManualStatementCreate(BaseModel):
     receipt_id: int | None = None
     transaction_date: date
     supplier: str
-    amount: float
+    amount: MoneyAmount
     currency: str = "TRY"
     business_reason: str | None = None
 

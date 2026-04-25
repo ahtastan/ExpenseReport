@@ -1,6 +1,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -8,11 +9,14 @@ from openpyxl import load_workbook
 from sqlmodel import Session
 
 from app.config import get_settings
+from app.json_utils import decode_decimal
 from app.models import ExpenseReport, ReportRun
 from app.services import model_router
 from app.services.receipt_annotations import ReceiptAnnotationLine, create_annotated_receipts_pdf
 from app.services.report_validation import ReportValidation, validate_report_readiness
 from app.services.review_sessions import confirmed_snapshot
+
+_AMOUNT_QUANT = Decimal("0.0001")
 
 
 DEFAULT_BUSINESS_REASONS = {
@@ -103,7 +107,7 @@ class MealDetailLine:
     location: str
     participants: str
     reason: str
-    amount: float
+    amount: Decimal
     eg: bool
     mr: bool
 
@@ -117,7 +121,7 @@ class ReportLine:
     receipt_file_name: str
     transaction_date: date
     supplier: str
-    amount: float
+    amount: Decimal
     currency: str
     business_or_personal: str
     report_bucket: str
@@ -130,8 +134,8 @@ class ReportLine:
     air_travel_rt_or_oneway: str | None = None
     air_travel_return_date: date | None = None
     air_travel_paid_by: str | None = None
-    air_travel_total_tkt_cost: float | None = None
-    air_travel_prior_tkt_value: float | None = None
+    air_travel_total_tkt_cost: Decimal | None = None
+    air_travel_prior_tkt_value: Decimal | None = None
     air_travel_comments: str | None = None
     meal_place: str | None = None
     meal_location: str | None = None
@@ -148,13 +152,22 @@ def _parse_optional_date(value: object) -> date | None:
         return None
 
 
-def _parse_optional_float(value: object) -> float | None:
+def _parse_optional_decimal(value: object) -> Decimal | None:
+    """Tolerantly decode an amount field from a confirmed_json blob.
+
+    Accepts new string-shaped values (Decimal-as-string per M1 Day 2.5) and
+    legacy float/int values written before the migration. Always quantizes
+    to the 4-dp money grid so downstream arithmetic is on a common scale.
+    """
     if value in (None, ""):
         return None
     try:
-        return float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        decoded = decode_decimal(value)
+    except (TypeError, InvalidOperation, ValueError):
         return None
+    if decoded is None:
+        return None
+    return decoded.quantize(_AMOUNT_QUANT)
 
 
 def _parse_bool(value: object) -> bool:
@@ -185,7 +198,7 @@ def _confirmed_lines(
                 receipt_file_name=row.get("receipt_file_name") or f"receipt_{row.get('receipt_id')}",
                 transaction_date=tx_date,
                 supplier=row.get("supplier") or "",
-                amount=float(amount),
+                amount=_parse_optional_decimal(amount) or Decimal("0"),
                 currency=row.get("currency") or "TRY",
                 business_or_personal=row.get("business_or_personal") or "",
                 report_bucket=row.get("report_bucket") or "",
@@ -198,8 +211,8 @@ def _confirmed_lines(
                 air_travel_rt_or_oneway=row.get("air_travel_rt_or_oneway") or None,
                 air_travel_return_date=_parse_optional_date(row.get("air_travel_return_date")),
                 air_travel_paid_by=row.get("air_travel_paid_by") or None,
-                air_travel_total_tkt_cost=_parse_optional_float(row.get("air_travel_total_tkt_cost")),
-                air_travel_prior_tkt_value=_parse_optional_float(row.get("air_travel_prior_tkt_value")),
+                air_travel_total_tkt_cost=_parse_optional_decimal(row.get("air_travel_total_tkt_cost")),
+                air_travel_prior_tkt_value=_parse_optional_decimal(row.get("air_travel_prior_tkt_value")),
                 air_travel_comments=row.get("air_travel_comments") or None,
                 meal_place=row.get("meal_place") or None,
                 meal_location=row.get("meal_location") or None,
@@ -210,7 +223,7 @@ def _confirmed_lines(
     return sorted(lines, key=lambda line: (line.transaction_date, line.review_row_id or 0))
 
 
-def _allocate(line: ReportLine, day_totals: dict[date, dict[str, list[float]]], detail_lines: dict[date, list[MealDetailLine]]) -> None:
+def _allocate(line: ReportLine, day_totals: dict[date, dict[str, list[Decimal]]], detail_lines: dict[date, list[MealDetailLine]]) -> None:
     bp = line.business_or_personal.lower()
     day = day_totals[line.transaction_date]
     if bp != "business":
@@ -245,7 +258,7 @@ def _fill_workbook(template_path: Path, output_path: Path, employee_name: str, t
     ws1a["B3"] = employee_name
     ws1a["G3"] = title
 
-    day_totals: dict[date, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    day_totals: dict[date, dict[str, list[Decimal]]] = defaultdict(lambda: defaultdict(list))
     detail_lines: dict[date, list[MealDetailLine]] = defaultdict(list)
     for line in lines:
         _allocate(line, day_totals, detail_lines)
@@ -255,7 +268,7 @@ def _fill_workbook(template_path: Path, output_path: Path, employee_name: str, t
     cols = ["E", "F", "G", "H", "I", "J", "K"]
 
     def fill_a(ws, page_dates: list[date]) -> None:
-        def total_value(amounts: list[float] | None) -> float | str | None:
+        def total_value(amounts: list[Decimal] | None) -> Decimal | str | None:
             if not amounts:
                 return None
             if len(amounts) == 1:
@@ -373,11 +386,11 @@ def _write_summary(path: Path, validation: ReportValidation, lines: list[ReportL
     path.write_text("\n".join(summary_lines), encoding="utf-8")
 
 
-def _bucket_totals(lines: list[ReportLine]) -> dict[str, float]:
-    totals: dict[str, float] = defaultdict(float)
+def _bucket_totals(lines: list[ReportLine]) -> dict[str, Decimal]:
+    totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
     for line in lines:
         amount = line.air_travel_total_tkt_cost if _bucket_key(line.report_bucket) == _bucket_key(AIRFARE_BUCKET) and line.air_travel_total_tkt_cost is not None else line.amount
-        totals[line.report_bucket or "Other"] += float(amount)
+        totals[line.report_bucket or "Other"] += amount
     return dict(sorted(totals.items()))
 
 

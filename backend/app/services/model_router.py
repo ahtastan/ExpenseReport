@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.json_utils import DecimalEncoder
+
 logger = logging.getLogger(__name__)
 
 # Defaults match the policy stated by the user.  Override per-env.
@@ -315,6 +317,7 @@ def match_disambiguate(
         {"receipt": receipt, "candidates": candidates},
         ensure_ascii=False,
         sort_keys=True,
+        cls=DecimalEncoder,
     )
     result = _text_call(MATCHING_MODEL, _MATCH_PROMPT, payload)
     if not isinstance(result, dict):
@@ -354,7 +357,7 @@ def synthesize_report_summary(report: dict[str, Any]) -> str | None:
     ``summary_md`` string. The report generator supplies a deterministic
     fallback so package creation does not depend on live API availability.
     """
-    payload = json.dumps(report, ensure_ascii=False, sort_keys=True, default=str)
+    payload = json.dumps(report, ensure_ascii=False, sort_keys=True, cls=DecimalEncoder, default=str)
     result = _text_call(SYNTHESIS_MODEL, _SYNTHESIS_PROMPT, payload)
     if not isinstance(result, dict):
         return None

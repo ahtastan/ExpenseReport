@@ -1,10 +1,12 @@
 import hashlib
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from sqlmodel import Session, select
 
+from app.json_utils import DecimalEncoder
 from app.models import (
     ExpenseReport,
     MatchDecision,
@@ -116,7 +118,16 @@ def _public_payload(value: Any) -> Any:
 
 
 def _dumps(value: dict[str, Any] | list[dict[str, Any]]) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    # DecimalEncoder emits Decimal as a fixed-point string so blob round-trips
+    # preserve money/rate precision (M1 Day 2.5). default=str remains as a
+    # safety net for any other non-JSON-native scalars (e.g. date/datetime).
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        cls=DecimalEncoder,
+        default=str,
+    )
 
 
 def _latest_session(session: Session, expense_report_id: int) -> ReviewSession | None:
@@ -162,11 +173,11 @@ def _resolve_statement_to_expense_report(
     return report.id  # type: ignore[return-value]
 
 
-def _amount_and_currency(tx: StatementTransaction) -> tuple[float | None, str | None]:
+def _amount_and_currency(tx: StatementTransaction) -> tuple[Decimal | None, str | None]:
     if tx.usd_amount is not None:
-        return float(tx.usd_amount), "USD"
+        return tx.usd_amount, "USD"
     if tx.local_amount is not None:
-        return float(tx.local_amount), tx.local_currency
+        return tx.local_amount, tx.local_currency
     return None, tx.local_currency
 
 

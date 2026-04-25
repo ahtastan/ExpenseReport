@@ -1,9 +1,11 @@
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal, InvalidOperation
 import json
 
 from sqlmodel import Session, select
 
+from app.json_utils import decode_decimal
 from app.models import (
     ClarificationQuestion,
     ExpenseReport,
@@ -522,16 +524,23 @@ def validate_report_readiness(
             # Addition A: Dinner per-head cap. Soft flag. USD-only until FX
             # lookup lands (M1 Day 7). Skipped when attendees is empty —
             # missing_attendees_on_meal already covers that case.
+            # decode_decimal tolerates both new string-shaped values
+            # ("123.45", per M1 Day 2.5) and legacy float-shaped JSON
+            # numbers from pre-migration ReviewRow.confirmed_json blobs.
+            try:
+                amount_decimal = decode_decimal(amount_value)
+            except (TypeError, InvalidOperation, ValueError):
+                amount_decimal = None
             if (
                 bucket_value == "Dinner"
                 and currency_value == "USD"
                 and attendees_entries
-                and isinstance(amount_value, (int, float))
-                and amount_value > 0
+                and amount_decimal is not None
+                and amount_decimal > 0
             ):
                 solo = _is_solo_attendee_list(attendees_entries)
                 cap = DINNER_CAP_SOLO_USD if solo else DINNER_CAP_WITH_CUSTOMER_USD
-                per_head = float(amount_value) / len(attendees_entries)
+                per_head = amount_decimal / Decimal(len(attendees_entries))
                 if per_head > cap:
                     with_without = "without" if solo else "with"
                     issues.append(

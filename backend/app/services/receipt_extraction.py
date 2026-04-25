@@ -1,12 +1,15 @@
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from sqlmodel import Session
 
 from app.models import ReceiptDocument
 from app.services import model_router
+
+_AMOUNT_QUANT = Decimal("0.0001")
 
 
 AMOUNT_RE = re.compile(
@@ -46,7 +49,7 @@ class ReceiptExtraction:
     status: str
     extracted_date: date | None = None
     extracted_supplier: str | None = None
-    extracted_local_amount: float | None = None
+    extracted_local_amount: Decimal | None = None
     extracted_currency: str | None = None
     business_or_personal: str | None = None
     receipt_type: str | None = None
@@ -55,7 +58,7 @@ class ReceiptExtraction:
     notes: list[str] = field(default_factory=list)
 
 
-def _coerce_amount(raw: str) -> float | None:
+def _coerce_amount(raw: str) -> Decimal | None:
     text = raw.strip()
     if not text:
         return None
@@ -64,8 +67,8 @@ def _coerce_amount(raw: str) -> float | None:
     elif "," in text:
         text = text.replace(",", ".")
     try:
-        return float(text)
-    except ValueError:
+        return Decimal(text).quantize(_AMOUNT_QUANT)
+    except (InvalidOperation, ValueError):
         return None
 
 
@@ -83,8 +86,8 @@ def _parse_date(text: str) -> date | None:
     return None
 
 
-def _parse_amount(text: str) -> tuple[float | None, str | None]:
-    candidates: list[tuple[float, str | None]] = []
+def _parse_amount(text: str) -> tuple[Decimal | None, str | None]:
+    candidates: list[tuple[Decimal, str | None]] = []
     for match in AMOUNT_RE.finditer(text):
         amount = _coerce_amount(match.group("amount"))
         if amount is None:
@@ -180,7 +183,17 @@ def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
     # Deterministic wins over vision because it reflects ground truth from the
     # upload metadata that the user typed; vision fills only the gaps.
     extracted_date = receipt.extracted_date or det_date or _vision_date()
-    vision_amount = (vision or {}).get("amount")
+    vision_amount_raw = (vision or {}).get("amount")
+    # Vision returns numeric JSON (int/float); route through str() into Decimal
+    # so the new column type can store it without binary-precision noise.
+    vision_amount: Decimal | None
+    if vision_amount_raw is None:
+        vision_amount = None
+    else:
+        try:
+            vision_amount = Decimal(str(vision_amount_raw)).quantize(_AMOUNT_QUANT)
+        except (InvalidOperation, ValueError):
+            vision_amount = None
     vision_currency = (vision or {}).get("currency")
     extracted_amount = det_amount if det_amount is not None else vision_amount
     extracted_currency = det_currency or vision_currency

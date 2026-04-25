@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
-from sqlalchemy import Column, Text
+from sqlalchemy import Column, Numeric, Text
 from sqlmodel import Field, SQLModel
 
 
@@ -40,7 +41,9 @@ class ReceiptDocument(SQLModel, table=True):
     caption: str | None = None
     extracted_date: date | None = None
     extracted_supplier: str | None = None
-    extracted_local_amount: float | None = None
+    extracted_local_amount: Decimal | None = Field(
+        default=None, sa_column=Column(Numeric(18, 4))
+    )
     extracted_currency: str | None = None
     ocr_confidence: float | None = None
     # Addition B: classification from the vision model so validation can flag
@@ -96,8 +99,12 @@ class StatementTransaction(SQLModel, table=True):
     supplier_raw: str = Field(index=True)
     supplier_normalized: str = Field(index=True)
     local_currency: str = Field(default="TRY", index=True)
-    local_amount: float | None = Field(default=None, index=True)
-    usd_amount: float | None = None
+    local_amount: Decimal | None = Field(
+        default=None, sa_column=Column(Numeric(18, 4), index=True)
+    )
+    usd_amount: Decimal | None = Field(
+        default=None, sa_column=Column(Numeric(18, 4))
+    )
     source_row_ref: str | None = None
     source_kind: str = Field(default="excel")
     created_at: datetime = Field(default_factory=utc_now)
@@ -203,6 +210,6 @@ class FxRate(SQLModel, table=True):
     rate_date: date = Field(index=True)
     from_currency: str = Field(index=True)
     to_currency: str = Field(index=True)
-    rate: float
+    rate: Decimal = Field(sa_column=Column(Numeric(18, 8), nullable=False))
     source: str  # "openexchangerates" | "ecb" | "manual"
     fetched_at: datetime = Field(default_factory=utc_now)

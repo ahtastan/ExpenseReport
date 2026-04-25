@@ -134,6 +134,10 @@ const apiForm = async (path, body) => {
   return res.json();
 };
 
+/* M1 Day 2.5: amount fields arrive as decimal strings to preserve precision;
+   toNum() coerces for display math. Server retains exact Decimal arithmetic. */
+const toNum = (v) => v == null ? null : (typeof v === 'string' ? Number(v) : v);
+
 // ─── Row adapters ─────────────────────────────────────────────────────────────
 function apiRowToLocal(apiRow) {
   const c = apiRow.confirmed || {};
@@ -145,10 +149,10 @@ function apiRowToLocal(apiRow) {
     status:      apiRow.status,
     attention:   apiRow.attention_required,
     attnNote:    apiRow.attention_note,
-    // statement amounts (raw, for display)
-    localAmount: stmt.local_amount,
+    // statement amounts (raw, for display); toNum unwraps decimal-string responses
+    localAmount: toNum(stmt.local_amount),
     localCurrency: stmt.local_currency || 'TRY',
-    usdAmount:   c.amount,
+    usdAmount:   toNum(c.amount),
     // match
     confidence:  match.confidence || null,
     matchMethod: match.match_method || null,
@@ -701,7 +705,7 @@ function AddStatementModal({ statementId, onClose, onCreated }) {
       setFields({
         date: result.extracted_date || '',
         supplier: result.extracted_supplier || '',
-        amount: result.extracted_local_amount != null ? String(result.extracted_local_amount) : '',
+        amount: result.extracted_local_amount != null ? String(toNum(result.extracted_local_amount)) : '',
         currency: result.extracted_currency || 'TRY',
         businessReason:'',
       });

@@ -62,6 +62,18 @@ Exit codes:
     0  success, or already-migrated no-op
     2  refused (production path, missing db, SQLite too old, verification failed)
     3  runtime error during DDL or backfill (transaction rolled back)
+
+Rollback procedure (if production deploy goes wrong after copy-back):
+
+    1. sudo systemctl stop dcexpense.service
+    2. sudo cp /var/lib/dcexpense/expense_app.db.pre-m1-day25-{ts}.backup \
+              /var/lib/dcexpense/expense_app.db
+    3. Roll code back to the previous main commit (git revert or hard reset)
+    4. sudo systemctl start dcexpense.service
+    5. Verify /health returns 200 and one receipt loads via /review
+
+The .pre-m1-day25-{timestamp}.backup file is auto-created by --apply
+alongside the target DB before any DDL runs.
 """
 
 from __future__ import annotations

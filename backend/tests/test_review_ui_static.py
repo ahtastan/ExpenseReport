@@ -41,6 +41,12 @@ def main() -> None:
     assert "Run Matching" in html
     assert "/matching/run" in html
     assert "runMatching" in html
+    assert 'data-testid="statement-switcher"' in html
+    assert "selectedStatementId" in html
+    assert "statementsList" in html
+    assert "api('/statements/')" in html
+    assert "URLSearchParams" in html
+    assert "statement_id" in html
 
     print("review_ui_static_tests=passed")
 

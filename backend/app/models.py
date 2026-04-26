@@ -119,6 +119,11 @@ class MatchDecision(SQLModel, table=True):
     approved: bool = Field(default=False, index=True)
     rejected: bool = Field(default=False, index=True)
     reason: str
+    # LLM-suggested EDT bucket+category from match_disambiguate.
+    # Populated only when the matching model returned a closed-set value;
+    # NULL on deterministic-only matches and on LLM abstentions.
+    suggested_bucket: str | None = None
+    suggested_category: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

@@ -108,6 +108,7 @@ class Source(str, Enum):
 
     DETERMINISTIC          = "deterministic"
     VISION                 = "vision"
+    LLM_MATCH              = "llm_match"  # matcher-disambiguation model output (model_router.match_disambiguate); distinct from VISION which is the receipt OCR pass
     USER_TELEGRAM          = "user_telegram"
     USER_WEB               = "user_web"
     DINERS_STATEMENT       = "diners_statement"

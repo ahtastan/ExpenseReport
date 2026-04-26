@@ -106,6 +106,12 @@ class MatchDisambiguation:
     confidence: str  # "high" | "medium" | "low" as judged by the model
     reasoning: str  # short natural-language rationale (for audit trail)
     model: str
+    # EDT-template bucket+category suggestion. Populated only when the model
+    # returned a value from the closed set in EDT_BUCKETS / EDT_CATEGORIES;
+    # unknown values are dropped to None during validation in
+    # ``match_disambiguate``. NULL on abstention.
+    suggested_bucket: str | None = None
+    suggested_category: str | None = None
 
 
 def _count_missing(fields: dict[str, Any]) -> list[str]:
@@ -240,15 +246,58 @@ def _call_openai(model: str, images: list[tuple[str, str]]) -> dict[str, Any] | 
 _vision_call = _call_openai
 
 
+# Closed-set EDT template buckets + categories. Mirrors CATEGORY_GROUPS in
+# frontend/review-table.html — kept in sync via
+# tests/test_match_prompt_buckets_match_category_map.py (drift detector).
+# When EDT changes its template, BOTH this list AND the frontend map must
+# be updated together.
+EDT_BUCKETS: tuple[str, ...] = (
+    # Hotel & Travel
+    "Hotel/Lodging/Laundry", "Auto Rental", "Auto Gasoline",
+    "Taxi/Parking/Tolls/Uber", "Other Travel Related",
+    # Meals & Entertainment
+    "Meals/Snacks", "Breakfast", "Lunch", "Dinner", "Entertainment",
+    # Air Travel
+    "Airfare/Bus/Ferry/Other",
+    # Other
+    "Membership/Subscription Fees", "Customer Gifts", "Telephone/Internet",
+    "Postage/Shipping", "Admin Supplies", "Lab Supplies",
+    "Field Service Supplies", "Assets", "Other",
+)
+EDT_CATEGORIES: tuple[str, ...] = (
+    "Hotel & Travel", "Meals & Entertainment",
+    "Air Travel", "Personal Car", "Other",
+)
+
+# Bumped from implicit v1 (no version) to v2 — v2 is the first prompt that
+# returns suggested_bucket + suggested_category. Future bumps (e.g. v3)
+# should accompany any change that materially alters the model's expected
+# output shape or its decision rules. M1 Day 3b PR-1 will start emitting
+# this version into FieldProvenanceEvent.metadata_json on LLM_MATCH events.
+MATCH_PROMPT_VERSION = "v2"
+
 _MATCH_PROMPT = (
     "You are a receipt-to-bank-statement matcher. You will be given a single "
     "receipt and a list of candidate statement transactions. Pick the single "
     "best candidate, or abstain if none is plausible.\n\n"
+    "You must also classify the receipt under EDT's expense template.\n"
+    "Allowed buckets (pick exactly one or null): "
+    + ", ".join(repr(b) for b in EDT_BUCKETS) + ".\n"
+    "Allowed categories: " + ", ".join(repr(c) for c in EDT_CATEGORIES) + ".\n"
+    "Categories map to buckets per the obvious topical grouping: "
+    "'Hotel & Travel' covers all lodging + ground-transport + gasoline; "
+    "'Air Travel' is just airfare; "
+    "'Meals & Entertainment' is the meal+entertainment cluster; "
+    "'Other' is admin/supplies/membership/telephone/internet; "
+    "'Personal Car' has no buckets and is rarely used.\n\n"
     "Return ONLY a JSON object with exactly these keys:\n"
     "  transaction_id (integer id from the candidate list, or null to abstain),\n"
     "  confidence (\"high\", \"medium\", or \"low\"),\n"
-    "  reasoning (one short sentence explaining the pick).\n"
+    "  reasoning (one short sentence explaining the pick),\n"
+    "  suggested_bucket (one of the allowed buckets above, or null if uncertain),\n"
+    "  suggested_category (one of the allowed categories above, or null).\n"
     "Do not invent a transaction_id that is not in the candidate list."
+    " Do not invent a bucket or category that is not in the allowed list."
 )
 
 _SYNTHESIS_PROMPT = (
@@ -342,11 +391,42 @@ def match_disambiguate(
     if confidence not in {"high", "medium", "low"}:
         confidence = "low"
     reasoning = str(result.get("reasoning") or "")[:300]
+
+    # Closed-set validation for the new bucket/category fields. Model output
+    # outside the EDT_BUCKETS / EDT_CATEGORIES sets is dropped to None and
+    # logged. Strings are accepted; everything else (numbers, lists) becomes
+    # None silently because there is no semantically reasonable coercion.
+    raw_bucket = result.get("suggested_bucket")
+    if isinstance(raw_bucket, str) and raw_bucket in EDT_BUCKETS:
+        suggested_bucket: str | None = raw_bucket
+    elif raw_bucket in (None, ""):
+        suggested_bucket = None
+    else:
+        logger.warning(
+            "match_disambiguate: model returned unknown bucket %r; dropping",
+            raw_bucket,
+        )
+        suggested_bucket = None
+
+    raw_category = result.get("suggested_category")
+    if isinstance(raw_category, str) and raw_category in EDT_CATEGORIES:
+        suggested_category: str | None = raw_category
+    elif raw_category in (None, ""):
+        suggested_category = None
+    else:
+        logger.warning(
+            "match_disambiguate: model returned unknown category %r; dropping",
+            raw_category,
+        )
+        suggested_category = None
+
     return MatchDisambiguation(
         transaction_id=chosen,
         confidence=confidence,
         reasoning=reasoning,
         model=MATCHING_MODEL,
+        suggested_bucket=suggested_bucket,
+        suggested_category=suggested_category,
     )
 
 

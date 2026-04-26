@@ -84,14 +84,17 @@ import shutil
 import sqlite3
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-
-PROTECTED_PATH_FRAGMENTS = ("/var/lib/dcexpense", "/opt/dcexpense")
-
-MIN_SQLITE_VERSION = (3, 35, 0)
+from backend.migrations._common import (
+    check_sqlite_version,
+    column_info,
+    index_exists,
+    migration_artifact_paths,
+    refuse_protected_path,
+    table_exists,
+)
 
 # (table, column, declared_type, decimal_places_for_round, epsilon_for_per_row_check)
 COLUMNS: list[tuple[str, str, str, int, str]] = [
@@ -134,65 +137,13 @@ class MigrationResult:
 
 
 # ---------------------------------------------------------------------------
-# guards & helpers
+# Day 2.5-specific helpers
 # ---------------------------------------------------------------------------
-
-
-def _refuse_protected_path(db_path: str) -> None:
-    """Hard refusal if the path resolves to a protected production prefix.
-
-    Uses Path.resolve() so symlinks and relative paths can't smuggle a
-    protected location past a literal-substring check.
-    """
-    raw = db_path.replace("\\", "/").lower()
-    resolved = str(Path(db_path).resolve()).replace("\\", "/").lower()
-    for fragment in PROTECTED_PATH_FRAGMENTS:
-        for candidate in (raw, resolved):
-            if fragment in candidate:
-                print(
-                    f"REFUSED: {db_path!r} resolves to a path matching protected "
-                    f"fragment {fragment!r}.\n"
-                    "  Per operational rule #6, copy the live DB to /tmp first, "
-                    "run the migration on the copy, then copy back.\n"
-                    "  This script will not migrate the live file in place.",
-                    file=sys.stderr,
-                )
-                raise SystemExit(2)
-
-
-def _check_sqlite_version() -> None:
-    if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
-        have = ".".join(str(x) for x in sqlite3.sqlite_version_info)
-        need = ".".join(str(x) for x in MIN_SQLITE_VERSION)
-        print(
-            f"REFUSED: SQLite {have} bundled with this Python is too old. "
-            f"This migration uses ALTER TABLE DROP COLUMN which requires "
-            f"SQLite ≥ {need}.",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-
-
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-        (table,),
-    ).fetchone()
-    return row is not None
-
-
-def _column_info(conn: sqlite3.Connection, table: str, column: str) -> tuple[str, bool] | None:
-    """Return (declared_type, exists) for table.column, or None if absent."""
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    for row in rows:
-        # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)
-        if row[1] == column:
-            return (row[2] or "", True)
-    return None
+# Generic guards (refuse_protected_path, check_sqlite_version),
+# timestamp/artifact-naming, and SQLite introspection helpers
+# (table_exists, column_info, index_exists) live in _common.py — imported
+# above. The helpers below are specific to the float→Decimal type-flip
+# migration and stay here.
 
 
 def _is_numeric_declared(declared_type: str) -> bool:
@@ -202,14 +153,6 @@ def _is_numeric_declared(declared_type: str) -> bool:
     Match on "NUMERIC" substring (case-insensitive); rejects "REAL", "FLOAT".
     """
     return "NUMERIC" in (declared_type or "").upper()
-
-
-def _index_exists(conn: sqlite3.Connection, index_name: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
-        (index_name,),
-    ).fetchone()
-    return row is not None
 
 
 # ---------------------------------------------------------------------------
@@ -253,13 +196,13 @@ def _migrate_column(
 ) -> ColumnReport:
     report = ColumnReport(table=table, column=column)
 
-    if not _table_exists(conn, table):
+    if not table_exists(conn, table):
         report.skipped = True
         report.skipped_reason = "table not present"
         logger.info("skip %s.%s: table not present", table, column)
         return report
 
-    info = _column_info(conn, table, column)
+    info = column_info(conn, table, column)
     if info is None:
         report.skipped = True
         report.skipped_reason = "column not present"
@@ -426,11 +369,11 @@ def _recreate_dropped_indexes(
 ) -> list[str]:
     recreated: list[str] = []
     for index_name, table, column in INDEXES_TO_RECREATE:
-        if not _table_exists(conn, table):
+        if not table_exists(conn, table):
             continue
-        if _column_info(conn, table, column) is None:
+        if column_info(conn, table, column) is None:
             continue
-        if _index_exists(conn, index_name):
+        if index_exists(conn, index_name):
             logger.info("index %s already present, skipping", index_name)
             continue
         conn.execute(f"CREATE INDEX {index_name} ON {table}({column})")
@@ -445,15 +388,15 @@ def _recreate_dropped_indexes(
 
 
 def migrate(db_path: str, *, apply: bool) -> MigrationResult:
-    _refuse_protected_path(db_path)
-    _check_sqlite_version()
+    refuse_protected_path(db_path)
+    check_sqlite_version()
 
     if not Path(db_path).exists():
         print(f"REFUSED: db path {db_path!r} does not exist.", file=sys.stderr)
         raise SystemExit(2)
 
     dry_run = not apply
-    ts = _timestamp()
+    ts, _projected_backup, _projected_log = migration_artifact_paths(db_path, "m1-day25")
     backup_path: str | None = None
     log_path: str | None = None
     logger_name = f"m1_day25.{ts}"
@@ -462,8 +405,8 @@ def migrate(db_path: str, *, apply: bool) -> MigrationResult:
     logger.setLevel(logging.INFO)
 
     if apply:
-        backup_path = f"{db_path}.pre-m1-day25-{ts}.backup"
-        log_path = f"{db_path}.pre-m1-day25-{ts}.migration.log"
+        backup_path = _projected_backup
+        log_path = _projected_log
         shutil.copy2(db_path, backup_path)
         handler: logging.Handler = logging.FileHandler(log_path, encoding="utf-8")
     else:

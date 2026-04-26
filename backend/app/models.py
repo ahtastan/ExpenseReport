@@ -1,7 +1,7 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import Column, Numeric, Text
+from sqlalchemy import Column, Index, Numeric, Text, text
 from sqlmodel import Field, SQLModel
 
 
@@ -213,3 +213,80 @@ class FxRate(SQLModel, table=True):
     rate: Decimal = Field(sa_column=Column(Numeric(18, 8), nullable=False))
     source: str  # "openexchangerates" | "ecb" | "manual"
     fetched_at: datetime = Field(default_factory=utc_now)
+
+
+class FieldProvenanceEvent(SQLModel, table=True):
+    """Append-only audit ledger for tracked-field writes (M1 Day 3a).
+
+    Invariant (enforced in service layer, see app.services.field_provenance):
+    every write to a tracked field on receiptdocument / reviewrow /
+    expensereport produces at least one event in the same DB transaction.
+    Current state continues to live on the product columns; this table is
+    the lineage record.
+
+    All enum-typed columns (entity_type, field_name, event_type, source,
+    actor_type) are str-typed at the DB layer; the corresponding Python
+    Enums in app.provenance_enums constrain values at the application
+    layer per the design's "no DB CHECK constraints" decision.
+
+    See docs/M1_DAY3A_DESIGN.md for the full schema rationale.
+    """
+
+    __tablename__ = "fieldprovenanceevent"
+
+    # Composite index for the load-bearing query: "give me the most recent
+    # event for (entity_type, entity_id, field_name)." Per-column indexes
+    # are auto-generated from Field(index=True) below; this is the one
+    # composite that has to be declared explicitly.
+    __table_args__ = (
+        Index(
+            "ix_fieldprovenanceevent_lookup",
+            "entity_type",
+            "entity_id",
+            "field_name",
+            text("created_at DESC"),
+        ),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+
+    # — entity reference (generic; integrity at app layer) —
+    entity_type: str = Field(index=True)
+    entity_id: int = Field(index=True)
+
+    # — what changed —
+    field_name: str = Field(index=True)
+    event_type: str
+    source: str = Field(index=True)
+
+    # — value (TEXT-shaped; Decimals via DecimalEncoder convention from
+    #   M1 Day 2.5; dates as ISO-8601; strings as-is) —
+    value: str | None = Field(default=None, sa_column=Column(Text))
+
+    # — denormalized money-shape value, populated only for fields in
+    #   app.provenance_enums.MONEY_FIELDS — enables aggregation queries
+    #   like SUM(value_decimal) WHERE field_name='extracted_local_amount'.
+    #   Same precision as Day 2.5 money columns; NOT (18, 8). —
+    value_decimal: Decimal | None = Field(
+        default=None, sa_column=Column(Numeric(18, 4))
+    )
+
+    # — only meaningful for source IN ('vision', 'deterministic') —
+    confidence: float | None = None
+
+    # — grouping (UUID hex stored as TEXT; always set, see design Q1) —
+    decision_group_id: str = Field(index=True)
+
+    # — actor (pre-SSO; see design §4 for the post-SSO migration story) —
+    actor_type: str
+    actor_user_id: int | None = Field(
+        default=None, foreign_key="appuser.id", index=True
+    )
+    actor_label: str  # durable identifier; e.g. "telegram:12345"
+
+    # — extra structured detail; serialized via app.json_utils.dumps so
+    #   Decimal-bearing payloads round-trip safely. Validated at write
+    #   time to be dict[str, Any] | None per design Q5. —
+    metadata_json: str | None = Field(default=None, sa_column=Column(Text))
+
+    created_at: datetime = Field(default_factory=utc_now, index=True)

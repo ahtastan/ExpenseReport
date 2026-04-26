@@ -164,8 +164,18 @@ class FieldName(str, Enum):
 
 **Money-field membership** (used by `record_field_event` to auto-populate `value_decimal`):
 ```python
-MONEY_FIELDS = {FieldName.EXTRACTED_LOCAL_AMOUNT, FieldName.VAT_AMOUNT, FieldName.FX_RATE}
+MONEY_FIELDS = {FieldName.EXTRACTED_LOCAL_AMOUNT, FieldName.VAT_AMOUNT}
 ```
+
+> **Step-5 implementation correction (`feat/m1-day3a-field-provenance`):** the original
+> design listed `FX_RATE` in this set, but `value_decimal` is `Numeric(18, 4)` (per Q4)
+> and FX rates are 8-dp. Storing `Decimal("0.00000001")` in `value_decimal` would silently
+> truncate to `Decimal("0.0000")`, and any `SUM(value_decimal)` audit query would mix
+> incompatible precisions across true money fields and rate multipliers. `FX_RATE` is now
+> excluded from `MONEY_FIELDS`; rate values live exact-precision in the `value` TEXT
+> column only. See §12 Q4 for the full revised rationale and
+> `test_fx_rate_skips_value_decimal_to_preserve_8dp_precision` in
+> `test_field_provenance_service.py` for the pinning test.
 
 ---
 
@@ -645,6 +655,22 @@ Reuse causes decision groups to accumulate indefinitely as receipts are edited a
 ### Q4. `value_decimal` for non-money Decimal-typed fields (e.g., `vat_rate`) — **CONFIRMED: MONEY_FIELDS gates value_decimal**
 
 Only populate `value_decimal` for fields in `MONEY_FIELDS` (set defined in §2). `vat_rate` is a multiplier, not money — putting it in `value_decimal` would skew any `SUM(value_decimal) WHERE field_name='extracted_local_amount'` query that forgot to filter by field. Other Decimal-typed fields serialize to `value` only.
+
+> **Step-5 refinement (commit on `feat/m1-day3a-field-provenance`):** the same logic
+> applies to `FX_RATE`. The original design grouped `FX_RATE` with `EXTRACTED_LOCAL_AMOUNT`
+> and `VAT_AMOUNT` under "money-shaped Decimals," but rate values are 8-dp (per the
+> M1 Day 2.5 `fxrate.rate` column = `Numeric(18, 8)`) while `value_decimal` is
+> `Numeric(18, 4)`. A naïve write of `Decimal("0.00000001")` to `value_decimal` would
+> silently truncate to `Decimal("0.0000")`. Worse, mixing money amounts (4 dp) and rate
+> multipliers (8 dp) in the same denormalized column makes `SUM(value_decimal)` audit
+> queries semantically wrong even when filtered correctly.
+>
+> **Revised rule:** `MONEY_FIELDS` contains true *amount* fields only —
+> `EXTRACTED_LOCAL_AMOUNT` and `VAT_AMOUNT`. Rates and multipliers (`FX_RATE`,
+> `VAT_RATE`) get their exact value into the `value` TEXT column and leave
+> `value_decimal` NULL. PM-confirmed in step 5 review. The pinning test is
+> `test_fx_rate_skips_value_decimal_to_preserve_8dp_precision` in
+> `test_field_provenance_service.py`.
 
 ### Q5. `metadata_json` schema — **CONFIRMED: freeform PLUS dict-or-null validation at write time**
 

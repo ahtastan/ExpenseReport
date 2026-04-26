@@ -35,6 +35,12 @@ def main() -> None:
     assert "Return date cannot be before travel date." not in html
     assert "f.atReturn < f.atDate" not in html
     assert 'data-testid="air-travel-panel"' in html
+    # B16 follow-up: manual "Run Matching" button on /review toolbar
+    # so the operator can re-fire matching after import or after editing
+    # receipts without dropping to curl.
+    assert "Run Matching" in html
+    assert "/matching/run" in html
+    assert "runMatching" in html
 
     print("review_ui_static_tests=passed")
 

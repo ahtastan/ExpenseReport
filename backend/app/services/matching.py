@@ -27,6 +27,8 @@ class MatchRunStats:
     skipped_receipts: int = 0
     llm_disambiguated: int = 0  # hard cases resolved by the matching model
     llm_abstained: int = 0  # hard cases where the model declined to pick
+    llm_classification_calls: int = 0  # LLM bucket-classify calls made on approved matches
+    bucket_auto_applied: int = 0  # LLM-suggested EDT buckets copied to receipt.report_bucket
 
 
 def normalize_text(value: str | None) -> str:
@@ -201,6 +203,7 @@ def run_matching(
         # "medium" so only one high remains. Low-confidence scores are left
         # untouched.
         promoted_transaction_id: int | None = None
+        promoted_disambiguation: model_router.MatchDisambiguation | None = None
         if not unique_high:
             plausible_scores = [
                 s for s in scores[:5] if s.confidence in {"high", "medium"}
@@ -231,6 +234,7 @@ def run_matching(
                 dis = model_router.match_disambiguate(receipt_payload, candidates_payload)
                 if dis is not None and dis.transaction_id is not None and dis.confidence == "high":
                     promoted_transaction_id = dis.transaction_id
+                    promoted_disambiguation = dis
                     new_scores: list[MatchScore] = []
                     for s in scores:
                         if s.transaction.id == dis.transaction_id:
@@ -270,11 +274,26 @@ def run_matching(
                 if transaction.id == promoted_transaction_id
                 else "date_amount_merchant_v1"
             )
+            llm_promoted_here = transaction.id == promoted_transaction_id
+            # LLM bucket+category suggestion lives on the row that the LLM
+            # actually picked (the promoted transaction's decision row).
+            # Other decision rows under the same receipt — e.g. the demoted
+            # rivals or the low-confidence alternates — get NULL because the
+            # LLM's bucket guess is anchored to its chosen transaction.
+            llm_suggested_bucket: str | None = None
+            llm_suggested_category: str | None = None
+            if llm_promoted_here and promoted_disambiguation is not None:
+                llm_suggested_bucket = promoted_disambiguation.suggested_bucket
+                llm_suggested_category = promoted_disambiguation.suggested_category
+
             if decision:
                 decision.confidence = score.confidence
                 decision.reason = score.reason
                 decision.match_method = method
                 decision.updated_at = now
+                if llm_promoted_here:
+                    decision.suggested_bucket = llm_suggested_bucket
+                    decision.suggested_category = llm_suggested_category
             else:
                 decision = MatchDecision(
                     receipt_document_id=receipt.id,
@@ -282,6 +301,8 @@ def run_matching(
                     confidence=score.confidence,
                     match_method=method,
                     reason=score.reason,
+                    suggested_bucket=llm_suggested_bucket,
+                    suggested_category=llm_suggested_category,
                 )
             unique_transaction_high = (
                 transaction.id is not None
@@ -291,13 +312,76 @@ def run_matching(
             # uniqueness alone because ``high_receipt_count_by_transaction_id``
             # was computed before the promotion. Require deterministic
             # uniqueness OR a confident LLM pick for auto-approval.
-            llm_promoted_here = transaction.id == promoted_transaction_id
             if auto_approve_high_confidence and score.confidence == "high" and unique_high and (
                 unique_transaction_high or llm_promoted_here
             ):
                 decision.approved = True
                 decision.rejected = False
                 stats.auto_approved += 1
+
+                # Scope C: every approved match gets a bucket+category from
+                # the LLM. If disambiguation already populated decision.suggested_bucket
+                # (LLM-promoted path), reuse it. Otherwise (deterministic path),
+                # call classify_match_bucket — a separate, classify-only call
+                # that doesn't ask the model to pick among candidates.
+                #
+                # Latency: ~500ms-1.5s per call on the mini model. With ~10-15
+                # approved matches per statement, this adds 5-20s to /matching/run.
+                # Sync-in-handler is acceptable because: (a) the route is operator-
+                # triggered (not user-facing), (b) the "Run Matching" toast in
+                # PR #28 already covers this UX, (c) Caddy default timeout is
+                # 3min — well above the worst case. If matchdecision counts grow
+                # past ~50 per statement, revisit with a background-task pattern.
+                if decision.suggested_bucket is None:
+                    classification = model_router.classify_match_bucket(
+                        receipt={
+                            "supplier": receipt.extracted_supplier,
+                            "date": receipt.extracted_date.isoformat()
+                            if receipt.extracted_date
+                            else None,
+                            "local_amount": receipt.extracted_local_amount,
+                            "local_currency": receipt.extracted_currency,
+                            "business_or_personal": receipt.business_or_personal,
+                            "receipt_type": receipt.receipt_type,
+                        },
+                        transaction={
+                            "supplier": transaction.supplier_raw,
+                            "date": transaction.transaction_date.isoformat()
+                            if transaction.transaction_date
+                            else None,
+                            "local_amount": transaction.local_amount,
+                            "local_currency": transaction.local_currency,
+                        },
+                    )
+                    if classification is not None:
+                        stats.llm_classification_calls += 1
+                        decision.suggested_bucket = classification.bucket
+                        decision.suggested_category = classification.category
+                        # Append the classifier's reasoning to the audit reason
+                        # so M3 UI can show "deterministic match; LLM bucket
+                        # rationale: <text>" without a separate column.
+                        if classification.reasoning:
+                            decision.reason = (
+                                f"{decision.reason}; "
+                                f"classify({classification.model}): {classification.reasoning}"
+                            )
+
+                # Auto-apply the suggested bucket onto the receipt when
+                # (a) we have a bucket (from disambiguation OR classification),
+                # and (b) the receipt has no operator-set bucket. We never
+                # clobber an existing report_bucket — operator wins always.
+                #
+                # NOTE: direct setattr on a tracked field. Day 3b PR-1 will
+                # refactor through write_tracked_field with Source.LLM_MATCH
+                # provenance. Until then the column write is untracked.
+                if (
+                    decision.suggested_bucket is not None
+                    and receipt.report_bucket is None
+                ):
+                    receipt.report_bucket = decision.suggested_bucket
+                    receipt.updated_at = now
+                    session.add(receipt)
+                    stats.bucket_auto_applied += 1
             session.add(decision)
             stats.candidates_created += 1
             if score.confidence == "high":

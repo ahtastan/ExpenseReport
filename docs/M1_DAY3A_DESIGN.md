@@ -104,6 +104,26 @@ Plus the per-column indexes already declared (`entity_type`, `entity_id`, `field
 - `(value_decimal)` — no current "find events with amount > X" use case.
 - `(event_type)` alone — always queried with entity context.
 
+### EntityType enum
+
+```python
+class EntityType(str, Enum):
+    # Initial values used by Day 3a + 3b + 3c
+    RECEIPT         = "receipt"          # receiptdocument.id
+    REVIEW_ROW      = "review_row"       # reviewrow.id
+    EXPENSE_REPORT  = "expense_report"   # expensereport.id
+
+    # — RESERVED FUTURE VALUES (not yet emitted by any code path) —
+    # M3 (match-decision provenance): statementtransaction matches
+    # STATEMENT_TRANSACTION = "statement_transaction"
+    # M3 (approval workflow): which match was accepted/rejected
+    # MATCH_DECISION        = "match_decision"
+    # M4 (policy decisions): per-row policy verdicts
+    # POLICY_DECISION       = "policy_decision"
+```
+
+**Day 3a writes only `receipt` events** (the backfill targets receiptdocument). `review_row` and `expense_report` are reserved for Day 3c snapshot work and any user-edit pipeline that targets ReviewRow directly. The reserved values stay commented out in the enum until the code that emits them is written — adding the value before its first writer creates dead enum members that confuse readers.
+
 ---
 
 ## 2. Field-name enum
@@ -248,14 +268,14 @@ def record_field_event(
     field_name: FieldName,
     event_type: EventType,
     source: Source,
-    value: Any,                       # serialized via DecimalEncoder
+    value: Any,                                 # serialized via DecimalEncoder
     confidence: float | None = None,
-    decision_group_id: str | None = None,  # auto-generate UUID if None
+    decision_group_id: str | None = None,       # auto-generate UUID if None
     actor_type: ActorType,
     actor_user_id: int | None = None,
     actor_label: str,
-    metadata: dict | None = None,
-) -> int:                              # returns event id
+    metadata: dict[str, Any] | None = None,     # see metadata contract below
+) -> int:                                       # returns event id
     """Write one provenance event. Caller owns the surrounding transaction.
 
     Atomicity contract: this function does session.add() + session.flush()
@@ -264,8 +284,27 @@ def record_field_event(
     table (or a no-write event like 'rejected'/'snapshotted'). Day 3b
     refactors the merge logic to honor this contract.
 
+    The required caller pattern is `with session.begin():` (see
+    "Atomicity model" below) — NOT manual session.commit() / rollback().
+
     value_decimal is auto-populated from value when value is a Decimal
     AND field_name is in MONEY_FIELDS. Otherwise NULL.
+
+    metadata contract:
+      - Type: dict[str, Any] | None. The wrapper validates this at write
+        time and raises TypeError on any other input (including raw
+        strings, lists, or pre-serialized JSON). This prevents callers
+        from accidentally storing inconsistent encodings.
+      - Serialization: the wrapper internally serializes via
+        app.json_utils.dumps before storing in metadata_json. Decimal
+        values inside metadata round-trip safely; arbitrary nested
+        structures are accepted as long as they are JSON-encodable
+        through the DecimalEncoder.
+      - Read side: callers reading metadata_json should use
+        app.json_utils.loads (or json.loads) to deserialize, then pass
+        any money-shaped keys through decode_decimal to restore Decimal
+        precision. A future helper get_metadata(event) -> dict can
+        encapsulate this if reads become common.
     """
 
 
@@ -309,17 +348,27 @@ def get_decision_group(
 
 ### Atomicity model
 
-The wrapper does **not** open transactions. The caller passes their existing session and is responsible for `commit()` / `rollback()`. The contract is:
+The wrapper does **not** open transactions. The caller passes their existing session, and the **required pattern** is `with session.begin():`:
 
 ```python
 with Session(engine) as session:
-    # Begin transaction implicit in SQLModel session
-    receipt.extracted_local_amount = new_value     # column write
-    record_field_event(session, ...)               # event write
-    session.commit()                               # atomic
+    with session.begin():
+        receipt.extracted_local_amount = new_value     # column write
+        record_field_event(session, ...)               # event write
+    # session.begin() commits on context exit; rolls back on any exception.
 ```
 
-If the column write succeeds but the event write fails (or vice versa), the transaction rolls back and neither lands. If the caller forgets to commit, both are lost together — the invariant holds.
+**This is required, not a suggestion.** Manual `session.commit()` / `session.rollback()` is not equivalent — it leaves the column write and the event write in an autoflush-vulnerable window:
+
+| Failure mode without `session.begin()` | Result |
+|---|---|
+| Column written, then `record_field_event` raises (bad enum, bad metadata, etc.). Caller catches the exception above. | SQLModel autoflush already pushed the column write to the DB on the way INTO `record_field_event`. The column write persists; no event was written. **Invariant violated.** |
+| Column written, then `record_field_event` succeeds, then caller code raises before `session.commit()`. | Both writes lost together — invariant holds. But the caller has to remember to call `commit()` and the autoflush window above is still a risk for any flush that happened before commit. |
+| `with session.begin():` block + any of the above | Block's context manager calls `rollback()` on exception, re-raises. Both writes are atomic w.r.t. the surrounding transaction. **Invariant holds.** |
+
+The invariant survives all paths only when the column write and the event write are inside the same `session.begin()` block. Day 3b's refactor of `apply_receipt_extraction` will use exactly this pattern; tests in `test_field_provenance_atomicity.py` verify it (see §10).
+
+Forgetting to use `with session.begin():` is a code-review item until M2 adds a linter rule.
 
 ### Day 3b enforcement (out of scope for Day 3a but sketched here)
 
@@ -336,42 +385,44 @@ def apply_receipt_extraction(session, receipt):
     if vision_amount is not None:
         candidates.append((Source.VISION, vision_amount, vision_confidence))
 
-    # Record proposed events for every candidate
-    for source, value, conf in candidates:
-        record_field_event(
-            session,
-            entity_type=EntityType.RECEIPT,
-            entity_id=receipt.id,
-            field_name=FieldName.EXTRACTED_LOCAL_AMOUNT,
-            event_type=EventType.PROPOSED,
-            source=source,
-            value=value,
-            confidence=conf,
-            decision_group_id=decision_group,
-            actor_type=ActorType.DETERMINISTIC_PIPELINE if source == Source.DETERMINISTIC else ActorType.VISION_PIPELINE,
-            actor_label=f"{source.value}:auto",
-        )
+    with session.begin():
+        # Record proposed events for every candidate
+        for source, value, conf in candidates:
+            record_field_event(
+                session,
+                entity_type=EntityType.RECEIPT,
+                entity_id=receipt.id,
+                field_name=FieldName.EXTRACTED_LOCAL_AMOUNT,
+                event_type=EventType.PROPOSED,
+                source=source,
+                value=value,
+                confidence=conf,
+                decision_group_id=decision_group,
+                actor_type=ActorType.DETERMINISTIC_PIPELINE if source == Source.DETERMINISTIC else ActorType.VISION_PIPELINE,
+                actor_label=f"{source.value}:auto",
+            )
 
-    # Apply merge precedence (today's logic, unchanged)
-    extracted = det_amount if det_amount is not None else vision_amount
+        # Apply merge precedence (today's logic, unchanged)
+        extracted = det_amount if det_amount is not None else vision_amount
 
-    # Write the column AND the accepted/overridden event
-    if extracted is not None and extracted != receipt.extracted_local_amount:
-        prior = get_current_event(session, ...)
-        receipt.extracted_local_amount = extracted
-        record_field_event(
-            session,
-            entity_type=EntityType.RECEIPT,
-            entity_id=receipt.id,
-            field_name=FieldName.EXTRACTED_LOCAL_AMOUNT,
-            event_type=EventType.OVERRIDDEN if prior else EventType.ACCEPTED,
-            source=winning_source,
-            value=extracted,
-            confidence=winning_confidence,
-            decision_group_id=decision_group,
-            actor_type=...,
-            actor_label=...,
-        )
+        # Write the column AND the accepted/overridden event in the same block
+        if extracted is not None and extracted != receipt.extracted_local_amount:
+            prior = get_current_event(session, ...)
+            receipt.extracted_local_amount = extracted
+            record_field_event(
+                session,
+                entity_type=EntityType.RECEIPT,
+                entity_id=receipt.id,
+                field_name=FieldName.EXTRACTED_LOCAL_AMOUNT,
+                event_type=EventType.OVERRIDDEN if prior else EventType.ACCEPTED,
+                source=winning_source,
+                value=extracted,
+                confidence=winning_confidence,
+                decision_group_id=decision_group,
+                actor_type=...,
+                actor_label=...,
+            )
+    # session.begin() commits on exit, rolls back on any exception above.
 ```
 
 A code-review checklist (and ideally a linter rule in M2) will verify "no write to a tracked column outside `record_field_event`-aware code." Day 3a doesn't add the linter; Day 3b refactors the merge to use the wrapper.
@@ -535,7 +586,9 @@ New tests (target file naming follows existing convention):
 - `test_get_decision_group_returns_all_events_with_matching_id_ordered_by_created_at_asc`
 
 ### `backend/tests/test_field_provenance_atomicity.py`
-- `test_session_rollback_drops_event_alongside_column_write` — start a transaction, write column + event, rollback, verify neither persists.
+- `test_session_rollback_drops_event_alongside_column_write` — start a transaction with `with session.begin()`, write column + event, raise inside the block, verify on a fresh session that neither persisted.
+- `test_record_field_event_rejects_non_dict_metadata` — passing `metadata="some json string"` or `metadata=[1,2,3]` raises TypeError. Only `dict[str, Any]` or `None` accepted.
+- `test_metadata_with_decimal_value_round_trips_through_decimal_encoder` — write event with `metadata={"raw_amount": Decimal("123.4567")}`, read back, assert exact Decimal preserved (relies on M1 Day 2.5 `app.json_utils.dumps`). — start a transaction, write column + event, rollback, verify neither persists.
 
 ### `backend/tests/test_m1_day3a_migration.py`
 - `test_apply_creates_table_and_indexes`
@@ -548,8 +601,11 @@ New tests (target file naming follows existing convention):
 - `test_refuses_protected_path` (mirror Day 2.5 pattern)
 - `test_exit_invariant_holds` — run the §8 exit-invariant SQL programmatically, assert 0 rows.
 
+### `backend/tests/test_field_provenance_invariant.py`
+- `test_invariant_column_equals_latest_event` — for every receipt and every tracked field, after backfill, the column value equals `get_current_event(...).value` (deserialized to the column's native type). This is the **load-bearing detector** for "someone wrote a column without going through the wrapper" once Day 3b's merge-logic refactor lands. Day 3a runs it post-backfill against the synthetic 13-receipt DB; Day 3b promotes it to a per-test fixture for ongoing enforcement across the suite.
+
 ### Total
-~20 new tests. No changes to existing tests in Day 3a (no merge-logic refactor yet).
+~24 new tests. No changes to existing tests in Day 3a (no merge-logic refactor yet).
 
 ---
 
@@ -570,51 +626,35 @@ Day 3a does **not** do the following:
 
 ---
 
-## 12. Open questions for PM
+## 12. PM-confirmed answers
 
-### Q1. `decision_group_id` always-set vs nullable
+PM reviewed the original recommendations below and confirmed each. Implementation proceeds against these answers.
 
-**Recommendation: always set, auto-generate UUID for single-event writes.**
+### Q1. `decision_group_id` always-set vs nullable — **CONFIRMED: always set**
 
-Trade-off: NULL would mean "this event isn't part of a merge run" and would simplify some queries. But it complicates the M3 approval UI which always wants to do `get_decision_group()` to show context — handling NULL there means a special branch. Auto-generating a UUID per single-event write costs nothing (UUID4 generation is microseconds) and makes the data model uniform.
+Auto-generate UUID for single-event writes. NULL would simplify some queries but complicates the M3 approval UI which always wants `get_decision_group()` to show context. Auto-generating a UUID per write costs microseconds and keeps the data model uniform.
 
-PM decision needed before implementation.
+### Q2. `replaces_event_id` column on `overridden` events — **CONFIRMED: NO for Day 3a**
 
-### Q2. Should `overridden` events link to the previous `accepted` event explicitly?
+The `(entity_type, entity_id, field_name, created_at DESC)` lookup gives "previous event" trivially. Adding an explicit pointer column duplicates that information and creates a denormalization invariant to maintain. Add later if M3 audit UI makes the lookup pattern unergonomic.
 
-E.g., a `replaces_event_id` column.
+### Q3. Decision-group reuse vs new-per-override — **CONFIRMED: new group per override**
 
-**Recommendation: NO for Day 3a.** The `(entity_type, entity_id, field_name, created_at DESC)` lookup gives you "the previous event" trivially. Adding an explicit pointer column duplicates that information and creates a denormalization invariant to maintain. Add later if a real use case (e.g., M3 audit UI that wants to render the override chain visually) makes the lookup pattern unergonomic.
+Reuse causes decision groups to accumulate indefinitely as receipts are edited and re-edited; new-per-override gives each "decision moment" a clean boundary. The entity+field history is still walkable via `get_field_history` across decision groups.
 
-### Q3. When a user overrides a value via the M3 approval UI, do we reuse the original `decision_group_id` or generate a new one?
+### Q4. `value_decimal` for non-money Decimal-typed fields (e.g., `vat_rate`) — **CONFIRMED: MONEY_FIELDS gates value_decimal**
 
-Two readings:
-- **Reuse the original** — "this entire conversation about the field's value is one decision group, including the human override." The group accumulates events over time.
-- **New group per override** — "the original extraction was one decision; the user override is a new decision." Groups stay tightly bounded to single events-in-time.
+Only populate `value_decimal` for fields in `MONEY_FIELDS` (set defined in §2). `vat_rate` is a multiplier, not money — putting it in `value_decimal` would skew any `SUM(value_decimal) WHERE field_name='extracted_local_amount'` query that forgot to filter by field. Other Decimal-typed fields serialize to `value` only.
 
-**Recommendation: new group per override.** Reuse causes decision groups to accumulate indefinitely as receipts are edited and re-edited; new-per-override gives each "decision moment" a clean boundary, and the entity+field history is still walkable via `get_field_history`. Worth confirming.
+### Q5. `metadata_json` schema — **CONFIRMED: freeform PLUS dict-or-null validation at write time**
 
-### Q4. `value_decimal` for non-money fields — strictly NULL?
+Freeform per-source schema in Day 3a (documented in code comments). The actual fields will settle out during Day 3b/3c; M3+ can formalize per-source Pydantic schemas if needed.
 
-What about `vat_rate` (M1 Day 6) — it's a percentage, semantically a number. Should it populate `value_decimal`?
+**Additional PM requirement:** the wrapper validates at write time that `metadata` is `dict[str, Any]` or `None`. Any other type (string, list, pre-serialized JSON, etc.) raises `TypeError`. This prevents callers from sneaking in inconsistent encodings. The §6 record_field_event docstring documents this contract; `test_record_field_event_rejects_non_dict_metadata` (in `test_field_provenance_atomicity.py`, §10) enforces it.
 
-**Recommendation: only populate `value_decimal` for fields in `MONEY_FIELDS` (the set defined in §2).** `vat_rate` is a Decimal but it's a multiplier, not money — putting it in `value_decimal` would skew any `SUM(value_decimal) WHERE field_name='extracted_local_amount'` query that forgot to filter by field. Keep `value_decimal` strictly money-shaped. Other Decimal-typed fields serialize to `value` only.
+### Q6. Migration script consolidation — **CONFIRMED: extract to `migrations/_common.py` in Day 3a**
 
-### Q5. `metadata_json` schema — formal or freeform?
-
-Different sources want very different fields:
-- vision: model id, escalation flag, raw-response checksum
-- diners_statement: row reference, import file id, sheet name
-- ecb: API response timestamp, fetch latency
-- backfill: original_created_at, backfill_reason
-
-**Recommendation: freeform Day 3a, with a documented per-source schema in code comments.** Adding a Pydantic schema per source is over-engineering for a foundation pass; we'll see what the actual fields settle into during Day 3b/3c implementation. M3+ can formalize.
-
-### Q6. Migration script consolidation
-
-Should `_refuse_protected_path` / `_check_sqlite_version` / backup-and-log boilerplate be extracted from `m1_day25_money_decimal.py` and `m1_day3a_field_provenance.py` into a shared `backend/migrations/_common.py` now, or wait until a third migration?
-
-**Recommendation: extract now.** Two copies is the right time per "rule of three minus one" — by the third migration the divergence makes consolidation harder. Cost is small (one new file, ~80 lines of common code). Alternative: leave for a follow-up housekeeping ticket.
+`_refuse_protected_path`, `_check_sqlite_version`, and the backup-naming helper move to `backend/migrations/_common.py` as part of Day 3a. The Day 2.5 migration script gets a follow-up patch in the same Day 3a PR to import from the shared module (touching only the imports, not the migration logic). Cost ~80 lines in a new shared file; benefit is the Day 3a migration script imports rather than copy-pastes those guards, and a future Day 7 (FX) migration starts from the shared baseline.
 
 ---
 

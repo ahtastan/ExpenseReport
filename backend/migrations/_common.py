@@ -122,7 +122,14 @@ def table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def column_info(
     conn: sqlite3.Connection, table: str, column: str
 ) -> tuple[str, bool] | None:
-    """Return (declared_type, exists) for table.column, or None if absent."""
+    """Return (declared_type, exists) for table.column, or None if absent.
+
+    Caller MUST pass a trusted table name; PRAGMA cannot use parameter
+    binding, so the table name is interpolated into the SQL via f-string.
+    All callers in this codebase pass hardcoded module constants, so
+    there is no injection vector — but new callers must preserve that
+    contract.
+    """
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     for row in rows:
         # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)

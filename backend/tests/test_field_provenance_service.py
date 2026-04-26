@@ -241,14 +241,30 @@ def test_fx_rate_skips_value_decimal_to_preserve_8dp_precision(isolated_db):
         assert event.value_decimal is None
 
 
-def test_record_field_event_rejects_bogus_enum_value(isolated_db):
-    """Passing a bare string instead of an enum raises TypeError."""
+@pytest.mark.parametrize(
+    "param_name,bad_value,expected_match",
+    [
+        ("entity_type",  "receipt",                "entity_type must be EntityType"),
+        ("field_name",   "extracted_local_amount", "field_name must be FieldName"),
+        ("event_type",   "accepted",               "event_type must be EventType"),
+        ("source",       "vision",                 "source must be Source"),
+        ("actor_type",   "vision_pipeline",        "actor_type must be ActorType"),
+    ],
+    ids=["entity_type", "field_name", "event_type", "source", "actor_type"],
+)
+def test_record_field_event_rejects_bogus_enum_value(
+    isolated_db, param_name, bad_value, expected_match,
+):
+    """Each of the 5 enum-typed params must raise TypeError when passed a
+    bare string instead of the corresponding enum. Belt-and-suspenders for
+    quick refactors that might smuggle a string past static type checking.
+    """
     rid = _create_receipt(isolated_db)
     kwargs = _kwargs_for(receipt_id=rid)
-    kwargs["field_name"] = "extracted_local_amount"  # str, not FieldName
+    kwargs[param_name] = bad_value  # bypass the enum, send a raw string
 
     with Session(isolated_db) as session:
-        with pytest.raises(TypeError, match="field_name must be FieldName"):
+        with pytest.raises(TypeError, match=expected_match):
             with session.begin():
                 record_field_event(session, **kwargs)
 

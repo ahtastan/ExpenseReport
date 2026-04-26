@@ -174,3 +174,22 @@ def test_metadata_with_decimal_value_round_trips_through_decimal_encoder(isolate
         # raw_amount round-trips as a string ("123.4567") — caller decodes:
         assert parsed["raw_amount"] == "123.4567"
         assert decode_decimal(parsed["raw_amount"]) == Decimal("123.4567")
+
+
+# ---------------------------------------------------------------------------
+# actor_label contract — non-empty required
+# ---------------------------------------------------------------------------
+
+
+def test_record_field_event_rejects_empty_actor_label(isolated_db):
+    """Empty actor_label must raise ValueError. Pins the wrapper guard so a
+    future refactor can't silently allow events with no actor identifier.
+    """
+    rid = _create_receipt(isolated_db)
+    with Session(isolated_db) as session:
+        with pytest.raises(ValueError, match="actor_label"):
+            with session.begin():
+                record_field_event(
+                    session,
+                    **_kwargs_for(receipt_id=rid, actor_label=""),
+                )

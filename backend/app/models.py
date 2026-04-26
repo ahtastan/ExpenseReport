@@ -237,7 +237,9 @@ class FieldProvenanceEvent(SQLModel, table=True):
     # Composite index for the load-bearing query: "give me the most recent
     # event for (entity_type, entity_id, field_name)." Per-column indexes
     # are auto-generated from Field(index=True) below; this is the one
-    # composite that has to be declared explicitly.
+    # composite that has to be declared explicitly. entity_type is the
+    # leftmost column here, so a standalone per-column index on it would
+    # be redundant — Field(index=True) is therefore omitted on entity_type.
     __table_args__ = (
         Index(
             "ix_fieldprovenanceevent_lookup",
@@ -251,7 +253,7 @@ class FieldProvenanceEvent(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
 
     # — entity reference (generic; integrity at app layer) —
-    entity_type: str = Field(index=True)
+    entity_type: str
     entity_id: int = Field(index=True)
 
     # — what changed —

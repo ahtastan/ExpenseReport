@@ -228,7 +228,13 @@ def record_field_event(
     )
     session.add(event)
     session.flush()  # populates event.id without committing
-    assert event.id is not None  # flush must have assigned the PK
+    if event.id is None:
+        # Belt-and-suspenders for the documented contract: flush() assigns
+        # the PK on success. Raise (not assert) so the invariant survives
+        # under python -O where assert statements are stripped.
+        raise RuntimeError(
+            "session.flush() did not assign primary key — transaction is broken"
+        )
     return event.id
 
 

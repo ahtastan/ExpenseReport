@@ -114,6 +114,23 @@ class MatchDisambiguation:
     suggested_category: str | None = None
 
 
+@dataclass(frozen=True)
+class MatchClassification:
+    """Outcome of a classify-only LLM call for an already-paired match.
+
+    Distinct from MatchDisambiguation: that picks one of N candidates;
+    this asks "given THIS receipt and THIS transaction, what EDT bucket
+    fits?" — no candidate-picking semantics, no confidence-on-pick field.
+    Used by run_matching on every approved match where disambiguation did
+    not already produce a bucket (i.e. all deterministic-path matches).
+    """
+
+    bucket: str | None  # one of EDT_BUCKETS, or None if model abstained / dropped
+    category: str | None  # one of EDT_CATEGORIES, or None if model abstained / dropped
+    reasoning: str  # one short sentence (for audit trail)
+    model: str
+
+
 def _count_missing(fields: dict[str, Any]) -> list[str]:
     return [key for key in CRITICAL_FIELDS if not fields.get(key)]
 
@@ -308,6 +325,70 @@ _SYNTHESIS_PROMPT = (
 )
 
 
+# Bumped from implicit v1 to v2 alongside MATCH_PROMPT_VERSION. The classify
+# call has its own version namespace because its prompt and contract are
+# distinct from match_disambiguate's; they evolve independently.
+CLASSIFY_PROMPT_VERSION = "v1"
+
+_CLASSIFY_PROMPT = (
+    "You are an EDT expense-template classifier. You will be given a single "
+    "receipt that has already been paired with a single statement transaction. "
+    "Pick the EDT template bucket + category that best fits this expense. "
+    "Be concise; do not second-guess the pairing.\n\n"
+    "Allowed buckets (pick exactly one or null if truly uncertain): "
+    + ", ".join(repr(b) for b in EDT_BUCKETS) + ".\n"
+    "Allowed categories: " + ", ".join(repr(c) for c in EDT_CATEGORIES) + ".\n"
+    "Categories map to buckets per the obvious topical grouping: "
+    "'Hotel & Travel' covers all lodging + ground-transport + gasoline; "
+    "'Air Travel' is just airfare; "
+    "'Meals & Entertainment' is the meal+entertainment cluster; "
+    "'Other' is admin/supplies/membership/telephone/internet; "
+    "'Personal Car' has no buckets and is rarely used.\n\n"
+    "Return ONLY a JSON object with exactly these keys:\n"
+    "  bucket (one of the allowed buckets above, or null),\n"
+    "  category (one of the allowed categories above, or null),\n"
+    "  reasoning (one short sentence explaining the pick).\n"
+    "Do not invent a bucket or category that is not in the allowed list."
+)
+
+
+# ---------------------------------------------------------------------------
+# closed-set validators (shared between match_disambiguate + classify_match_bucket)
+# ---------------------------------------------------------------------------
+
+
+def _validate_edt_bucket(raw: object, *, source_label: str) -> str | None:
+    """Coerce a model-returned bucket value to a valid EDT_BUCKETS entry or None.
+
+    Strings in the closed set are accepted. None and empty string are accepted
+    as deliberate abstention. Anything else (unknown strings, ints, lists,
+    objects) is dropped to None and logged with ``source_label`` for audit
+    diagnosis.
+    """
+    if isinstance(raw, str) and raw in EDT_BUCKETS:
+        return raw
+    if raw in (None, ""):
+        return None
+    logger.warning(
+        "%s: model returned unknown bucket %r; dropping",
+        source_label, raw,
+    )
+    return None
+
+
+def _validate_edt_category(raw: object, *, source_label: str) -> str | None:
+    """Same as _validate_edt_bucket but against EDT_CATEGORIES."""
+    if isinstance(raw, str) and raw in EDT_CATEGORIES:
+        return raw
+    if raw in (None, ""):
+        return None
+    logger.warning(
+        "%s: model returned unknown category %r; dropping",
+        source_label, raw,
+    )
+    return None
+
+
 def _call_openai_text(model: str, prompt: str, payload: str) -> dict[str, Any] | None:
     """Invoke a text-only OpenAI chat completion and parse a JSON response."""
     api_key = os.getenv("OPENAI_API_KEY")
@@ -392,33 +473,14 @@ def match_disambiguate(
         confidence = "low"
     reasoning = str(result.get("reasoning") or "")[:300]
 
-    # Closed-set validation for the new bucket/category fields. Model output
-    # outside the EDT_BUCKETS / EDT_CATEGORIES sets is dropped to None and
-    # logged. Strings are accepted; everything else (numbers, lists) becomes
-    # None silently because there is no semantically reasonable coercion.
-    raw_bucket = result.get("suggested_bucket")
-    if isinstance(raw_bucket, str) and raw_bucket in EDT_BUCKETS:
-        suggested_bucket: str | None = raw_bucket
-    elif raw_bucket in (None, ""):
-        suggested_bucket = None
-    else:
-        logger.warning(
-            "match_disambiguate: model returned unknown bucket %r; dropping",
-            raw_bucket,
-        )
-        suggested_bucket = None
-
-    raw_category = result.get("suggested_category")
-    if isinstance(raw_category, str) and raw_category in EDT_CATEGORIES:
-        suggested_category: str | None = raw_category
-    elif raw_category in (None, ""):
-        suggested_category = None
-    else:
-        logger.warning(
-            "match_disambiguate: model returned unknown category %r; dropping",
-            raw_category,
-        )
-        suggested_category = None
+    # Closed-set validation for the bucket/category fields. Shared with
+    # classify_match_bucket via _validate_edt_bucket / _validate_edt_category.
+    suggested_bucket = _validate_edt_bucket(
+        result.get("suggested_bucket"), source_label="match_disambiguate"
+    )
+    suggested_category = _validate_edt_category(
+        result.get("suggested_category"), source_label="match_disambiguate"
+    )
 
     return MatchDisambiguation(
         transaction_id=chosen,
@@ -427,6 +489,55 @@ def match_disambiguate(
         model=MATCHING_MODEL,
         suggested_bucket=suggested_bucket,
         suggested_category=suggested_category,
+    )
+
+
+def classify_match_bucket(
+    receipt: dict[str, Any],
+    transaction: dict[str, Any],
+) -> MatchClassification | None:
+    """Classify an already-paired (receipt, transaction) into an EDT bucket.
+
+    Distinct from match_disambiguate: the pair is already chosen by the
+    deterministic scorer (or by a prior LLM disambiguation call). This
+    function exists purely to ask the model "what bucket fits?" — it does
+    not pick among candidates.
+
+    Returns None if the OpenAI call is unavailable (no API key, SDK
+    missing, or transient failure), so callers can keep the deterministic
+    match without a bucket suggestion. Callers should NOT treat None as
+    failure-to-classify-meaningfully — it just means we never got an
+    answer; the receipt's existing report_bucket (if any) stands.
+
+    The returned MatchClassification has bucket / category validated
+    against EDT_BUCKETS / EDT_CATEGORIES. Hallucinated values are
+    dropped to None and logged the same way as in match_disambiguate.
+    """
+    if not isinstance(receipt, dict) or not isinstance(transaction, dict):
+        return None
+
+    payload = json.dumps(
+        {"receipt": receipt, "transaction": transaction},
+        ensure_ascii=False,
+        sort_keys=True,
+        cls=DecimalEncoder,
+    )
+    result = _text_call(MATCHING_MODEL, _CLASSIFY_PROMPT, payload)
+    if not isinstance(result, dict):
+        return None
+
+    bucket = _validate_edt_bucket(
+        result.get("bucket"), source_label="classify_match_bucket"
+    )
+    category = _validate_edt_category(
+        result.get("category"), source_label="classify_match_bucket"
+    )
+    reasoning = str(result.get("reasoning") or "")[:300]
+    return MatchClassification(
+        bucket=bucket,
+        category=category,
+        reasoning=reasoning,
+        model=MATCHING_MODEL,
     )
 
 

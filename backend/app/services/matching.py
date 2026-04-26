@@ -27,6 +27,7 @@ class MatchRunStats:
     skipped_receipts: int = 0
     llm_disambiguated: int = 0  # hard cases resolved by the matching model
     llm_abstained: int = 0  # hard cases where the model declined to pick
+    llm_classification_calls: int = 0  # LLM bucket-classify calls made on approved matches
     bucket_auto_applied: int = 0  # LLM-suggested EDT buckets copied to receipt.report_bucket
 
 
@@ -317,24 +318,67 @@ def run_matching(
                 decision.approved = True
                 decision.rejected = False
                 stats.auto_approved += 1
-                # Auto-apply the LLM-suggested bucket onto the receipt when
-                # (a) this is the LLM-promoted decision (it's the row that
-                # carries the bucket suggestion), (b) the LLM produced a
-                # bucket value, and (c) the receipt has no operator-set
-                # bucket. We never clobber an existing report_bucket —
-                # operator wins always.
+
+                # Scope C: every approved match gets a bucket+category from
+                # the LLM. If disambiguation already populated decision.suggested_bucket
+                # (LLM-promoted path), reuse it. Otherwise (deterministic path),
+                # call classify_match_bucket — a separate, classify-only call
+                # that doesn't ask the model to pick among candidates.
                 #
-                # NOTE: this is a direct setattr on a tracked field and so
-                # is one of the paths Day 3b PR-1 will refactor to go
-                # through write_tracked_field with proper provenance metadata
-                # (Source.LLM_MATCH). Until that lands, the column write is
-                # untracked. Acceptable trade-off for tonight per PM ack.
+                # Latency: ~500ms-1.5s per call on the mini model. With ~10-15
+                # approved matches per statement, this adds 5-20s to /matching/run.
+                # Sync-in-handler is acceptable because: (a) the route is operator-
+                # triggered (not user-facing), (b) the "Run Matching" toast in
+                # PR #28 already covers this UX, (c) Caddy default timeout is
+                # 3min — well above the worst case. If matchdecision counts grow
+                # past ~50 per statement, revisit with a background-task pattern.
+                if decision.suggested_bucket is None:
+                    classification = model_router.classify_match_bucket(
+                        receipt={
+                            "supplier": receipt.extracted_supplier,
+                            "date": receipt.extracted_date.isoformat()
+                            if receipt.extracted_date
+                            else None,
+                            "local_amount": receipt.extracted_local_amount,
+                            "local_currency": receipt.extracted_currency,
+                            "business_or_personal": receipt.business_or_personal,
+                            "receipt_type": receipt.receipt_type,
+                        },
+                        transaction={
+                            "supplier": transaction.supplier_raw,
+                            "date": transaction.transaction_date.isoformat()
+                            if transaction.transaction_date
+                            else None,
+                            "local_amount": transaction.local_amount,
+                            "local_currency": transaction.local_currency,
+                        },
+                    )
+                    if classification is not None:
+                        stats.llm_classification_calls += 1
+                        decision.suggested_bucket = classification.bucket
+                        decision.suggested_category = classification.category
+                        # Append the classifier's reasoning to the audit reason
+                        # so M3 UI can show "deterministic match; LLM bucket
+                        # rationale: <text>" without a separate column.
+                        if classification.reasoning:
+                            decision.reason = (
+                                f"{decision.reason}; "
+                                f"classify({classification.model}): {classification.reasoning}"
+                            )
+
+                # Auto-apply the suggested bucket onto the receipt when
+                # (a) we have a bucket (from disambiguation OR classification),
+                # and (b) the receipt has no operator-set bucket. We never
+                # clobber an existing report_bucket — operator wins always.
+                #
+                # NOTE: direct setattr on a tracked field. Day 3b PR-1 will
+                # refactor through write_tracked_field with Source.LLM_MATCH
+                # provenance. Until then the column write is untracked.
                 if (
-                    llm_promoted_here
-                    and llm_suggested_bucket is not None
+                    decision.suggested_bucket is not None
                     and receipt.report_bucket is None
                 ):
-                    receipt.report_bucket = llm_suggested_bucket
+                    receipt.report_bucket = decision.suggested_bucket
                     receipt.updated_at = now
                     session.add(receipt)
                     stats.bucket_auto_applied += 1

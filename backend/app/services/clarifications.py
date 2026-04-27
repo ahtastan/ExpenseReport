@@ -180,13 +180,61 @@ def ensure_receipt_review_questions(
 
 
 def next_open_question_for_user(session: Session, user_id: int) -> ClarificationQuestion | None:
-    return session.exec(
+    """Return the next clarification question to dispatch for ``user_id``.
+
+    Scoped to the receipt with the *most recently created* open question
+    — i.e., the receipt the bot is currently interacting with. Within
+    that receipt, returns the oldest open question (per-receipt FIFO).
+
+    The pre-F1.5 implementation ordered globally across every open
+    question the user had, oldest first. That de-coupled display from
+    dispatch: ``telegram.handle_update`` shows the just-uploaded
+    receipt's ``questions[0].question_text`` (newest receipt), but the
+    answer was routed by ``next_open_question_for_user``, which would
+    return the oldest open question across *all* receipts. When stale
+    open questions existed on older receipts, an "amount?" prompt for
+    receipt N got answered by writing the user's reply into receipt
+    M's ``supplier`` slot — the dispatch correctly hit the supplier
+    branch with an amount-shaped value, corrupting the older receipt's
+    merchant column and leaving the newer receipt's amount NULL
+    (incident F1.5, 2026-04-27).
+
+    Receipt-scoping realigns display and dispatch: the receipt the bot
+    just spoke about (most recent open question) is the one whose
+    oldest open question gets the next answer. Once that receipt's
+    queue drains, the *next* most recent open question's receipt
+    becomes active automatically.
+
+    Receiptless questions (rare; ``receipt_document_id IS NULL``) are
+    returned as-is — there's no receipt to scope to.
+    """
+    most_recent = session.exec(
         select(ClarificationQuestion)
         .where(
             ClarificationQuestion.user_id == user_id,
             ClarificationQuestion.status == "open",
         )
-        .order_by(ClarificationQuestion.created_at)
+        .order_by(
+            ClarificationQuestion.created_at.desc(),
+            ClarificationQuestion.id.desc(),
+        )
+    ).first()
+    if most_recent is None:
+        return None
+    receipt_id = most_recent.receipt_document_id
+    if receipt_id is None:
+        return most_recent
+    return session.exec(
+        select(ClarificationQuestion)
+        .where(
+            ClarificationQuestion.user_id == user_id,
+            ClarificationQuestion.status == "open",
+            ClarificationQuestion.receipt_document_id == receipt_id,
+        )
+        .order_by(
+            ClarificationQuestion.created_at,
+            ClarificationQuestion.id,
+        )
     ).first()
 
 

@@ -325,16 +325,29 @@ _SYNTHESIS_PROMPT = (
 )
 
 
-# Bumped from implicit v1 to v2 alongside MATCH_PROMPT_VERSION. The classify
-# call has its own version namespace because its prompt and contract are
-# distinct from match_disambiguate's; they evolve independently.
-CLASSIFY_PROMPT_VERSION = "v1"
+# Bumped to v2: prompt now treats receipt.business_reason as the PRIMARY
+# signal for classification. v1 leaned heavily on supplier name, which
+# misleads when the supplier is generic (a gas-station mini-mart that's
+# actually a snack stop; a market entry that's a customer coffee meeting;
+# a restaurant chain row from a hotel folio). The operator's typed
+# business_reason captures intent in a way the supplier name does not.
+CLASSIFY_PROMPT_VERSION = "v2"
 
 _CLASSIFY_PROMPT = (
     "You are an EDT expense-template classifier. You will be given a single "
     "receipt that has already been paired with a single statement transaction. "
     "Pick the EDT template bucket + category that best fits this expense. "
     "Be concise; do not second-guess the pairing.\n\n"
+    "PRIMARY SIGNAL: receipt.business_reason captures the operator's intent "
+    "for this expense (e.g. 'customer meeting in Sakarya', 'fuel for company "
+    "travel', 'team lunch'). Treat it as the strongest cue when present and "
+    "non-empty. The supplier name alone often misleads — a gas station may "
+    "be a coffee/snack stop, a market may be a customer-meeting venue, and "
+    "a restaurant chain row may actually be a hotel folio sub-line.\n\n"
+    "SECONDARY SIGNALS (use to corroborate or break ties): receipt.supplier, "
+    "receipt.attendees (people the expense was for), receipt.receipt_type, "
+    "transaction.supplier (statement-side supplier name; sometimes cleaner "
+    "than the receipt OCR), and the amount/date pair.\n\n"
     "Allowed buckets (pick exactly one or null if truly uncertain): "
     + ", ".join(repr(b) for b in EDT_BUCKETS) + ".\n"
     "Allowed categories: " + ", ".join(repr(c) for c in EDT_CATEGORIES) + ".\n"
@@ -347,7 +360,8 @@ _CLASSIFY_PROMPT = (
     "Return ONLY a JSON object with exactly these keys:\n"
     "  bucket (one of the allowed buckets above, or null),\n"
     "  category (one of the allowed categories above, or null),\n"
-    "  reasoning (one short sentence explaining the pick).\n"
+    "  reasoning (one short sentence explaining the pick — cite which "
+    "signal you weighted most).\n"
     "Do not invent a bucket or category that is not in the allowed list."
 )
 

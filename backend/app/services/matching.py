@@ -343,6 +343,14 @@ def run_matching(
                             "local_currency": receipt.extracted_currency,
                             "business_or_personal": receipt.business_or_personal,
                             "receipt_type": receipt.receipt_type,
+                            # Operator-supplied trip/customer context. The
+                            # classifier prompt treats this as the primary
+                            # signal — see _CLASSIFY_PROMPT in model_router.py.
+                            # The supplier name alone often misleads (e.g. a
+                            # gas station's mini-mart that's actually a snack
+                            # stop, or a market entry that's a coffee meeting).
+                            "business_reason": receipt.business_reason,
+                            "attendees": receipt.attendees,
                         },
                         transaction={
                             "supplier": transaction.supplier_raw,

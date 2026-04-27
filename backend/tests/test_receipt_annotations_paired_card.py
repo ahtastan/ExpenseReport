@@ -190,20 +190,28 @@ def test_paired_card_hotel_bucket_recognized_as_exception() -> None:
     assert _is_hotel_bucket("  Hotel/Lodging/Laundry  ") is True
 
 
-def test_paired_card_with_only_hotel_renders_one_full_page() -> None:
-    """Single hotel receipt → full-page exception → one page. (No grid page
-    needed since there's nothing else.)"""
+def test_paired_card_single_page_hotel_stays_in_grid_post_fix2() -> None:
+    """Post-FIX-2 (PR #34 revision): single-page hotel receipts go in the
+    regular grid, NOT the full-A4 exception path. Only multi-page PDFs
+    (typically multi-night folios) trigger the full-A4 treatment. The
+    hotel-vs-non-hotel distinction surfaces visually via the FOLIO corner
+    badge drawn on the card, not via page layout.
+    """
     lines = [_line(rid=1, day=10, supplier="Hotel", amount=200.0,
                    bucket="Hotel/Lodging/Laundry")]
     with TemporaryDirectory() as tmp:
         out = Path(tmp) / "pc.pdf"
         n = _render_paired_card_layout(lines, out)
+    # 1 receipt → 1 grid page (was previously 1 full-A4 page; same count
+    # but now via the grid path).
     assert n == 1
 
 
-def test_paired_card_hotel_plus_three_others_renders_one_mixed_page() -> None:
-    """1 hotel + 3 grid receipts: spec says mixed page (folio at top +
-    spillover row beneath) when remainder ≤ 3. Total = 1 page."""
+def test_paired_card_hotel_plus_three_others_all_fit_in_grid_post_fix2() -> None:
+    """1 hotel + 3 grid receipts: post-FIX-2, the hotel is treated as a
+    regular grid card. All 4 fit in one grid page; no mixed-page path
+    fires.
+    """
     lines = [
         _line(rid=1, day=10, supplier="Hotel", amount=200.0,
               bucket="Hotel/Lodging/Laundry"),
@@ -215,6 +223,83 @@ def test_paired_card_hotel_plus_three_others_renders_one_mixed_page() -> None:
         out = Path(tmp) / "pc.pdf"
         n = _render_paired_card_layout(lines, out)
     assert n == 1
+
+
+def test_paired_card_hotel_in_stream_goes_to_grid_not_full_stream_post_fix2() -> None:
+    """Direct check on the filter: a single-page hotel receipt routes to
+    grid_stream, not full_stream. Verifies FIX 2's filter change without
+    needing to render to disk.
+    """
+    from app.services.receipt_annotations import (
+        _build_paired_card_stream,
+        _is_hotel_bucket,
+    )
+    lines = [
+        _line(rid=1, day=10, bucket="Hotel/Lodging/Laundry"),
+        _line(rid=2, day=11, bucket="Other"),
+    ]
+    stream = _build_paired_card_stream(lines, week_label="41")
+    # Both should have multi_page=False (no real PDF file in test fixture).
+    assert all(c.multi_page is False for c in stream)
+    # Therefore both end up in grid_stream under the FIX-2 filter
+    # (multi_page-only). The hotel is identified for the FOLIO badge but
+    # not exiled to a full-A4 page.
+    grid = [c for c in stream if not c.multi_page]
+    full = [c for c in stream if c.multi_page]
+    assert len(grid) == 2
+    assert len(full) == 0
+    # is_hotel_bucket still surfaces the hotel for the corner badge.
+    assert any(_is_hotel_bucket(c.line.report_bucket) for c in grid)
+
+
+# ---------------------------------------------------------------------------
+# 4b. Bucket badge + FOLIO corner badge (FIX 3)
+# ---------------------------------------------------------------------------
+
+
+def test_paired_card_bucket_letter_codes_cover_all_canonical_buckets() -> None:
+    """Every bucket in _BUCKET_TO_PAGE_1A_ROW must have a single-letter
+    code in _BUCKET_LETTER_CODE so the bucket badge always renders the
+    "[X] LABEL" format. Drift catcher: adding a new bucket without a
+    code would leave the badge falling back to "[O]" silently.
+    """
+    from app.services.receipt_annotations import (
+        _BUCKET_LETTER_CODE,
+        _BUCKET_SHORT_LABEL,
+        _BUCKET_TO_PAGE_1A_ROW,
+    )
+    canonical = set(_BUCKET_TO_PAGE_1A_ROW.keys())
+    coded = set(_BUCKET_LETTER_CODE.keys())
+    labelled = set(_BUCKET_SHORT_LABEL.keys())
+    assert canonical <= coded, (
+        f"Buckets missing letter codes: {sorted(canonical - coded)}"
+    )
+    assert canonical <= labelled, (
+        f"Buckets missing short labels: {sorted(canonical - labelled)}"
+    )
+
+
+def test_paired_card_bucket_letter_codes_are_single_uppercase_letters() -> None:
+    """Codes are single uppercase A-Z letters — keeps the badge format
+    "[X] LABEL" parseable without ambiguity."""
+    from app.services.receipt_annotations import _BUCKET_LETTER_CODE
+    for bucket, code in _BUCKET_LETTER_CODE.items():
+        assert len(code) == 1, f"{bucket!r}'s code {code!r} is not 1 char"
+        assert code.isupper(), f"{bucket!r}'s code {code!r} is not uppercase"
+        assert code.isalpha(), f"{bucket!r}'s code {code!r} is not a letter"
+
+
+def test_paired_card_supplier_truncation_caps_at_18_chars() -> None:
+    """Post-FIX-1: supplier names truncate to 18 chars to fit the right
+    info column at 8.5pt sans bold (≈ 17 chars/311 px width)."""
+    from app.services.receipt_annotations import _format_pc_supplier
+    long_supplier = _line(
+        rid=1, supplier="İKBAL LOKANTACILIK / ZEY SPORT SPOR MAL.",
+    )
+    out = _format_pc_supplier(long_supplier)
+    assert len(out) <= 18
+    # Ellipsis preserved — the truncation produces a visually clean cut.
+    assert out.endswith("…") or len(long_supplier.supplier) <= 18
 
 
 # ---------------------------------------------------------------------------

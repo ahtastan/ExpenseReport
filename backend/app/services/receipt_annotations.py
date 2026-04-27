@@ -289,7 +289,7 @@ _MONO = ("JetBrainsMono-Regular.ttf", "JetBrainsMonoNL-Regular.ttf", "RobotoMono
 FONT_PC_AMOUNT_USD = _font_first_available(_MONO_BOLD, 42)    # 10pt mono bold
 FONT_PC_AMOUNT_TRY = _font_first_available(_MONO_BOLD, 35)    # 8.5pt mono bold
 FONT_PC_DATE = _font_first_available(_MONO, 35)               # 8.5pt mono
-FONT_PC_SUPPLIER = _font_first_available(_SANS_BOLD, 35)      # 8.5pt sans bold uppercase
+FONT_PC_SUPPLIER = _font_first_available(_SANS_BOLD, 28)      # 6.7pt sans bold uppercase (tightened from 8.5pt for narrow cells)
 FONT_PC_BUCKET = _font_first_available(_SANS, 29)             # 7pt uppercase
 FONT_PC_TAG = _font_first_available(_MONO, 29)                # 7pt mono uppercase
 FONT_PC_GROUP = _font_first_available(_MONO_BOLD, 31)         # 7.5pt mono bold uppercase
@@ -1130,7 +1130,7 @@ def _format_pc_amount_local(line: ReceiptAnnotationLine) -> str:
     return f"{line.local_currency} {float(line.local_amount):,.2f}"
 
 
-PC_SUPPLIER_LINE_CHARS = 17     # ~311 px / 35-px sans-bold ≈ 17 chars per line
+PC_SUPPLIER_LINE_CHARS = 13     # ~311 px / 28-px sans-bold ≈ 14 chars; bound at 13 for wide-glyph headroom (M/W/letters with diacritics)
 PC_SUPPLIER_MAX_LINES = 2
 
 
@@ -1289,8 +1289,8 @@ def _draw_paired_card(
     # 5. Supplier (uppercase, Excel-style wrap up to 2 lines).
     supplier_lines = _wrap_pc_supplier(line)
     for i, supplier_line in enumerate(supplier_lines):
-        _draw_text_safe(draw, (cx, cy + i * 38), supplier_line, font=FONT_PC_SUPPLIER)
-    cy += 50 + (len(supplier_lines) - 1) * 38
+        _draw_text_safe(draw, (cx, cy + i * 32), supplier_line, font=FONT_PC_SUPPLIER)
+    cy += 50 + (len(supplier_lines) - 1) * 32
 
     # 6. Bucket badge (solid black tag with white text) — visually distinct
     #    so the auditor's eye lands on the category. Format: "[X] LABEL"

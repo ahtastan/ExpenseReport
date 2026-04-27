@@ -290,29 +290,28 @@ def test_paired_card_bucket_letter_codes_are_single_uppercase_letters() -> None:
 
 
 def test_paired_card_supplier_wraps_yuvamceto_kebap_gida_to_two_lines() -> None:
-    """Post-FIX-4: supplier names that don't fit one line wrap to a second
-    line at the latest whitespace boundary instead of being hard-truncated.
-    'YUVAMCETO KEBAP GIDA' is 20 chars > 17 → split keeps the longest
-    word-prefix that fits ('YUVAMCETO KEBAP' = 15 chars) on line 1 and
-    pushes the trailing word ('GIDA') onto line 2. No ellipsis since
-    nothing overflows the 2-line budget.
+    """Post-FIX-5: supplier names that don't fit one line wrap to a second
+    line at the latest whitespace boundary. 'YUVAMCETO KEBAP GIDA' (20 chars)
+    splits as ['YUVAMCETO', 'KEBAP GIDA'] under the 13-char budget — the
+    longest word-prefix that fits is 'YUVAMCETO' (9 chars), and the
+    remainder 'KEBAP GIDA' (10 chars) also fits. No ellipsis.
     """
     from app.services.receipt_annotations import _wrap_pc_supplier
     out = _wrap_pc_supplier(_line(rid=1, supplier="Yuvamceto Kebap Gida"))
-    assert out == ["YUVAMCETO KEBAP", "GIDA"]
+    assert out == ["YUVAMCETO", "KEBAP GIDA"]
     assert all("…" not in ln for ln in out)
 
 
 def test_paired_card_supplier_wraps_fermaki_meat_and_more_to_two_lines() -> None:
     """'FERMAKI MEAT & MORE' (19 chars) wraps at the last whitespace fitting
-    the 17-char line bound: 'FERMAKI MEAT &' (14) + 'MORE'."""
+    the 13-char line bound: 'FERMAKI MEAT' (12) + '& MORE' (6)."""
     from app.services.receipt_annotations import _wrap_pc_supplier
     out = _wrap_pc_supplier(_line(rid=1, supplier="Fermaki Meat & More"))
-    assert out == ["FERMAKI MEAT &", "MORE"]
+    assert out == ["FERMAKI MEAT", "& MORE"]
 
 
 def test_paired_card_supplier_short_name_renders_one_line_unchanged() -> None:
-    """Names that fit the 17-char single-line budget pass through without
+    """Names that fit the 13-char single-line budget pass through without
     wrapping. 'GOKHAN BUFE' is 11 chars."""
     from app.services.receipt_annotations import _wrap_pc_supplier
     out = _wrap_pc_supplier(_line(rid=1, supplier="Gokhan Bufe"))
@@ -349,6 +348,51 @@ def test_paired_card_supplier_single_long_word_falls_back_to_truncate() -> None:
     out = _wrap_pc_supplier(_line(rid=1, supplier="ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
     assert len(out) == 1
     assert out[0].endswith("…")
+
+
+def test_paired_card_supplier_rendered_width_fits_info_column() -> None:
+    """Post-FIX-5 acceptance guard: every wrapped supplier line must
+    fit the right info column's usable text width when measured with
+    FONT_PC_SUPPLIER. The PM reported 'KAMIL KOC SAKARYA OTOG',
+    'YUVAMCETO KEBAP GIDA H', 'NAR TUR SEYAHAT', 'ZEY SPORT SPOR
+    MALZEME', 'FERMAKI MEAT & MORE', and 'MAVI EGE MARKET HUSE' as
+    overflow cases under the prior 35-px font / 17-char budget.
+    Tightening to 28 px + 13 chars must hold all six within budget.
+
+    Failure here means a future tweak to the font size or line bound
+    has reintroduced overflow; do not just relax the test, fix the
+    sizing.
+    """
+    from app.services.receipt_annotations import (
+        FONT_PC_SUPPLIER,
+        PC_CELL_WIDTH,
+        PC_INFO_PADDING_X,
+        PC_THUMB_SIDE_PCT,
+        _wrap_pc_supplier,
+    )
+    info_text_width = (
+        int(PC_CELL_WIDTH * (1 - PC_THUMB_SIDE_PCT)) - 2 * PC_INFO_PADDING_X
+    )
+    pm_overflow_corpus = [
+        "KAMIL KOC SAKARYA OTOG",
+        "YUVAMCETO KEBAP GIDA H",
+        "NAR TUR SEYAHAT",
+        "ZEY SPORT SPOR MALZEME",
+        "FERMAKI MEAT & MORE",
+        "MAVI EGE MARKET HUSE",
+    ]
+    for supplier in pm_overflow_corpus:
+        wrapped = _wrap_pc_supplier(_line(rid=1, supplier=supplier))
+        for idx, text in enumerate(wrapped, start=1):
+            try:
+                rendered = FONT_PC_SUPPLIER.getlength(text)
+            except AttributeError:
+                bbox = FONT_PC_SUPPLIER.getbbox(text)
+                rendered = bbox[2] - bbox[0]
+            assert rendered <= info_text_width, (
+                f"{supplier!r} line {idx}/{len(wrapped)} ({text!r}) "
+                f"rendered {rendered:.0f}px > {info_text_width}px budget"
+            )
 
 
 # ---------------------------------------------------------------------------

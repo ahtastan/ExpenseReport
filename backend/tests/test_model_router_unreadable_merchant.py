@@ -26,13 +26,18 @@ acceptance check (see ``test_model_router_live_ocr.py``).
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import pytest
+from sqlmodel import Session
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.models import StatementImport  # noqa: E402
 from app.services import model_router  # noqa: E402
 from app.services.model_router import UNREADABLE_MERCHANT_SENTINEL  # noqa: E402
 
@@ -66,6 +71,19 @@ class _Recorder:
 
 def _patch_vision_call(monkeypatch, recorder):
     monkeypatch.setattr(model_router, "_vision_call", recorder)
+
+
+@pytest.fixture(autouse=True)
+def _october_statement_window(isolated_db):
+    with Session(isolated_db) as session:
+        session.add(
+            StatementImport(
+                source_filename="diners-october.xlsx",
+                period_start=date(2025, 10, 10),
+                period_end=date(2025, 11, 9),
+            )
+        )
+        session.commit()
 
 
 # ---------------------------------------------------------------------------

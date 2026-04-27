@@ -38,10 +38,16 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
+from sqlmodel import Session, select
+
+from app import db as app_db
 from app.json_utils import DecimalEncoder
+from app.models import StatementImport
+from app.services.validators.date_sanity import validate_extracted_date
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +163,15 @@ _VISION_PROMPT_STRICT = (
     "no code fences, no explanation."
 )
 
+
+def _date_context_hint(today: date) -> str:
+    return (
+        f"\nDATE CONTEXT: today is {today.isoformat()}. "
+        "The receipt is recent. Do not output dates more than "
+        "90 days in the past. If the year digit is unclear, "
+        "prefer the most recent plausible year."
+    )
+
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 _PDF_EXTENSIONS = {".pdf"}
@@ -248,6 +263,53 @@ def _normalize_unreadable_supplier(fields: dict[str, Any]) -> dict[str, Any]:
         normalized["supplier"] = None
         return normalized
     return fields
+
+
+def _parse_extracted_date(value: Any) -> date | None:
+    if isinstance(value, date):
+        return value
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _latest_statement_period() -> tuple[date, date] | None:
+    try:
+        with Session(app_db.engine) as session:
+            statement = session.exec(
+                select(StatementImport)
+                .order_by(StatementImport.id.desc())
+                .limit(1)
+            ).first()
+    except Exception as exc:
+        logger.debug("Could not load latest statement period for OCR date validation: %s", exc)
+        return None
+    if statement is None or statement.period_start is None or statement.period_end is None:
+        return None
+    return statement.period_start, statement.period_end
+
+
+def _validate_vision_date(
+    fields: dict[str, Any],
+    statement_period: tuple[date, date] | None,
+    today: date,
+    notes: list[str],
+    pass_label: str,
+) -> tuple[dict[str, Any], bool]:
+    sanitized = dict(fields)
+    extracted_date = _parse_extracted_date(sanitized.get("date"))
+    is_valid, reason = validate_extracted_date(extracted_date, statement_period, today)
+    if is_valid:
+        return sanitized, True
+    notes.append(f"{pass_label} OCR date {sanitized.get('date')!r} rejected: {reason}.")
+    sanitized["date"] = None
+    return sanitized, False
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
@@ -795,14 +857,31 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     else:
         return None
 
+    today = date.today()
+    statement_period = _latest_statement_period()
+    retry_prompt = _VISION_PROMPT_STRICT
+
     first_fields = _vision_call(MINI_MODEL, images)
     if first_fields is not None:
+        first_fields, first_date_valid = _validate_vision_date(
+            first_fields,
+            statement_period,
+            today,
+            notes,
+            f"First pass ({MINI_MODEL})",
+        )
         missing = _count_missing(first_fields)
         if not missing:
             notes.append(f"Vision extraction succeeded on first pass ({MINI_MODEL}).")
             return VisionResult(
                 fields=_normalize_unreadable_supplier(first_fields),
                 model=MINI_MODEL, escalated=False, notes=notes,
+            )
+        if not first_date_valid:
+            retry_prompt = _VISION_PROMPT_STRICT + _date_context_hint(today)
+            notes.append(
+                f"First pass ({MINI_MODEL}) returned an implausible date; "
+                "retrying with stricter prompt and date context."
             )
         if "supplier" in missing and _is_unreadable_merchant_sentinel(first_fields.get("supplier")):
             notes.append(
@@ -817,8 +896,15 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     else:
         notes.append(f"First pass ({MINI_MODEL}) unavailable or invalid; retrying with stricter prompt.")
 
-    retry_fields = _vision_call(FULL_MODEL, images, _VISION_PROMPT_STRICT)
+    retry_fields = _vision_call(FULL_MODEL, images, retry_prompt)
     if retry_fields is not None:
+        retry_fields, _retry_date_valid = _validate_vision_date(
+            retry_fields,
+            statement_period,
+            today,
+            notes,
+            f"Stricter retry ({FULL_MODEL})",
+        )
         notes.append(f"Vision extraction succeeded on stricter retry ({FULL_MODEL}).")
         return VisionResult(
             fields=_normalize_unreadable_supplier(retry_fields),

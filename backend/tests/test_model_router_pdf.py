@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import io
 import sys
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -75,7 +76,7 @@ def test_vision_extract_pdf_uses_multi_image_payload(monkeypatch):
         captured["model"] = model
         captured["images"] = images
         return {
-            "date": "2025-08-29",
+            "date": date.today().isoformat(),
             "supplier": "HOTEL TEST CO",
             "amount": 3500.0,
             "currency": "TRY",

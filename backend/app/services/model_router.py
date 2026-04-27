@@ -1,17 +1,29 @@
 """Model routing policy for OCR, matching, and report synthesis.
 
-Policy (user-defined):
-  - default OCR model      = OCR_MINI_MODEL  (cheap, high throughput)
-  - escalation OCR model   = OCR_FULL_MODEL  (hard cases / final review)
-  - report synthesis model = OCR_FULL_MODEL  (stronger reasoning)
-  - chat + matching model  = OCR_MINI_MODEL  (routine orchestration)
+Policy (post-F1 hardening, 2026-04):
+  - vision OCR model       = OCR_VISION_MODEL (single tier, ``gpt-5.5``)
+  - report synthesis model = OCR_VISION_MODEL (was full, now unified)
+  - chat + matching model  = OCR_VISION_MODEL (was mini, now unified)
+
+The previous mini→full tier system collapsed once we moved to gpt-5.5,
+which has no "mini" variant in its family — the upgrade absorbed both
+ends of the previous cost/quality split. ``MINI_MODEL`` and
+``FULL_MODEL`` Python constants are kept as aliases (both default to
+``VISION_MODEL``) so existing callers and env-var overrides keep
+working. Set ``OCR_MINI_MODEL`` or ``OCR_FULL_MODEL`` separately if you
+need to A/B against a different model in dev.
 
 Staged OCR pipeline (implemented in ``vision_extract``):
   1. caller runs deterministic parsing first (regex over caption/filename);
   2. if critical fields are still missing, caller invokes ``vision_extract``;
-  3. ``vision_extract`` tries the mini model first;
-  4. if the mini result is invalid or still missing critical fields, it
-     escalates once to the full model.
+  3. ``vision_extract`` runs the standard prompt against ``MINI_MODEL``;
+  4. if the result is invalid, missing critical fields, or returns
+     ``UNREADABLE_MERCHANT`` for supplier, the router retries against
+     ``FULL_MODEL`` with a STRICTER prompt variant that explicitly lists
+     hallucination antipatterns (composing names from address fragments,
+     VAT IDs, MERSIS numbers, surrounding context). With both models
+     defaulting to gpt-5.5, the second call's value comes from the
+     prompt swap, not a tier upgrade.
 
 The real model identifiers are env-driven so non-production environments
 can point at fakes/stubs without code changes.
@@ -33,14 +45,21 @@ from app.json_utils import DecimalEncoder
 
 logger = logging.getLogger(__name__)
 
-# Defaults match the policy stated by the user.  Override per-env.
-MINI_MODEL = os.getenv("OCR_MINI_MODEL", "gpt-5.4-mini")
-FULL_MODEL = os.getenv("OCR_FULL_MODEL", "gpt-5.4")
-CHAT_MODEL = os.getenv("CHAT_MODEL", MINI_MODEL)
-SYNTHESIS_MODEL = os.getenv("SYNTHESIS_MODEL", FULL_MODEL)
-MATCHING_MODEL = os.getenv("MATCHING_MODEL", MINI_MODEL)
+# Single-tier vision model. Snapshot-pinned per leadership directive
+# (alias upgrades require explicit re-test against the receipt corpus).
+VISION_MODEL = os.getenv("OCR_VISION_MODEL", "gpt-5.5-2026-04-23")
+
+# Backwards-compat aliases — both default to the unified VISION_MODEL but
+# can be overridden independently via env for A/B testing.
+MINI_MODEL = os.getenv("OCR_MINI_MODEL", VISION_MODEL)
+FULL_MODEL = os.getenv("OCR_FULL_MODEL", VISION_MODEL)
+CHAT_MODEL = os.getenv("CHAT_MODEL", VISION_MODEL)
+SYNTHESIS_MODEL = os.getenv("SYNTHESIS_MODEL", VISION_MODEL)
+MATCHING_MODEL = os.getenv("MATCHING_MODEL", VISION_MODEL)
 
 CRITICAL_FIELDS = ("date", "supplier", "amount")
+
+UNREADABLE_MERCHANT_SENTINEL = "UNREADABLE_MERCHANT"
 
 _VISION_PROMPT = (
     "You are an expense receipt parser. Extract the following fields from the "
@@ -52,6 +71,19 @@ _VISION_PROMPT = (
     "  business_or_personal (\"Business\" or \"Personal\" or null),\n"
     "  receipt_type (one of \"itemized\", \"payment_receipt\", \"invoice\", "
     "\"confirmation\", \"unknown\").\n"
+    "MERCHANT NAME RULES (read carefully — F1 hardening):\n"
+    "  Output the merchant name EXACTLY as printed at the top of the receipt "
+    "(the masthead/header line, not the address block, not the VAT/tax ID "
+    "line, not a slogan, not a payment-processor name like \"BKM EXPRESS\" or "
+    "\"ISBANK POS\").\n"
+    "  If the merchant line is unclear, ambiguous, partially obscured, or you "
+    "find yourself reading from address text, neighborhood/district names, or "
+    "context rather than a header, output the literal string "
+    f"\"{UNREADABLE_MERCHANT_SENTINEL}\" for supplier — DO NOT guess and DO "
+    "NOT infer. It is better to abstain than to invent.\n"
+    "  Do NOT compose merchant names from address fragments (e.g. street "
+    "names, neighborhood names, building names) or from text in the line-item "
+    "list. The supplier must come from the printed receipt header.\n"
     "For Turkish receipts, the date may be labeled TARIH and may appear as "
     "DD/MM/YYYY or DD.MM.YYYY; convert it to YYYY-MM-DD.\n"
     "Payment slips may label the transaction date as ISLEM with a value like "
@@ -70,6 +102,50 @@ _VISION_PROMPT = (
     "  unknown          — cannot determine from the image.\n"
     "If unsure, default to \"unknown\" rather than guessing.\n"
     "Return only the JSON object, no other text."
+)
+
+# Stricter retry variant — used when the first pass returned the
+# UNREADABLE_MERCHANT sentinel, missing critical fields, or otherwise
+# came back unusable. Front-loads the antipattern list so the model
+# isn't tempted to re-invent the same hallucination on the second try.
+_VISION_PROMPT_STRICT = (
+    "You already failed to extract clean fields from this receipt on a "
+    "first pass. Try again — slowly, more carefully — and obey these "
+    "rules without exception:\n"
+    "\n"
+    "MERCHANT NAME — the most common failure mode. Output the merchant "
+    "name EXACTLY as printed on the masthead (the topmost line of the "
+    "receipt header).\n"
+    "  DO NOT compose merchant names from any of the following — these "
+    "are all NOT the merchant:\n"
+    "    - address fragments (street names, neighborhood/district names, "
+    "building names, city names, postal codes)\n"
+    "    - VAT IDs / vergi numarası lines\n"
+    "    - MERSIS numbers\n"
+    "    - tax-office labels (e.g. \"VERGİ DAİRESİ\")\n"
+    "    - payment processor names (\"BKM\", \"ISBANK POS\", \"ZIRAAT POS\")\n"
+    "    - line items inside the bill body\n"
+    "    - cashier/operator names (e.g. \"KASIYER: ...\")\n"
+    "    - slogans, taglines, or descriptive subtitles below the masthead\n"
+    "  DO NOT infer merchant from category context (e.g. seeing fuel-pump "
+    "line items does NOT mean the merchant is \"Generic Petrol Station\").\n"
+    f"  If you still cannot read the masthead with confidence, output "
+    f"\"{UNREADABLE_MERCHANT_SENTINEL}\" — DO NOT guess. We would rather "
+    f"see the sentinel than a hallucinated name.\n"
+    "\n"
+    "TOTAL AMOUNT — pick the LARGEST line at the bottom of the receipt "
+    "labeled TUTAR, TOPLAM, AMOUNT, GENEL TOPLAM, or equivalent. NEVER "
+    "pick ARA TOPLAM (subtotal), KDV (tax-only), or per-line subtotals. "
+    "If multiple totals exist, pick the largest unless one is explicitly "
+    "marked DISCOUNT/INDIRIM.\n"
+    "\n"
+    "DATE — the receipt is recent. If you find yourself reading a year "
+    "more than 6 months in the past, double-check — you are probably "
+    "misreading the year digit (e.g., reading \"2022\" when it actually "
+    "says \"2025\" or \"2026\").\n"
+    "\n"
+    "Return ONLY the JSON object with the same keys as before. No prose, "
+    "no code fences, no explanation."
 )
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -132,7 +208,37 @@ class MatchClassification:
 
 
 def _count_missing(fields: dict[str, Any]) -> list[str]:
-    return [key for key in CRITICAL_FIELDS if not fields.get(key)]
+    """Return the list of CRITICAL_FIELDS that are missing/null/sentinel.
+
+    A supplier value of ``UNREADABLE_MERCHANT_SENTINEL`` counts as missing —
+    that's the explicit abstention signal we instruct the mini model to emit
+    when the masthead is unreadable, and it must trigger escalation to the
+    full model the same way a null supplier does.
+    """
+    missing: list[str] = []
+    for key in CRITICAL_FIELDS:
+        value = fields.get(key)
+        if not value:
+            missing.append(key)
+        elif key == "supplier" and _is_unreadable_merchant_sentinel(value):
+            missing.append(key)
+    return missing
+
+
+def _is_unreadable_merchant_sentinel(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().upper() == UNREADABLE_MERCHANT_SENTINEL
+
+
+def _normalize_unreadable_supplier(fields: dict[str, Any]) -> dict[str, Any]:
+    """If supplier is the abstention sentinel, surface it as ``None`` to
+    downstream callers — they should not see the literal sentinel string in
+    the supplier field.
+    """
+    if _is_unreadable_merchant_sentinel(fields.get("supplier")):
+        normalized = dict(fields)
+        normalized["supplier"] = None
+        return normalized
+    return fields
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
@@ -220,13 +326,20 @@ def _read_pdf_pages_b64(
     return pages_b64 or None
 
 
-def _call_openai(model: str, images: list[tuple[str, str]]) -> dict[str, Any] | None:
+def _call_openai(
+    model: str,
+    images: list[tuple[str, str]],
+    prompt: str = _VISION_PROMPT,
+) -> dict[str, Any] | None:
     """Invoke the OpenAI chat-completions vision API for one or more images.
 
     ``images`` is a list of ``(media_type, base64_payload)`` tuples. All
     images are sent in a single user message as separate ``image_url``
     content blocks so the model sees them together (preserves cross-page
     context for multi-page PDFs).
+
+    ``prompt`` defaults to the standard ``_VISION_PROMPT``; on the
+    stricter retry path ``vision_extract`` passes ``_VISION_PROMPT_STRICT``.
 
     Returns ``None`` when the key is unset, the SDK is unavailable, the
     images list is empty, or the response cannot be parsed as JSON.
@@ -242,7 +355,7 @@ def _call_openai(model: str, images: list[tuple[str, str]]) -> dict[str, Any] | 
         return None
     try:
         client = OpenAI(api_key=api_key)
-        content: list[dict[str, Any]] = [{"type": "text", "text": _VISION_PROMPT}]
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for media_type, b64 in images:
             data_url = f"data:{media_type};base64,{b64}"
             content.append({"type": "image_url", "image_url": {"url": data_url}})
@@ -673,28 +786,44 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     else:
         return None
 
-    mini_fields = _vision_call(MINI_MODEL, images)
-    if mini_fields is not None:
-        missing = _count_missing(mini_fields)
+    first_fields = _vision_call(MINI_MODEL, images)
+    if first_fields is not None:
+        missing = _count_missing(first_fields)
         if not missing:
-            notes.append(f"Vision extraction succeeded on mini model ({MINI_MODEL}).")
-            return VisionResult(fields=mini_fields, model=MINI_MODEL, escalated=False, notes=notes)
-        notes.append(
-            f"Mini model ({MINI_MODEL}) returned missing critical fields {missing}; escalating."
-        )
+            notes.append(f"Vision extraction succeeded on first pass ({MINI_MODEL}).")
+            return VisionResult(
+                fields=_normalize_unreadable_supplier(first_fields),
+                model=MINI_MODEL, escalated=False, notes=notes,
+            )
+        if "supplier" in missing and _is_unreadable_merchant_sentinel(first_fields.get("supplier")):
+            notes.append(
+                f"First pass ({MINI_MODEL}) reported {UNREADABLE_MERCHANT_SENTINEL} for supplier; "
+                "retrying with stricter prompt."
+            )
+        else:
+            notes.append(
+                f"First pass ({MINI_MODEL}) returned missing critical fields {missing}; "
+                "retrying with stricter prompt."
+            )
     else:
-        notes.append(f"Mini model ({MINI_MODEL}) unavailable or invalid; escalating.")
+        notes.append(f"First pass ({MINI_MODEL}) unavailable or invalid; retrying with stricter prompt.")
 
-    full_fields = _vision_call(FULL_MODEL, images)
-    if full_fields is not None:
-        notes.append(f"Vision extraction escalated to full model ({FULL_MODEL}).")
-        return VisionResult(fields=full_fields, model=FULL_MODEL, escalated=True, notes=notes)
+    retry_fields = _vision_call(FULL_MODEL, images, _VISION_PROMPT_STRICT)
+    if retry_fields is not None:
+        notes.append(f"Vision extraction succeeded on stricter retry ({FULL_MODEL}).")
+        return VisionResult(
+            fields=_normalize_unreadable_supplier(retry_fields),
+            model=FULL_MODEL, escalated=True, notes=notes,
+        )
 
-    # Both tiers failed but the mini attempt produced *something* — prefer
+    # Both passes failed but the first attempt produced *something* — prefer
     # returning partial data over nothing so deterministic fields still merge.
-    if mini_fields is not None:
-        notes.append("Full model unavailable; returning partial mini-model fields.")
-        return VisionResult(fields=mini_fields, model=MINI_MODEL, escalated=False, notes=notes)
+    if first_fields is not None:
+        notes.append("Stricter retry unavailable; returning partial first-pass fields.")
+        return VisionResult(
+            fields=_normalize_unreadable_supplier(first_fields),
+            model=MINI_MODEL, escalated=False, notes=notes,
+        )
 
-    notes.append("All vision tiers failed.")
+    notes.append("All vision passes failed.")
     return None

@@ -265,6 +265,16 @@ function Dropdown({ value, options, onChange, placeholder, width=120, danger=fal
   );
 }
 
+function statementDateLabel(statement) {
+  if (statement.statement_date) return statement.statement_date;
+  if (statement.period_start && statement.period_end) return `${statement.period_start} - ${statement.period_end}`;
+  return statement.period_start || statement.period_end || 'No statement date';
+}
+
+function statementOptionLabel(statement) {
+  return `${statement.source_filename || `Statement ${statement.id}`} · ${statementDateLabel(statement)}`;
+}
+
 function InlineBP({ value, onChange }) {
   const [open, setOpen] = useState(false);
   const ref = useRef();
@@ -606,9 +616,9 @@ function ImportModal({ onClose, onImported }) {
     try {
       const fd = new FormData();
       fd.append('file', file);
-      await apiForm('/statements/import-excel', fd);
+      const imported = await apiForm('/statements/import-excel', fd);
       setStep('done');
-      setTimeout(() => { onImported(); onClose(); }, 1400);
+      setTimeout(() => { onImported(imported?.id, { syncUrl:true }); onClose(); }, 1400);
     } catch(e) { setErr(e.message); setBusy(false); }
   }
   return (
@@ -1105,7 +1115,7 @@ function WorkflowBar({ sessionStatus, onConfirm, onValidate, hasErrors, download
   );
 }
 
-function ReviewQueue({ session, statement, localRows, categoryMap, onSave, onLocalUpdate, onToggleFlag, onConfirmSession, onValidate, onImported, addAudit, sessionStatus, downloadUrl, reportRunId }) {
+function ReviewQueue({ session, statement, statementsList, selectedStatementId, onSelectStatement, localRows, categoryMap, onSave, onLocalUpdate, onToggleFlag, onConfirmSession, onValidate, onImported, addAudit, sessionStatus, downloadUrl, reportRunId }) {
   const [filter, setFilter] = useState('all');
   const [showImport, setShowImport] = useState(false);
   const [showAddStatement, setShowAddStatement] = useState(false);
@@ -1240,6 +1250,21 @@ function ReviewQueue({ session, statement, localRows, categoryMap, onSave, onLoc
             background:'var(--accent-subtle)', fontSize:12, fontWeight:600, color:'var(--accent)', cursor:'pointer' }}>
             Add Statement
           </button>
+          {statementsList.length > 0 && (
+            <label data-testid="statement-switcher" style={{ display:'flex', alignItems:'center', gap:6 }}>
+              <span style={{ fontSize:11, fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' }}>Statement</span>
+              <select value={selectedStatementId || ''} disabled={statementsList.length <= 1}
+                onChange={e=>onSelectStatement(Number(e.target.value))}
+                style={{ maxWidth:260, padding:'5px 28px 5px 9px', borderRadius:5,
+                  border:'1px solid var(--border)', background:'var(--surface-2)',
+                  color:'var(--text-2)', fontSize:12, fontWeight:500,
+                  cursor:statementsList.length <= 1?'default':'pointer' }}>
+                {statementsList.map(stmt=>(
+                  <option key={stmt.id} value={stmt.id}>{statementOptionLabel(stmt)}</option>
+                ))}
+              </select>
+            </label>
+          )}
           <button onClick={runMatching} disabled={matchBusy || !statement?.id}
             title={!statement?.id ? 'Import a statement first' : 'Re-run the matching engine on this statement'}
             style={{ display:'flex', alignItems:'center', gap:5,
@@ -1542,6 +1567,8 @@ function App() {
 
   // Data state
   const [statement,     setStatement]     = useState(null);
+  const [statementsList,setStatementsList]= useState([]);
+  const [selectedStatementId, setSelectedStatementId] = useState(null);
   const [session,       setSession]       = useState(null);
   const [localRows,     setLocalRows]     = useState([]);
   const [sessionStatus, setSessionStatus] = useState('draft');
@@ -1558,11 +1585,35 @@ function App() {
 
   const CATEGORY_MAP = Object.fromEntries(CATEGORY_GROUPS.map(g=>[g.key,g.buckets]));
 
-  async function loadData() {
+  function selectedStatementIdFromUrl() {
+    const value = new URLSearchParams(window.location.search).get('statement_id');
+    const id = value ? Number(value) : null;
+    return Number.isFinite(id) && id > 0 ? id : null;
+  }
+
+  function syncStatementUrl(statementId, replace=false) {
+    const url = new URL(window.location.href);
+    if (statementId) url.searchParams.set('statement_id', statementId);
+    else url.searchParams.delete('statement_id');
+    window.history[replace ? 'replaceState' : 'pushState']({}, '', `${url.pathname}${url.search}${url.hash}`);
+  }
+
+  async function loadData(statementId, opts={}) {
     setLoading(true); setLoadErr('');
     try {
-      const stmt = await api('/statements/latest');
+      const statements = await api('/statements/');
+      setStatementsList(statements);
+      const urlStatementId = selectedStatementIdFromUrl();
+      const preferredId = statementId != null
+        ? Number(statementId)
+        : (opts.preferLatest ? null : (urlStatementId || selectedStatementId));
+      const stmt = statements.find(item => item.id === preferredId) || statements[0];
+      if (!stmt) throw new Error('No statement imports found');
       setStatement(stmt);
+      setSelectedStatementId(stmt.id);
+      if (opts.syncUrl) syncStatementUrl(stmt.id, !!opts.replaceUrl);
+      setDownloadUrl(null);
+      setReportRunId(null);
       const rev = await api(`/reviews/report/${stmt.id}`);
       setSession(rev);
       const rows = (rev.rows||[]).map(apiRowToLocal);
@@ -1572,7 +1623,20 @@ function App() {
     finally { setLoading(false); }
   }
 
-  useEffect(()=>{ loadData(); }, []);
+  useEffect(()=>{ loadData(selectedStatementIdFromUrl(), { preferLatest: !selectedStatementIdFromUrl() }); }, []);
+  useEffect(()=>{
+    const onPopState = () => {
+      const statementId = selectedStatementIdFromUrl();
+      loadData(statementId, { preferLatest: !statementId });
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [selectedStatementId]);
+
+  function handleSelectStatement(statementId) {
+    if (!statementId || statementId === selectedStatementId) return;
+    loadData(statementId, { syncUrl:true });
+  }
 
   async function handleSave(rowId, localChanges) {
     const apiFields = buildApiFields(localChanges);
@@ -1667,7 +1731,9 @@ function App() {
             </div>
           )}
           {screen==='review' && (
-            <ReviewQueue session={session} statement={statement} localRows={localRows} categoryMap={CATEGORY_MAP}
+            <ReviewQueue session={session} statement={statement} statementsList={statementsList}
+              selectedStatementId={selectedStatementId} onSelectStatement={handleSelectStatement}
+              localRows={localRows} categoryMap={CATEGORY_MAP}
               onSave={handleSave} onLocalUpdate={handleLocalUpdate} onToggleFlag={handleToggleFlag}
               onConfirmSession={handleConfirmSession} onValidate={handleValidate}
               onImported={loadData} addAudit={addAudit}

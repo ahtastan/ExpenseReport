@@ -289,17 +289,66 @@ def test_paired_card_bucket_letter_codes_are_single_uppercase_letters() -> None:
         assert code.isalpha(), f"{bucket!r}'s code {code!r} is not a letter"
 
 
-def test_paired_card_supplier_truncation_caps_at_18_chars() -> None:
-    """Post-FIX-1: supplier names truncate to 18 chars to fit the right
-    info column at 8.5pt sans bold (≈ 17 chars/311 px width)."""
-    from app.services.receipt_annotations import _format_pc_supplier
-    long_supplier = _line(
-        rid=1, supplier="İKBAL LOKANTACILIK / ZEY SPORT SPOR MAL.",
+def test_paired_card_supplier_wraps_yuvamceto_kebap_gida_to_two_lines() -> None:
+    """Post-FIX-4: supplier names that don't fit one line wrap to a second
+    line at the latest whitespace boundary instead of being hard-truncated.
+    'YUVAMCETO KEBAP GIDA' is 20 chars > 17 → split keeps the longest
+    word-prefix that fits ('YUVAMCETO KEBAP' = 15 chars) on line 1 and
+    pushes the trailing word ('GIDA') onto line 2. No ellipsis since
+    nothing overflows the 2-line budget.
+    """
+    from app.services.receipt_annotations import _wrap_pc_supplier
+    out = _wrap_pc_supplier(_line(rid=1, supplier="Yuvamceto Kebap Gida"))
+    assert out == ["YUVAMCETO KEBAP", "GIDA"]
+    assert all("…" not in ln for ln in out)
+
+
+def test_paired_card_supplier_wraps_fermaki_meat_and_more_to_two_lines() -> None:
+    """'FERMAKI MEAT & MORE' (19 chars) wraps at the last whitespace fitting
+    the 17-char line bound: 'FERMAKI MEAT &' (14) + 'MORE'."""
+    from app.services.receipt_annotations import _wrap_pc_supplier
+    out = _wrap_pc_supplier(_line(rid=1, supplier="Fermaki Meat & More"))
+    assert out == ["FERMAKI MEAT &", "MORE"]
+
+
+def test_paired_card_supplier_short_name_renders_one_line_unchanged() -> None:
+    """Names that fit the 17-char single-line budget pass through without
+    wrapping. 'GOKHAN BUFE' is 11 chars."""
+    from app.services.receipt_annotations import _wrap_pc_supplier
+    out = _wrap_pc_supplier(_line(rid=1, supplier="Gokhan Bufe"))
+    assert out == ["GOKHAN BUFE"]
+
+
+def test_paired_card_supplier_extreme_overflow_truncates_second_line() -> None:
+    """Pathological names that overflow even after wrapping (~36+ chars
+    after first split) fall back to ellipsis truncation on line 2.
+    Verifies the renderer still bounds vertical space at 2 lines."""
+    from app.services.receipt_annotations import (
+        _wrap_pc_supplier,
+        PC_SUPPLIER_LINE_CHARS,
     )
-    out = _format_pc_supplier(long_supplier)
-    assert len(out) <= 18
-    # Ellipsis preserved — the truncation produces a visually clean cut.
-    assert out.endswith("…") or len(long_supplier.supplier) <= 18
+    out = _wrap_pc_supplier(_line(
+        rid=1,
+        supplier="İkbal Lokantacılık / Zey Sport Spor Mal. San. Tic. Ltd. Şti.",
+    ))
+    assert len(out) <= 2
+    # Each rendered line stays bounded.
+    for ln in out:
+        assert len(ln) <= PC_SUPPLIER_LINE_CHARS + 1, (
+            f"line {ln!r} exceeds wrap budget ({len(ln)} chars)"
+        )
+    # Either line 1 or line 2 ends in an ellipsis when content overflows.
+    assert any(ln.endswith("…") for ln in out)
+
+
+def test_paired_card_supplier_single_long_word_falls_back_to_truncate() -> None:
+    """A single word that exceeds the line bound has no whitespace to wrap
+    at, so we hard-truncate to one line with ellipsis (wrapping mid-word
+    would look broken)."""
+    from app.services.receipt_annotations import _wrap_pc_supplier
+    out = _wrap_pc_supplier(_line(rid=1, supplier="ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+    assert len(out) == 1
+    assert out[0].endswith("…")
 
 
 # ---------------------------------------------------------------------------

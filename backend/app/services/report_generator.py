@@ -736,12 +736,22 @@ def generate_report_package(
     statement_date = statement.statement_date if statement is not None else None
     period_ending = _resolve_period_ending(statement_date, lines)
 
+    # Bug 5: LLM-generate the trip-purpose title from the receipts'
+    # business_reason text. Falls back to title_prefix when the LLM is
+    # unavailable, returns nothing usable, or no business_reasons exist.
+    # Best-effort: never blocks report generation. No caching tonight —
+    # one extra ~500ms-1s call per generation is acceptable for the demo;
+    # add a ReportRun.title cache column in a follow-up if cost matters.
+    business_reasons = [line.business_reason for line in lines if line.business_reason]
+    llm_title = model_router.generate_travel_reason_summary(business_reasons)
+    workbook_title = llm_title or title_prefix
+
     dates = sorted({line.transaction_date for line in lines})
     chunks = [dates[i : i + 14] for i in range(0, len(dates), 14)]
     workbook_paths: list[Path] = []
     for idx, chunk_dates in enumerate(chunks, start=1):
         chunk_lines = [line for line in lines if line.transaction_date in set(chunk_dates)]
-        title = f"{title_prefix} - Part {idx}" if len(chunks) > 1 else title_prefix
+        title = f"{workbook_title} - Part {idx}" if len(chunks) > 1 else workbook_title
         workbook_path = output_dir / f"expense_report_part_{idx}.xlsx"
         _fill_workbook(
             settings.report_template_path,

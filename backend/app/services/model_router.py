@@ -572,6 +572,79 @@ def synthesize_report_summary(report: dict[str, Any]) -> str | None:
     return summary.strip()
 
 
+# Bumped from implicit v1 to v1 (first explicit version). Co-located with
+# the prompt text so a developer who edits the prompt is forced to consider
+# the version bump on review.
+TRAVEL_REASON_PROMPT_VERSION = "v1"
+
+_TRAVEL_REASON_PROMPT = (
+    "You summarize the purpose of a business trip from individual receipt "
+    "notes. Given the business_reason text from N receipts (one per line), "
+    "write a single concise sentence (max 100 chars) describing the trip's "
+    "purpose. Format like:\n"
+    "  'Customer visit to <region>, visiting <customer names if mentioned>'\n"
+    "  'Sarajevo trade conference, customer meetings'\n"
+    "  'Kartonsan service visit, paper mill maintenance'\n"
+    "Cite specific customer/site names from the input when they appear in "
+    "multiple receipts (high-signal). Do not invent customers. If receipts "
+    "are mixed across multiple unrelated trips, return the dominant theme.\n\n"
+    "Return ONLY a JSON object with exactly one key: summary."
+)
+
+# Maximum length of the returned summary in characters. Sized to fit the
+# Week 1A!G3 cell width without wrapping at the EDT template's default
+# column widths.
+TRAVEL_REASON_MAX_LEN = 100
+
+
+def generate_travel_reason_summary(business_reasons: list[str]) -> str | None:
+    """Summarize a trip's purpose from per-receipt business_reason text.
+
+    Returns ``None`` when:
+      - ``business_reasons`` is empty or all entries are empty/whitespace,
+      - the OpenAI call is unavailable (no API key, SDK missing, transient fail),
+      - the model's response is malformed or empty.
+
+    Callers (``report_generator.generate_report_package``) fall back to the
+    operator-supplied ``title_prefix`` when this returns ``None`` so report
+    generation never blocks on live API availability. No retry logic — the
+    LLM call is best-effort decoration of the report header, not load-bearing.
+
+    The result is sized to ``TRAVEL_REASON_MAX_LEN`` (100 chars). Anything
+    longer is truncated at the last sentence boundary if possible, else hard
+    cut with an ellipsis. The model is asked to stay within the limit but
+    we don't trust it.
+    """
+    cleaned = [r.strip() for r in business_reasons if isinstance(r, str) and r.strip()]
+    if not cleaned:
+        return None
+
+    payload = json.dumps(
+        {"business_reasons": cleaned, "receipt_count": len(cleaned)},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    result = _text_call(SYNTHESIS_MODEL, _TRAVEL_REASON_PROMPT, payload)
+    if not isinstance(result, dict):
+        return None
+    summary = result.get("summary")
+    if not isinstance(summary, str):
+        return None
+    summary = summary.strip()
+    if not summary:
+        return None
+    if len(summary) > TRAVEL_REASON_MAX_LEN:
+        # Try to clip at a sentence boundary first; fall back to hard cut + ellipsis.
+        for boundary in (". ", "; ", ", "):
+            cut = summary.rfind(boundary, 0, TRAVEL_REASON_MAX_LEN - 1)
+            if cut > 0:
+                summary = summary[:cut].rstrip(".,; ") + "."
+                break
+        else:
+            summary = summary[: TRAVEL_REASON_MAX_LEN - 1].rstrip() + "…"
+    return summary
+
+
 def vision_extract(storage_path: str) -> VisionResult | None:
     """Run the staged vision pipeline (mini → full) for one image or PDF.
 

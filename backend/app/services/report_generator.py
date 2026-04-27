@@ -278,6 +278,47 @@ def _allocate(line: ReportLine, day_totals: dict[date, dict[str, list[Decimal]]]
         )
 
 
+def group_meal_details_for_irs(
+    details: list["MealDetailLine"],
+) -> list[tuple["MealDetailLine", list[Decimal] | None]]:
+    """Group same-supplier-same-code meal details for the Page 1B IRS section.
+
+    Returns a list of (primary, sum_components) tuples in the input's
+    first-occurrence order:
+
+    - When a (code, normalized_supplier) appears exactly once → (detail, None).
+      Caller writes the row normally; the amount cell inherits the template's
+      pre-existing IF formula that pulls from the Week 1A daily total.
+
+    - When the same (code, normalized_supplier) appears 2+ times → returns
+      (first_detail, [d1.amount, d2.amount, …]). Caller writes the row using
+      the first detail's metadata (place / location / participants / reason —
+      identical across the duplicates by definition; this is the
+      "split-bill on one dinner across two card transactions" pattern) and
+      writes a SUM formula directly to the amount cell so the auditor can
+      see =A+B and decode the component receipts.
+
+    Different suppliers under the same code on the same day are kept as
+    separate group entries — caller still has to allocate them to rows
+    and currently drops 2nd/3rd different-supplier collisions per the
+    template's 5-rows-per-day constraint. The Bug 2 fix targets the
+    same-supplier collapse case explicitly; the rare different-supplier
+    same-code collision is out of scope here.
+    """
+    groups: dict[tuple[str, str], list[MealDetailLine]] = {}
+    for detail in details:
+        supplier_norm = (detail.place or "").strip().lower()
+        groups.setdefault((detail.code, supplier_norm), []).append(detail)
+    result: list[tuple[MealDetailLine, list[Decimal] | None]] = []
+    for group in groups.values():
+        primary = group[0]
+        if len(group) >= 2:
+            result.append((primary, [d.amount for d in group]))
+        else:
+            result.append((primary, None))
+    return result
+
+
 def _resolve_period_ending(
     statement_date: date | None,
     lines: list[ReportLine],
@@ -434,18 +475,34 @@ def _fill_workbook(
     def fill_b(ws, page_dates: list[date]) -> None:
         code_rows = {"M": 0, "B": 1, "L": 2, "D": 3, "E": 4}
         for day_index, tx_date in enumerate(page_dates):
+            # Bug 2: collapse same-supplier-same-code duplicates into one IRS
+            # row. The amount cell becomes a SUM formula so the auditor sees
+            # each receipt's component (e.g. =92.72+16.65 for a dinner billed
+            # across two card transactions). Without this, the second receipt
+            # was silently dropped because it collided on (day, code).
+            grouped = group_meal_details_for_irs(detail_lines.get(tx_date, []))
             used_codes: set[str] = set()
-            for detail in detail_lines.get(tx_date, []):
-                if detail.code not in code_rows or detail.code in used_codes:
+            for primary, sum_components in grouped:
+                if primary.code not in code_rows or primary.code in used_codes:
                     continue
-                used_codes.add(detail.code)
-                rownum = 8 + day_index * 5 + code_rows[detail.code]
-                ws[f"C{rownum}"] = detail.place[:40]
-                ws[f"D{rownum}"] = detail.location[:28]
-                ws[f"E{rownum}"] = detail.participants[:40]
-                ws[f"F{rownum}"] = detail.reason[:50]
-                ws[f"H{rownum}"] = "x" if detail.eg else None
-                ws[f"I{rownum}"] = "x" if detail.mr else None
+                used_codes.add(primary.code)
+                rownum = 8 + day_index * 5 + code_rows[primary.code]
+                ws[f"C{rownum}"] = primary.place[:40]
+                ws[f"D{rownum}"] = primary.location[:28]
+                ws[f"E{rownum}"] = primary.participants[:40]
+                ws[f"F{rownum}"] = primary.reason[:50]
+                ws[f"H{rownum}"] = "x" if primary.eg else None
+                ws[f"I{rownum}"] = "x" if primary.mr else None
+                # When 2+ receipts collapsed: write SUM formula directly to
+                # the amount column (J) so the auditor sees =A+B and can
+                # decode the component receipts. Without this, J{rownum}
+                # inherits the template's pre-existing IF formula that
+                # opaquely pulls the Week 1A daily total — which already
+                # includes the sum, but doesn't reveal the components on
+                # Page 1B itself.
+                if sum_components is not None:
+                    parts = [f"{amt:.2f}".rstrip("0").rstrip(".") for amt in sum_components]
+                    ws[f"J{rownum}"] = "=" + "+".join(parts)
 
     first7_set = set(first7)
     next7_set = set(next7)

@@ -885,22 +885,8 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     Returns ``None`` when the file is unsupported or the first-pass
     model call itself produced no parseable response.
     """
-    path = Path(storage_path)
-    suffix = path.suffix.lower()
-    notes: list[str] = []
-
-    if suffix in _PDF_EXTENSIONS:
-        pages_b64 = _read_pdf_pages_b64(storage_path)
-        if not pages_b64:
-            return None
-        images: list[tuple[str, str]] = [("image/png", b64) for b64 in pages_b64]
-        notes.append(f"Rasterized PDF into {len(images)} page image(s) at {_PDF_RASTER_DPI} DPI.")
-    elif suffix in _IMAGE_EXTENSIONS:
-        encoded = _read_image_b64(path)
-        if encoded is None:
-            return None
-        images = [encoded]
-    else:
+    images, notes = _vision_images_for_path(storage_path)
+    if images is None:
         return None
 
     first_fields = _vision_call(VISION_MODEL, images)
@@ -1013,3 +999,36 @@ def vision_extract(storage_path: str) -> VisionResult | None:
         fields=_normalize_unreadable_supplier(merged),
         model=VISION_MODEL, escalated=retry_contributed, notes=notes,
     )
+
+
+def _vision_images_for_path(storage_path: str) -> tuple[list[tuple[str, str]] | None, list[str]]:
+    path = Path(storage_path)
+    suffix = path.suffix.lower()
+    notes: list[str] = []
+
+    if suffix in _PDF_EXTENSIONS:
+        pages_b64 = _read_pdf_pages_b64(storage_path)
+        if not pages_b64:
+            return None, notes
+        images: list[tuple[str, str]] = [("image/png", b64) for b64 in pages_b64]
+        notes.append(f"Rasterized PDF into {len(images)} page image(s) at {_PDF_RASTER_DPI} DPI.")
+        return images, notes
+    if suffix in _IMAGE_EXTENSIONS:
+        encoded = _read_image_b64(path)
+        if encoded is None:
+            return None, notes
+        return [encoded], notes
+    return None, notes
+
+
+def vision_retry_date(storage_path: str) -> VisionResult | None:
+    """Run only the receipt-date prompt against the configured vision model."""
+    images, notes = _vision_images_for_path(storage_path)
+    if images is None:
+        return None
+    fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_DATE_ONLY)
+    if fields is None:
+        notes.append(f"Date-only retry ({VISION_MODEL}) unavailable or returned invalid JSON.")
+        return None
+    notes.append(f"Date-only retry ({VISION_MODEL}) returned date={fields.get('date')!r}.")
+    return VisionResult(fields=fields, model=VISION_MODEL, escalated=True, notes=notes)

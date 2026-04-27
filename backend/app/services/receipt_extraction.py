@@ -1,15 +1,22 @@
+import calendar
+import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
-from app.models import ReceiptDocument
+from app.models import AppUser, ExpenseReport, ReceiptDocument, StatementImport
 from app.services import model_router
 
 _AMOUNT_QUANT = Decimal("0.0001")
+_DATE_HARD_FLOOR = date(2024, 1, 1)
+_STATEMENT_DATE_TOLERANCE_DAYS = 7
+_NO_STATEMENT_MAX_AGE_MONTHS = 18
+
+logger = logging.getLogger(__name__)
 
 
 AMOUNT_RE = re.compile(
@@ -56,6 +63,49 @@ class ReceiptExtraction:
     confidence: float | None = None
     missing_fields: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DateSanityContext:
+    statement_import_id: int
+    period_start: date
+    period_end: date
+
+
+@dataclass(frozen=True)
+class DateSanityResult:
+    accepted: bool
+    reason: str | None = None
+
+
+def _months_ago(anchor: date, months: int) -> date:
+    month = anchor.month - months
+    year = anchor.year + (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    day = min(anchor.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def validate_receipt_date(
+    value: date | None,
+    *,
+    context: DateSanityContext | None,
+    today: date | None = None,
+) -> DateSanityResult:
+    if value is None:
+        return DateSanityResult(True)
+    if context is not None:
+        allowed_start = context.period_start - timedelta(days=_STATEMENT_DATE_TOLERANCE_DAYS)
+        allowed_end = context.period_end + timedelta(days=_STATEMENT_DATE_TOLERANCE_DAYS)
+        if value < allowed_start or value > allowed_end:
+            return DateSanityResult(False, "outside_statement_period")
+    if value < _DATE_HARD_FLOOR:
+        return DateSanityResult(False, "before_hard_floor")
+    if context is None:
+        today = today or date.today()
+        if value < _months_ago(today, _NO_STATEMENT_MAX_AGE_MONTHS):
+            return DateSanityResult(False, "older_than_18_months")
+    return DateSanityResult(True)
 
 
 def _coerce_amount(raw: str) -> Decimal | None:
@@ -147,7 +197,83 @@ def _source_text(receipt: ReceiptDocument) -> str:
     return " | ".join(part for part in parts if part)
 
 
-def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
+def _statement_context_from_statement(statement: StatementImport | None) -> DateSanityContext | None:
+    if (
+        statement is None
+        or statement.id is None
+        or statement.period_start is None
+        or statement.period_end is None
+    ):
+        return None
+    return DateSanityContext(
+        statement_import_id=statement.id,
+        period_start=statement.period_start,
+        period_end=statement.period_end,
+    )
+
+
+def _resolve_date_sanity_context(session: Session, receipt: ReceiptDocument) -> DateSanityContext | None:
+    if receipt.expense_report_id is not None:
+        report = session.get(ExpenseReport, receipt.expense_report_id)
+        if report and report.statement_import_id is not None:
+            context = _statement_context_from_statement(
+                session.get(StatementImport, report.statement_import_id)
+            )
+            if context is not None:
+                return context
+
+    if receipt.uploader_user_id is None:
+        return None
+
+    user = session.get(AppUser, receipt.uploader_user_id)
+    if user and user.current_report_id is not None:
+        report = session.get(ExpenseReport, user.current_report_id)
+        if report and report.statement_import_id is not None:
+            context = _statement_context_from_statement(
+                session.get(StatementImport, report.statement_import_id)
+            )
+            if context is not None:
+                return context
+
+    statements = session.exec(
+        select(StatementImport)
+        .where(StatementImport.uploader_user_id == receipt.uploader_user_id)
+        .order_by(StatementImport.created_at.desc(), StatementImport.id.desc())
+    ).all()
+    for statement in statements:
+        context = _statement_context_from_statement(statement)
+        if context is not None:
+            return context
+    return None
+
+
+def _log_date_rejection(
+    receipt: ReceiptDocument,
+    rejected_date: date,
+    result: DateSanityResult,
+    context: DateSanityContext | None,
+    *,
+    recovered: bool,
+) -> None:
+    logger.warning(
+        "Receipt OCR date sanity rejected receipt_id=%s rejected_date=%s reason=%s "
+        "statement_import_id=%s statement_period=%s..%s date_retry_recovered=%s",
+        receipt.id,
+        rejected_date,
+        result.reason,
+        context.statement_import_id if context else None,
+        context.period_start if context else None,
+        context.period_end if context else None,
+        recovered,
+    )
+
+
+def extract_receipt_fields(
+    receipt: ReceiptDocument,
+    *,
+    date_sanity_context: DateSanityContext | None = None,
+    today: date | None = None,
+) -> ReceiptExtraction:
     text = _source_text(receipt)
     notes: list[str] = []
     if not text:
@@ -159,9 +285,9 @@ def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
     det_supplier = _parse_merchant(text, receipt.original_file_name)
     det_bp = _parse_business_or_personal(text)
 
-    # Stage 2: escalate to the staged vision pipeline only when critical fields
-    # are still missing. The router tries mini first and escalates to the full
-    # model only when the mini attempt is invalid/incomplete (cost-controlled).
+    # Stage 2: run the configured vision pipeline only when critical fields
+    # are still missing. Focused retries remain inside the router except for
+    # sanity-rejected dates, which are retried below with the date-only prompt.
     vision: dict | None = None
     needs_vision = any(value is None for value in (det_date, det_amount, det_supplier))
     if needs_vision and receipt.storage_path:
@@ -183,6 +309,46 @@ def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
     # Deterministic wins over vision because it reflects ground truth from the
     # upload metadata that the user typed; vision fills only the gaps.
     extracted_date = receipt.extracted_date or det_date or _vision_date()
+    date_sanity = validate_receipt_date(extracted_date, context=date_sanity_context, today=today)
+    if receipt.extracted_date is None and extracted_date is not None and not date_sanity.accepted:
+        rejected_date = extracted_date
+        retry_recovered = False
+        notes.append(
+            f"Rejected OCR date {rejected_date.isoformat()} as implausible "
+            f"({date_sanity.reason}); retrying date-only extraction."
+        )
+        retry_date: date | None = None
+        if receipt.storage_path:
+            retry_result = model_router.vision_retry_date(receipt.storage_path)
+            if retry_result is not None:
+                notes.extend(retry_result.notes)
+                raw_retry_date = retry_result.fields.get("date")
+                if raw_retry_date:
+                    try:
+                        retry_date = date.fromisoformat(str(raw_retry_date))
+                    except ValueError:
+                        retry_date = _parse_date(str(raw_retry_date))
+        retry_sanity = validate_receipt_date(retry_date, context=date_sanity_context, today=today)
+        if retry_date is not None and retry_sanity.accepted:
+            extracted_date = retry_date
+            retry_recovered = True
+            notes.append(f"Date-only retry recovered plausible date {retry_date.isoformat()}.")
+        else:
+            extracted_date = None
+            if retry_date is not None:
+                notes.append(
+                    f"Date-only retry returned implausible date {retry_date.isoformat()} "
+                    f"({retry_sanity.reason}); date left missing for clarification."
+                )
+            else:
+                notes.append("Date-only retry did not recover a parseable date; date left missing.")
+        _log_date_rejection(
+            receipt,
+            rejected_date=rejected_date,
+            result=date_sanity,
+            context=date_sanity_context,
+            recovered=retry_recovered,
+        )
     vision_amount_raw = (vision or {}).get("amount")
     # Vision returns numeric JSON (int/float); route through str() into Decimal
     # so the new column type can store it without binary-precision noise.
@@ -250,7 +416,10 @@ def extract_receipt_fields(receipt: ReceiptDocument) -> ReceiptExtraction:
 
 
 def apply_receipt_extraction(session: Session, receipt: ReceiptDocument) -> ReceiptExtraction:
-    result = extract_receipt_fields(receipt)
+    result = extract_receipt_fields(
+        receipt,
+        date_sanity_context=_resolve_date_sanity_context(session, receipt),
+    )
     receipt.extracted_date = result.extracted_date
     receipt.extracted_supplier = result.extracted_supplier
     receipt.extracted_local_amount = result.extracted_local_amount

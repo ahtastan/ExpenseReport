@@ -95,6 +95,35 @@ def _photo_payload(telegram_user_id: int, chat_id: int, message_id: int, file_un
     }
 
 
+def test_best_photo_uses_dimensions_when_file_size_missing() -> None:
+    message = {
+        "photo": [
+            {"file_id": "thumb", "width": 160, "height": 120},
+            {"file_id": "large", "width": 1280, "height": 960},
+            {"file_id": "medium", "width": 640, "height": 480},
+        ]
+    }
+
+    best = telegram_service._best_photo(message)
+
+    assert best is not None
+    assert best["file_id"] == "large"
+
+
+def test_best_photo_uses_file_size_when_available() -> None:
+    message = {
+        "photo": [
+            {"file_id": "thumb", "file_size": 2048, "width": 1280, "height": 960},
+            {"file_id": "large", "file_size": 8192, "width": 640, "height": 480},
+        ]
+    }
+
+    best = telegram_service._best_photo(message)
+
+    assert best is not None
+    assert best["file_id"] == "large"
+
+
 def test_duplicate_telegram_photo_returns_existing_receipt() -> None:
     original_client = telegram_service.TelegramClient
     try:

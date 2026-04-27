@@ -22,13 +22,11 @@ OCR pipeline (implemented in ``vision_extract``):
   2. if critical fields are still missing, caller invokes ``vision_extract``;
   3. ``vision_extract`` runs the standard prompt against ``VISION_MODEL``
      and reads date / amount / supplier / receipt_type normally;
-  4. when the first-pass supplier is missing — the ``UNREADABLE_MERCHANT``
-     sentinel, ``None``, or an empty string — the router retries against
-     the same ``VISION_MODEL`` with a STRICTER merchant-only prompt. The
-     retry rewrites supplier ONLY; first-pass date / amount / currency /
-     receipt_type are preserved verbatim. A missing date or amount on the
-     first pass does NOT trigger the retry — the retry exists for
-     merchant ambiguity only and would not re-extract those fields.
+  4. before clarification questions are created, missing fields get focused
+     retries against the same ``VISION_MODEL``: supplier-only for missing or
+     unreadable supplier, date-only for missing date, and amount/currency-only
+     for missing amount or currency. Each retry fills only the missing field(s)
+     it owns; clean first-pass values are preserved verbatim.
 
 The real model identifiers are env-driven so non-production environments
 can point at fakes/stubs without code changes.
@@ -161,6 +159,48 @@ _VISION_PROMPT_STRICT = (
     "fences, no explanation."
 )
 
+_VISION_PROMPT_DATE_ONLY = (
+    "Look at this receipt image one more time. Date is the only missing "
+    "field from the first extraction pass. Your only task is to find the "
+    "receipt or transaction date.\n"
+    "\n"
+    "DATE RULES:\n"
+    "  Return the printed receipt date, transaction date, or payment date.\n"
+    "  For Turkish receipts, labels such as TARIH or ISLEM may show dates "
+    "as DD/MM/YYYY, DD.MM.YYYY, or DD-MM-YYYY; convert to YYYY-MM-DD.\n"
+    "  Ignore due dates, statement dates, card expiry dates, tax-office "
+    "registration dates, and any unrelated dates.\n"
+    "  If no receipt/transaction/payment date is readable, return null.\n"
+    "\n"
+    "Return ONLY a JSON object with exactly one key:\n"
+    "  date (string YYYY-MM-DD, or null).\n"
+    "Do not include supplier, amount, currency, or any other fields. No "
+    "prose, no code fences, no explanation."
+)
+
+_VISION_PROMPT_AMOUNT_ONLY = (
+    "Look at this receipt image one more time. Amount and/or currency is "
+    "the only missing field from the first extraction pass. Your only task "
+    "is to find the final paid total and its currency.\n"
+    "\n"
+    "AMOUNT RULES:\n"
+    "  Return the final grand total / paid amount, not subtotals, taxes, "
+    "change, card balances, installments, tips-only lines, or per-item "
+    "prices.\n"
+    "  For Turkish receipts, totals may be labeled TOPLAM, GENEL TOPLAM, "
+    "TUTAR, ODENEN, or ISLEM TUTARI. TRY, TL, and the Turkish lira symbol "
+    "all map to TRY.\n"
+    "  Preserve decimals as a number. If only currency is readable, return "
+    "amount null and the currency. If only amount is readable, return amount "
+    "and currency null.\n"
+    "\n"
+    "Return ONLY a JSON object with exactly these keys:\n"
+    "  amount (number, or null),\n"
+    "  currency (3-letter ISO code string such as TRY, USD, EUR, or null).\n"
+    "Do not include date, supplier, or any other fields. No prose, no code "
+    "fences, no explanation."
+)
+
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 _PDF_EXTENSIONS = {".pdf"}
@@ -179,11 +219,11 @@ _PDF_MAX_PAGES = 10
 
 @dataclass(frozen=True)
 class VisionResult:
-    """Outcome of a single-tier vision call (with optional merchant retry)."""
+    """Outcome of a single-tier vision call with optional focused retries."""
 
     fields: dict[str, Any]
     model: str  # the model that produced the fields (single-tier post-F1.3)
-    escalated: bool  # true when the merchant-only stricter retry was used
+    escalated: bool  # true when a focused retry contributed to the result
     notes: list[str]
 
 
@@ -260,6 +300,26 @@ def _supplier_needs_merchant_retry(value: Any) -> bool:
     """
     if _is_unreadable_merchant_sentinel(value):
         return True
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
+
+
+def _date_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
+
+
+def _amount_missing(value: Any) -> bool:
+    return value is None
+
+
+def _currency_missing(value: Any) -> bool:
     if value is None:
         return True
     if isinstance(value, str) and not value.strip():
@@ -376,8 +436,8 @@ def _call_openai(
     content blocks so the model sees them together (preserves cross-page
     context for multi-page PDFs).
 
-    ``prompt`` defaults to the standard ``_VISION_PROMPT``; on the
-    stricter retry path ``vision_extract`` passes ``_VISION_PROMPT_STRICT``.
+    ``prompt`` defaults to the standard ``_VISION_PROMPT``; focused retry
+    paths pass narrower prompts for supplier, date, or amount/currency.
 
     Returns ``None`` when the key is unset, the SDK is unavailable, the
     images list is empty, or the response cannot be parsed as JSON.
@@ -811,16 +871,16 @@ def vision_extract(storage_path: str) -> VisionResult | None:
       2. If the first-pass supplier is missing — the
          ``UNREADABLE_MERCHANT`` sentinel, ``None``, or an empty
          string — retry the same model with ``_VISION_PROMPT_STRICT``
-         (merchant-only) and merge the retry's supplier over the
-         first-pass result. First-pass date / amount / currency /
-         receipt_type are preserved across the retry — supplier
-         ambiguity must NEVER blank a date or amount that the first
-         pass extracted.
-      3. A missing amount or missing date on the first pass does NOT
-         trigger the retry. The retry is merchant-only and would not
-         re-extract those fields anyway; a null amount or null date
-         is reported as-is rather than papered over with a second
-         guess.
+         (supplier-only) and merge only supplier.
+      3. If date is still missing, retry with ``_VISION_PROMPT_DATE_ONLY``
+         and merge only date.
+      4. If amount or currency is still missing, retry with
+         ``_VISION_PROMPT_AMOUNT_ONLY`` and merge only the missing
+         amount/currency fields.
+
+    Focused retries never overwrite non-null first-pass values. They run
+    before clarification questions, so the bot only asks the user after
+    these narrow recovery attempts fail.
 
     Returns ``None`` when the file is unsupported or the first-pass
     model call itself produced no parseable response.
@@ -847,50 +907,108 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     if first_fields is None:
         notes.append(
             f"First pass ({VISION_MODEL}) unavailable or returned invalid JSON; "
-            "no retry (retry is scoped to merchant ambiguity)."
+            "no focused retries."
         )
         return None
 
-    first_supplier = first_fields.get("supplier")
-    if not _supplier_needs_merchant_retry(first_supplier):
-        notes.append(f"Vision extraction succeeded on first pass ({VISION_MODEL}).")
-        return VisionResult(
-            fields=_normalize_unreadable_supplier(first_fields),
-            model=VISION_MODEL, escalated=False, notes=notes,
-        )
-
-    # Supplier-only ambiguity → run stricter merchant-only retry. Date and
-    # amount from the first pass stand: a supplier-side problem must never
-    # blank fields that were already extracted cleanly.
-    if _is_unreadable_merchant_sentinel(first_supplier):
-        retry_reason = f"reported {UNREADABLE_MERCHANT_SENTINEL} for supplier"
-    elif first_supplier is None:
-        retry_reason = "returned null supplier"
-    else:
-        retry_reason = "returned empty/whitespace supplier"
-    notes.append(
-        f"First pass ({VISION_MODEL}) {retry_reason}; "
-        "retrying merchant extraction with stricter prompt (date/amount preserved)."
-    )
-    retry_fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_STRICT)
     merged = dict(first_fields)
-    # ``escalated`` reflects whether the retry actually contributed to the
-    # returned result. A None retry response means the retry didn't run (or
-    # ran and failed to parse) — we keep the first-pass fields unchanged,
-    # which is semantically the same as "no retry happened" from the
-    # downstream caller's perspective.
-    retry_contributed = retry_fields is not None and "supplier" in retry_fields
+    retry_attempted = False
+    retry_contributed = False
+
+    first_supplier = merged.get("supplier")
+    if _supplier_needs_merchant_retry(first_supplier):
+        # Supplier-only ambiguity -> run stricter merchant-only retry. Date and
+        # amount from the first pass stand: a supplier-side problem must never
+        # blank fields that were already extracted cleanly.
+        if _is_unreadable_merchant_sentinel(first_supplier):
+            retry_reason = f"reported {UNREADABLE_MERCHANT_SENTINEL} for supplier"
+        elif first_supplier is None:
+            retry_reason = "returned null supplier"
+        else:
+            retry_reason = "returned empty/whitespace supplier"
+        notes.append(
+            f"First pass ({VISION_MODEL}) {retry_reason}; "
+            "retrying supplier extraction with stricter prompt (other fields preserved)."
+        )
+        retry_attempted = True
+        retry_fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_STRICT)
+        # ``escalated`` reflects whether the retry actually contributed to the
+        # returned result. A None retry response means the retry didn't run (or
+        # ran and failed to parse) — we keep the first-pass fields unchanged,
+        # which is semantically the same as "no retry happened" from the
+        # downstream caller's perspective.
+        if retry_fields is not None and "supplier" in retry_fields:
+            merged["supplier"] = retry_fields.get("supplier")
+            retry_contributed = True
+            notes.append(
+                f"Supplier retry ({VISION_MODEL}) returned supplier="
+                f"{retry_fields.get('supplier')!r}; first-pass date/amount/etc. preserved."
+            )
+        else:
+            notes.append(
+                "Supplier retry unavailable; keeping first-pass fields with supplier "
+                "normalized to None."
+            )
+
+    if _date_missing(merged.get("date")):
+        notes.append(
+            f"Date missing after first pass ({VISION_MODEL}); retrying date-only extraction."
+        )
+        retry_attempted = True
+        retry_fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_DATE_ONLY)
+        retry_date = retry_fields.get("date") if retry_fields is not None else None
+        if not _date_missing(retry_date):
+            merged["date"] = retry_date
+            retry_contributed = True
+            notes.append(
+                f"Date retry ({VISION_MODEL}) returned date={retry_date!r}; "
+                "all other fields preserved."
+            )
+        else:
+            notes.append("Date retry unavailable or returned null; date remains missing.")
+
+    amount_missing = _amount_missing(merged.get("amount"))
+    currency_missing = _currency_missing(merged.get("currency"))
+    if amount_missing or currency_missing:
+        missing_names = [
+            name
+            for name, missing in (("amount", amount_missing), ("currency", currency_missing))
+            if missing
+        ]
+        notes.append(
+            f"{'/'.join(missing_names).capitalize()} missing after first pass ({VISION_MODEL}); "
+            "retrying amount-only extraction."
+        )
+        retry_attempted = True
+        retry_fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_AMOUNT_ONLY)
+        retry_filled: list[str] = []
+        if retry_fields is not None:
+            retry_amount = retry_fields.get("amount")
+            retry_currency = retry_fields.get("currency")
+            if amount_missing and not _amount_missing(retry_amount):
+                merged["amount"] = retry_amount
+                retry_filled.append("amount")
+            if currency_missing and not _currency_missing(retry_currency):
+                merged["currency"] = retry_currency
+                retry_filled.append("currency")
+        if retry_filled:
+            retry_contributed = True
+            notes.append(
+                f"Amount retry ({VISION_MODEL}) filled {', '.join(retry_filled)}; "
+                "non-missing first-pass fields preserved."
+            )
+        else:
+            notes.append(
+                "Amount retry unavailable or returned no missing amount/currency values."
+            )
+
     if retry_contributed:
-        merged["supplier"] = retry_fields.get("supplier")
-        notes.append(
-            f"Stricter merchant retry ({VISION_MODEL}) returned supplier="
-            f"{retry_fields.get('supplier')!r}; date/amount/etc. preserved from first pass."
-        )
+        notes.append(f"Vision extraction completed with focused retry contribution ({VISION_MODEL}).")
+    elif retry_attempted:
+        notes.append(f"Vision extraction completed with no focused retry contribution ({VISION_MODEL}).")
     else:
-        notes.append(
-            "Stricter merchant retry unavailable; keeping first-pass fields with supplier "
-            "normalized to None."
-        )
+        notes.append(f"Vision extraction succeeded on first pass ({VISION_MODEL}).")
+
     return VisionResult(
         fields=_normalize_unreadable_supplier(merged),
         model=VISION_MODEL, escalated=retry_contributed, notes=notes,

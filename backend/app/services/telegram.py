@@ -1,4 +1,5 @@
 import json
+import logging
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ from app.services.receipt_extraction import apply_receipt_extraction
 from app.services.review_sessions import get_or_create_review_session
 from app.services.storage import save_bytes
 from app.services.statement_import import import_diners_excel
+
+logger = logging.getLogger(__name__)
 
 
 class TelegramClient:
@@ -85,7 +88,52 @@ def _best_photo(message: dict[str, Any]) -> dict[str, Any] | None:
     photos = message.get("photo") or []
     if not photos:
         return None
-    return max(photos, key=lambda item: item.get("file_size") or 0)
+    if all(_photo_file_size(item) > 0 for item in photos):
+        return max(photos, key=_photo_file_size)
+    return max(photos, key=_photo_area)
+
+
+def _photo_file_size(photo: dict[str, Any]) -> int:
+    try:
+        return int(photo.get("file_size") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _photo_area(photo: dict[str, Any]) -> int:
+    try:
+        width = int(photo.get("width") or 0)
+        height = int(photo.get("height") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return width * height
+
+
+def _stored_image_metadata(path: Path) -> tuple[int | None, int | None, int | None]:
+    try:
+        byte_size = path.stat().st_size
+    except OSError:
+        byte_size = None
+    try:
+        from PIL import Image  # deferred import; optional outside OCR installs
+
+        with Image.open(path) as image:
+            return image.width, image.height, byte_size
+    except Exception:
+        return None, None, byte_size
+
+
+def _log_stored_receipt_media(path: Path, *, content_type: str, original_name: str) -> None:
+    width, height, byte_size = _stored_image_metadata(path)
+    logger.info(
+        "Telegram stored receipt media: content_type=%s original_name=%s path=%s width=%s height=%s bytes=%s",
+        content_type,
+        original_name,
+        path,
+        width,
+        height,
+        byte_size,
+    )
 
 
 def _document_is_receipt(document: dict[str, Any]) -> bool:
@@ -258,6 +306,8 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     try:
         downloaded = client.download_file(file_id, user.id, original_name) if file_id else None
         storage_path = str(downloaded) if downloaded else None
+        if downloaded is not None:
+            _log_stored_receipt_media(downloaded, content_type=content_type, original_name=original_name)
         if not downloaded:
             status = "received_metadata_only"
     except Exception as exc:

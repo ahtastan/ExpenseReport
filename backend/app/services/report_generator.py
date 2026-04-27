@@ -6,11 +6,12 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment
 from sqlmodel import Session
 
 from app.config import get_settings
 from app.json_utils import decode_decimal
-from app.models import ExpenseReport, ReportRun
+from app.models import ExpenseReport, ReportRun, StatementImport
 from app.services import model_router
 from app.services.receipt_annotations import ReceiptAnnotationLine, create_annotated_receipts_pdf
 from app.services.report_validation import ReportValidation, validate_report_readiness
@@ -167,6 +168,12 @@ class ReportLine:
     meal_location: str | None = None
     meal_eg: bool = False
     meal_mr: bool = False
+    # Local-currency amount + currency from the BMO statement side. Used by
+    # the annotated-receipts PDF banner renderer (Bug 4) to show "USD $X.XX
+    # | TRY YYY.YY" without losing the original-currency anchor. Sourced
+    # from the snapshot's source.statement payload during _confirmed_lines.
+    local_amount: Decimal | None = None
+    local_currency: str | None = None
 
 
 def _parse_optional_date(value: object) -> date | None:
@@ -215,6 +222,22 @@ def _confirmed_lines(
         if not tx_date_raw or amount is None:
             continue
         tx_date = date.fromisoformat(str(tx_date_raw))
+        # Local-currency anchor for the annotated-receipts PDF banner.
+        # source.statement is the BMO-side authoritative amount; falls back
+        # to source.receipt.extracted_local_amount when the statement side
+        # is absent (manual-entry path).
+        statement_block = (row.get("source") or {}).get("statement") or {}
+        receipt_block = (row.get("source") or {}).get("receipt") or {}
+        local_amount = _parse_optional_decimal(
+            statement_block.get("local_amount")
+        ) or _parse_optional_decimal(
+            receipt_block.get("extracted_local_amount")
+        )
+        local_currency = (
+            statement_block.get("local_currency")
+            or receipt_block.get("extracted_currency")
+            or None
+        )
         lines.append(
             ReportLine(
                 transaction_id=int(row["transaction_id"]),
@@ -244,6 +267,8 @@ def _confirmed_lines(
                 meal_location=row.get("meal_location") or None,
                 meal_eg=_parse_bool(row.get("meal_eg")),
                 meal_mr=_parse_bool(row.get("meal_mr")),
+                local_amount=local_amount,
+                local_currency=local_currency,
             )
         )
     return sorted(lines, key=lambda line: (line.transaction_date, line.review_row_id or 0))
@@ -278,7 +303,154 @@ def _allocate(line: ReportLine, day_totals: dict[date, dict[str, list[Decimal]]]
         )
 
 
-def _fill_workbook(template_path: Path, output_path: Path, employee_name: str, title: str, lines: list[ReportLine]) -> None:
+def _write_irs_detail_row(
+    ws,
+    rownum: int,
+    primary: "MealDetailLine",
+    sum_components: list[Decimal] | None,
+) -> None:
+    """Write one Page 1B IRS detail row.
+
+    Per Bug 3 fix, writes full strings without [:N] truncation and applies
+    wrap_text=True to the four wide-content cells (C/D/E/F) so long values
+    flow vertically. ``row_dimensions[rownum].height`` is left None so
+    Excel auto-fits at render time.
+
+    Per Bug 2 fix, when ``sum_components`` is non-None (≥ 2 receipts
+    collapsed under same-supplier-same-code), writes a SUM formula
+    directly to the amount cell (J) so the auditor sees =A+B[+C…].
+    Otherwise leaves J alone — the template's pre-existing IF formula
+    pulls the daily total from Week 1A.
+
+    Module-level helper (rather than a closure inside _fill_workbook) so
+    tests can exercise the cell-shape contract without a real .xlsx
+    template loaded — see test_report_generator_irs_truncation.py.
+    """
+    ws[f"C{rownum}"] = primary.place
+    ws[f"D{rownum}"] = primary.location
+    ws[f"E{rownum}"] = primary.participants
+    ws[f"F{rownum}"] = primary.reason
+    _wrap_top = Alignment(wrap_text=True, vertical="top")
+    for col in ("C", "D", "E", "F"):
+        ws[f"{col}{rownum}"].alignment = _wrap_top
+    ws.row_dimensions[rownum].height = None
+    ws[f"H{rownum}"] = "x" if primary.eg else None
+    ws[f"I{rownum}"] = "x" if primary.mr else None
+    if sum_components is not None:
+        parts = [f"{amt:.2f}".rstrip("0").rstrip(".") for amt in sum_components]
+        ws[f"J{rownum}"] = "=" + "+".join(parts)
+
+
+def group_meal_details_for_irs(
+    details: list["MealDetailLine"],
+) -> list[tuple["MealDetailLine", list[Decimal] | None]]:
+    """Group same-supplier-same-code meal details for the Page 1B IRS section.
+
+    Returns a list of (primary, sum_components) tuples in the input's
+    first-occurrence order:
+
+    - When a (code, normalized_supplier) appears exactly once → (detail, None).
+      Caller writes the row normally; the amount cell inherits the template's
+      pre-existing IF formula that pulls from the Week 1A daily total.
+
+    - When the same (code, normalized_supplier) appears 2+ times → returns
+      (first_detail, [d1.amount, d2.amount, …]). Caller writes the row using
+      the first detail's metadata (place / location / participants / reason —
+      identical across the duplicates by definition; this is the
+      "split-bill on one dinner across two card transactions" pattern) and
+      writes a SUM formula directly to the amount cell so the auditor can
+      see =A+B and decode the component receipts.
+
+    Different suppliers under the same code on the same day are kept as
+    separate group entries — caller still has to allocate them to rows
+    and currently drops 2nd/3rd different-supplier collisions per the
+    template's 5-rows-per-day constraint. The Bug 2 fix targets the
+    same-supplier collapse case explicitly; the rare different-supplier
+    same-code collision is out of scope here.
+    """
+    groups: dict[tuple[str, str], list[MealDetailLine]] = {}
+    for detail in details:
+        supplier_norm = (detail.place or "").strip().lower()
+        groups.setdefault((detail.code, supplier_norm), []).append(detail)
+    result: list[tuple[MealDetailLine, list[Decimal] | None]] = []
+    for group in groups.values():
+        primary = group[0]
+        if len(group) >= 2:
+            result.append((primary, [d.amount for d in group]))
+        else:
+            result.append((primary, None))
+    return result
+
+
+def _resolve_period_ending(
+    statement_date: date | None,
+    lines: list[ReportLine],
+) -> date | None:
+    """Pick the period-ending date for the report header.
+
+    Prefers the BMO statement_date when known (Diners Club statement-driven
+    reports always have one). Falls back to the latest transaction_date in
+    confirmed_lines when the statement_date is unset (manual entry path,
+    or a statement uploaded before the statement-date column existed).
+    Returns None only when neither is available, in which case callers
+    leave the template's existing period-ending formula in place.
+    """
+    if statement_date is not None:
+        return statement_date
+    line_dates = [line.transaction_date for line in lines if line.transaction_date]
+    return max(line_dates) if line_dates else None
+
+
+def _apply_period_ending(
+    wb,
+    period_ending: date | None,
+    *,
+    has_week2_data: bool,
+) -> None:
+    """Override the template's period-ending chain with a concrete date.
+
+    Template behavior we're replacing: ``Week 1A!M3 = ='Week 2A'!K5`` and
+    ``Week 2A!M3 = =K5`` chain through a 14-column date projection that
+    drifts past the actual data. For our 5-date November dataset the
+    chain ends up at 2025-10-29 even though the latest transaction is
+    2025-10-20 and the BMO statement closes on 2025-11-10.
+
+    Override behavior:
+      - Always overwrite ``Week 1A!M3`` with the resolved date. The B-side
+        sheets (Week 1B, Week 2B) read M3 via IF wrappers; they pick up
+        the overwrite for free.
+      - When Week 2 has no data: also clear Week 2A's row-5 date formulas
+        (E5–K5) and overwrite Week 2A!M3 with the same resolved date so
+        the auditor doesn't see a stale projected period on a blank
+        Week 2A.
+      - When Week 2 HAS data: leave Week 2A's row-5 formulas alone (they
+        derive valid Week 2 dates) and write the resolved date to Week 2A
+        M3 too so its self-reference (=K5) is overridden.
+    """
+    if period_ending is None:
+        return
+
+    period_dt = datetime(period_ending.year, period_ending.month, period_ending.day)
+    wb["Week 1A"]["M3"] = period_dt
+    wb["Week 2A"]["M3"] = period_dt
+
+    if not has_week2_data:
+        # Clear Week 2A row-5 date formulas so the empty Week 2A doesn't
+        # display projected dates 2025-10-23..29 next to a date label.
+        # The cells stay empty; Excel renders blanks not zeros.
+        for col in ("E", "F", "G", "H", "I", "J", "K"):
+            wb["Week 2A"][f"{col}5"] = None
+
+
+def _fill_workbook(
+    template_path: Path,
+    output_path: Path,
+    employee_name: str,
+    title: str,
+    lines: list[ReportLine],
+    *,
+    period_ending: date | None = None,
+) -> None:
     wb = load_workbook(template_path)
     ws1a, ws1b, ws2a, ws2b = wb["Week 1A"], wb["Week 1B"], wb["Week 2A"], wb["Week 2B"]
     ws1a["B3"] = employee_name
@@ -366,18 +538,19 @@ def _fill_workbook(template_path: Path, output_path: Path, employee_name: str, t
     def fill_b(ws, page_dates: list[date]) -> None:
         code_rows = {"M": 0, "B": 1, "L": 2, "D": 3, "E": 4}
         for day_index, tx_date in enumerate(page_dates):
+            # Bug 2: collapse same-supplier-same-code duplicates into one IRS
+            # row. The amount cell becomes a SUM formula so the auditor sees
+            # each receipt's component (e.g. =92.72+16.65 for a dinner billed
+            # across two card transactions). Without this, the second receipt
+            # was silently dropped because it collided on (day, code).
+            grouped = group_meal_details_for_irs(detail_lines.get(tx_date, []))
             used_codes: set[str] = set()
-            for detail in detail_lines.get(tx_date, []):
-                if detail.code not in code_rows or detail.code in used_codes:
+            for primary, sum_components in grouped:
+                if primary.code not in code_rows or primary.code in used_codes:
                     continue
-                used_codes.add(detail.code)
-                rownum = 8 + day_index * 5 + code_rows[detail.code]
-                ws[f"C{rownum}"] = detail.place[:40]
-                ws[f"D{rownum}"] = detail.location[:28]
-                ws[f"E{rownum}"] = detail.participants[:40]
-                ws[f"F{rownum}"] = detail.reason[:50]
-                ws[f"H{rownum}"] = "x" if detail.eg else None
-                ws[f"I{rownum}"] = "x" if detail.mr else None
+                used_codes.add(primary.code)
+                rownum = 8 + day_index * 5 + code_rows[primary.code]
+                _write_irs_detail_row(ws, rownum, primary, sum_components)
 
     first7_set = set(first7)
     next7_set = set(next7)
@@ -390,6 +563,7 @@ def _fill_workbook(template_path: Path, output_path: Path, employee_name: str, t
     fill_b(ws2b, next7)
     fill_air_travel(ws1a, "Week 1A", first7_lines)
     fill_air_travel(ws2a, "Week 2A", next7_lines)
+    _apply_period_ending(wb, period_ending, has_week2_data=bool(next7))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
 
@@ -521,6 +695,8 @@ def _annotation_lines(lines: list[ReportLine]) -> list[ReceiptAnnotationLine]:
             report_bucket=line.report_bucket,
             business_reason=line.business_reason,
             attendees=line.attendees,
+            local_amount=float(line.local_amount) if line.local_amount is not None else None,
+            local_currency=line.local_currency,
         )
         for line in lines
     ]
@@ -579,14 +755,38 @@ def generate_report_package(
     output_dir = settings.storage_root / "reports" / f"report_{run.id}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Bug 1: period-ending uses BMO statement_date when present. Falls back
+    # to max(transaction_date) so manual-entry statements (no statement_date)
+    # still produce a sensible header.
+    statement = session.get(StatementImport, statement_import_id)
+    statement_date = statement.statement_date if statement is not None else None
+    period_ending = _resolve_period_ending(statement_date, lines)
+
+    # Bug 5: LLM-generate the trip-purpose title from the receipts'
+    # business_reason text. Falls back to title_prefix when the LLM is
+    # unavailable, returns nothing usable, or no business_reasons exist.
+    # Best-effort: never blocks report generation. No caching tonight —
+    # one extra ~500ms-1s call per generation is acceptable for the demo;
+    # add a ReportRun.title cache column in a follow-up if cost matters.
+    business_reasons = [line.business_reason for line in lines if line.business_reason]
+    llm_title = model_router.generate_travel_reason_summary(business_reasons)
+    workbook_title = llm_title or title_prefix
+
     dates = sorted({line.transaction_date for line in lines})
     chunks = [dates[i : i + 14] for i in range(0, len(dates), 14)]
     workbook_paths: list[Path] = []
     for idx, chunk_dates in enumerate(chunks, start=1):
         chunk_lines = [line for line in lines if line.transaction_date in set(chunk_dates)]
-        title = f"{title_prefix} - Part {idx}" if len(chunks) > 1 else title_prefix
+        title = f"{workbook_title} - Part {idx}" if len(chunks) > 1 else workbook_title
         workbook_path = output_dir / f"expense_report_part_{idx}.xlsx"
-        _fill_workbook(settings.report_template_path, workbook_path, employee_name, title, chunk_lines)
+        _fill_workbook(
+            settings.report_template_path,
+            workbook_path,
+            employee_name,
+            title,
+            chunk_lines,
+            period_ending=period_ending,
+        )
         workbook_paths.append(workbook_path)
 
     summary_path = output_dir / "validation_summary.txt"

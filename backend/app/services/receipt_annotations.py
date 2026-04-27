@@ -56,7 +56,21 @@ MAX_RECEIPTS_PER_DAY_GROUP = 9
 PDF_RASTER_DPI = 180
 PDF_MAX_PAGES = 10
 
-DEFAULT_STRATEGY = "day_grouped_colored"
+DEFAULT_STRATEGY = "banner_grid"
+
+# ─── Banner-grid layout constants (Bug 4 — Carolyn's reference) ───────────────
+# 3x3 grid with full-width green banner overlaying the top of each receipt
+# thumbnail. The banner carries amount + date + supplier so an EDT auditor
+# can scan a page without flipping back to a legend.
+
+BANNER_HEIGHT_PX = 160                  # ~1.5cm at 300 DPI; sized for two text lines
+BANNER_BG_HEX = "#2ca02c"               # Tableau green; matches reference PDF
+BANNER_TEXT_COLOR = "#ffffff"
+BANNER_INNER_PAD_X = 32                 # left padding for banner text
+BANNER_INNER_PAD_Y_TOP = 12             # space above first text line
+BANNER_LINE_GAP_PX = 56                 # vertical gap between line 1 and line 2
+THIN_BORDER_HEX = "#bdbdbd"             # 2px gray hairline around each thumb
+THIN_BORDER_WIDTH_PX = 2
 
 # Tableau 10 palette — colorblind-aware, print-safe, max differentiation.
 LINE_COLOR_PALETTE: tuple[str, ...] = (
@@ -94,6 +108,14 @@ class ReceiptAnnotationLine:
     report_bucket: str
     business_reason: str
     attendees: str
+    # Local-currency anchor for the banner_grid layout (Bug 4). Reflects the
+    # BMO-side authoritative amount — e.g., a receipt-side OCR'd 250.00 TRY
+    # plus the report's USD-converted 6.12 lets the banner show
+    # "USD $6.12 | TRY 250.00" so an auditor sees both sides at a glance.
+    # Default None so callers that don't know the local amount (legacy
+    # call sites, tests built before Bug 4) keep working.
+    local_amount: float | None = None
+    local_currency: str | None = None
 
 
 # ─── Fonts ────────────────────────────────────────────────────────────────────
@@ -112,6 +134,11 @@ FONT_DAY_HEADER = _font("arialbd.ttf", 60)
 FONT_DAY_SUB = _font("arial.ttf", 36)
 FONT_LEGEND_TITLE = _font("arialbd.ttf", 110)
 FONT_LEGEND_ENTRY = _font("arial.ttf", 42)
+# Banner fonts for the banner_grid layout (Bug 4). Sized for the
+# BANNER_HEIGHT_PX of 160; tuned so two lines of text fit with comfortable
+# padding at the cell width of ~800 px.
+FONT_BANNER_AMOUNT = _font("arialbd.ttf", 44)  # line 1: "USD $X.XX | TRY YYY.YY"
+FONT_BANNER_META = _font("arial.ttf", 30)      # line 2: "DATE | SUPPLIER | B/P"
 
 
 # ─── Line keys, color assignment, grouping ────────────────────────────────────
@@ -570,6 +597,220 @@ def _render_grid_layout(
     return len(pages)
 
 
+# ─── Banner-grid layout (Bug 4 — Carolyn's reference) ─────────────────────────
+
+
+def _format_banner_amount_line(line: ReceiptAnnotationLine) -> str:
+    """Top banner line: 'USD $X.XX | TRY YYY.YY' when both currencies known.
+
+    Falls back gracefully:
+      - Both: ``'USD $5.21 | TRY 119.34'``
+      - Local only (currency != USD, no usd amount): ``'TRY 119.34'``
+      - USD only: ``'USD $5.21'``
+      - Neither: ``''`` (empty banner line; unusual)
+
+    The report-currency leg uses ``amount`` + ``currency`` (which is USD
+    in the diners_statement flow). The local-currency leg uses
+    ``local_amount`` + ``local_currency``, populated from the BMO
+    statement-side authoritative amount in _confirmed_lines.
+    """
+    parts: list[str] = []
+    if line.amount is not None and line.currency:
+        if line.currency.upper() == "USD":
+            parts.append(f"USD ${float(line.amount):.2f}")
+        else:
+            parts.append(f"{line.currency} {float(line.amount):.2f}")
+    if (
+        line.local_amount is not None
+        and line.local_currency
+        and line.local_currency.upper() != (line.currency or "").upper()
+    ):
+        parts.append(f"{line.local_currency} {float(line.local_amount):.2f}")
+    return " | ".join(parts)
+
+
+def _format_banner_meta_line(line: ReceiptAnnotationLine) -> str:
+    """Bottom banner line: 'YYYY-MM-DD | SUPPLIER | Business' (or Personal).
+
+    Truncated supplier names get the ``shorten`` treatment to fit within
+    the cell width — the green banner is bounded by CELL_WIDTH; long
+    chain names like 'İKBAL LOKANTACILIK / ZEY SPORT SPOR MAL. SAN.' are
+    visually cut at ~40 chars.
+    """
+    bp = (line.business_or_personal or "").strip()
+    supplier = shorten(line.supplier or "", width=42, placeholder="…")
+    parts = [line.transaction_date.isoformat(), supplier]
+    if bp:
+        parts.append(bp)
+    return " | ".join(parts)
+
+
+def _draw_thin_border(img: Image.Image) -> Image.Image:
+    """2px gray hairline around a thumbnail — replaces the old 12px
+    color-coded BORDER_WIDTH from day_grouped_colored. Cheap visual
+    separation between adjacent cells in the 3x3 grid.
+    """
+    bordered = img.copy()
+    draw = ImageDraw.Draw(bordered)
+    w, h = bordered.size
+    draw.rectangle(
+        (0, 0, w - 1, h - 1),
+        outline=THIN_BORDER_HEX,
+        width=THIN_BORDER_WIDTH_PX,
+    )
+    return bordered
+
+
+def _make_banner_thumbnail(
+    receipt_img: Image.Image,
+    line: ReceiptAnnotationLine,
+) -> Image.Image:
+    """Render one cell of the 3x3 grid: receipt thumbnail + green top banner.
+
+    The banner overlays the upper BANNER_HEIGHT_PX of the cell. The
+    receipt image is letterboxed to fill the rest of the cell (preserving
+    aspect ratio); a 2px gray border separates this cell from neighbors.
+    """
+    canvas = Image.new("RGB", (CELL_WIDTH, CELL_HEIGHT), "white")
+
+    # Receipt fills the whole cell; banner composites on top of it later.
+    img = receipt_img.copy()
+    img.thumbnail((CELL_WIDTH, CELL_HEIGHT), Image.Resampling.LANCZOS)
+    img_x = (CELL_WIDTH - img.width) // 2
+    img_y = (CELL_HEIGHT - img.height) // 2
+    canvas.paste(img, (img_x, img_y))
+
+    # Green banner overlay across full top of cell.
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((0, 0, CELL_WIDTH, BANNER_HEIGHT_PX), fill=BANNER_BG_HEX)
+    draw.text(
+        (BANNER_INNER_PAD_X, BANNER_INNER_PAD_Y_TOP),
+        _format_banner_amount_line(line),
+        fill=BANNER_TEXT_COLOR,
+        font=FONT_BANNER_AMOUNT,
+    )
+    draw.text(
+        (BANNER_INNER_PAD_X, BANNER_INNER_PAD_Y_TOP + BANNER_LINE_GAP_PX),
+        _format_banner_meta_line(line),
+        fill=BANNER_TEXT_COLOR,
+        font=FONT_BANNER_META,
+    )
+
+    return _draw_thin_border(canvas)
+
+
+def _render_full_page_banner_continuation(
+    img: Image.Image,
+    line: ReceiptAnnotationLine,
+    *,
+    page_num: int,
+    total_pages: int,
+) -> Image.Image:
+    """A full-page A4 page for a multi-page receipt's pages 2..N.
+
+    Same green banner as on the grid cell, but at the top of a full A4
+    page so multi-page hotel folios remain readable without being shrunk
+    to thumbnail size. Banner shows '… (page N of M)' so the auditor
+    knows where they are.
+    """
+    page = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
+    big = img.copy()
+    big.thumbnail(
+        (A4_WIDTH - 2 * MARGIN_X, A4_HEIGHT - 2 * MARGIN_Y - BANNER_HEIGHT_PX),
+        Image.Resampling.LANCZOS,
+    )
+    px = (A4_WIDTH - big.width) // 2
+    py = MARGIN_Y + BANNER_HEIGHT_PX
+    page.paste(big, (px, py))
+
+    draw = ImageDraw.Draw(page)
+    # Banner spans full page width (not cell width).
+    draw.rectangle((0, 0, A4_WIDTH, BANNER_HEIGHT_PX), fill=BANNER_BG_HEX)
+    draw.text(
+        (BANNER_INNER_PAD_X * 2, BANNER_INNER_PAD_Y_TOP),
+        _format_banner_amount_line(line),
+        fill=BANNER_TEXT_COLOR,
+        font=FONT_BANNER_AMOUNT,
+    )
+    draw.text(
+        (BANNER_INNER_PAD_X * 2, BANNER_INNER_PAD_Y_TOP + BANNER_LINE_GAP_PX),
+        f"{_format_banner_meta_line(line)}  (page {page_num} of {total_pages})",
+        fill=BANNER_TEXT_COLOR,
+        font=FONT_BANNER_META,
+    )
+    return page
+
+
+def _render_banner_grid_layout(
+    lines: list[ReceiptAnnotationLine],
+    output_path: Path,
+) -> int:
+    """3x3 grid PDF with green banners — the Carolyn-approved layout.
+
+    Sort order: ``(transaction_date, receipt_id)`` — natural chronological
+    ordering with stable tie-break for same-day receipts. PM's grouping
+    rule (receipts contributing to one report line stay on the same page)
+    is satisfied for the November dataset by date sorting alone, since
+    same-(supplier, code, date) groups are contiguous after sort.
+
+    Multi-page receipts (e.g. hotel folios): page 1 of the receipt goes
+    in the grid as a thumbnail; pages 2..N are emitted as full-A4 pages
+    AFTER the grid page they belong to, using the same banner. This
+    matches the prior day_grouped_colored behavior so hotel folios stay
+    readable.
+
+    No legend page, no color-coded borders. Each thumbnail's green banner
+    is a self-contained cross-reference (amount, date, supplier, B/P) so
+    the auditor doesn't need a separate legend.
+    """
+    ordered = sorted(
+        lines,
+        key=lambda ln: (ln.transaction_date, ln.receipt_id or 0),
+    )
+    pages: list[Image.Image] = []
+
+    for offset in range(0, len(ordered), COLUMNS * ROWS):
+        batch = ordered[offset : offset + COLUMNS * ROWS]
+        page = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
+
+        # Lay out 3x3 grid; track multi-page receipts encountered for
+        # post-grid full-page emission.
+        multi_page_extras: list[Image.Image] = []
+        for idx, line in enumerate(batch):
+            cell_pages = _load_receipt_pages(line) or [_placeholder_tile(line, "no file")]
+            thumb = _make_banner_thumbnail(cell_pages[0], line)
+            col = idx % COLUMNS
+            row = idx // COLUMNS
+            x0 = MARGIN_X + col * (CELL_WIDTH + GAP_X)
+            y0 = MARGIN_Y + row * (CELL_HEIGHT + GAP_Y)
+            x = x0 + (CELL_WIDTH - thumb.width) // 2
+            y = y0 + (CELL_HEIGHT - thumb.height) // 2
+            page.paste(thumb, (x, y))
+
+            if len(cell_pages) > 1:
+                total = len(cell_pages)
+                for extra_idx, extra_img in enumerate(cell_pages[1:], start=2):
+                    multi_page_extras.append(
+                        _render_full_page_banner_continuation(
+                            extra_img, line,
+                            page_num=extra_idx, total_pages=total,
+                        )
+                    )
+
+        pages.append(page)
+        # Emit any multi-page receipt continuations right after the grid
+        # page they belong to, so the hotel folio stays adjacent to its
+        # thumbnail.
+        pages.extend(multi_page_extras)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not pages:
+        # Defensive — should be impossible given the non-empty check upstream.
+        pages = [Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")]
+    pages[0].save(output_path, save_all=True, append_images=pages[1:])
+    return len(pages)
+
+
 # ─── Public entry point ───────────────────────────────────────────────────────
 
 def create_annotated_receipts_pdf(
@@ -581,6 +822,9 @@ def create_annotated_receipts_pdf(
     """Render the annotated receipts PDF. Returns the page count written."""
     if not lines:
         raise ValueError("No receipt lines are available for annotation")
+
+    if strategy == "banner_grid":
+        return _render_banner_grid_layout(lines, output_path)
 
     if strategy == "grid":
         return _render_grid_layout(lines, output_path)

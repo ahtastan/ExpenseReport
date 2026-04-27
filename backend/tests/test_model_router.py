@@ -2,12 +2,15 @@
 
 The router must:
   - call the full vision model exactly once on the happy path;
-  - return the first-pass fields when supplier is non-sentinel
-    (including when supplier itself is null — null is not ambiguity);
-  - retry with the stricter merchant-only prompt ONLY when the first
-    pass returns the ``UNREADABLE_MERCHANT`` sentinel for supplier;
+  - retry with the stricter merchant-only prompt when the first-pass
+    supplier is missing — the ``UNREADABLE_MERCHANT`` sentinel,
+    ``None``, or an empty/whitespace string — since all three shapes
+    mean the model couldn't read the merchant masthead;
   - on retry, swap supplier from the retry response while preserving
     first-pass date / amount / currency / receipt_type;
+  - NOT retry on missing date or missing amount — the merchant-only
+    retry can't recover those fields, and re-extracting them would
+    risk overwriting valid data with a second guess;
   - return ``None`` when the first-pass call itself produced no
     parseable response (no retry on transient API failure — retry is
     scoped to merchant ambiguity, per the F1.3 PM directive).
@@ -95,20 +98,56 @@ def test_missing_date_does_not_trigger_retry(tmp_path, monkeypatch):
     assert result.fields["date"] is None
 
 
-def test_null_supplier_does_not_trigger_retry(tmp_path, monkeypatch):
-    """A plain null supplier (model returned no value) must not trigger
-    the merchant-only retry. The retry is reserved for the explicit
-    ``UNREADABLE_MERCHANT`` abstention sentinel — null means the model
-    didn't say anything, not that it abstained."""
+def test_null_supplier_triggers_merchant_only_retry(tmp_path, monkeypatch):
+    """A null supplier means the model couldn't read the merchant — the
+    same condition the explicit sentinel signals. F1.3 patch: retry on
+    null supplier as well as on the sentinel. The retry is merchant-only
+    and preserves first-pass date / amount / currency, so it cannot
+    blank good fields — making it safe to fire on the broader
+    "supplier missing" signal."""
     rec = _Recorder([
-        {"date": "2026-04-01", "supplier": None, "amount": 42.5, "currency": "TRY"},
+        {"date": "2026-04-01", "supplier": None, "amount": 42.5,
+         "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "Migros"},
     ])
     monkeypatch.setattr(model_router, "_vision_call", rec)
     result = model_router.vision_extract(str(_fake_image(tmp_path)))
     assert result is not None
-    assert result.escalated is False
-    assert rec.calls == [model_router.VISION_MODEL]
-    assert result.fields["supplier"] is None
+    assert result.escalated is True
+    assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    # Supplier comes from the retry; date/amount/currency/receipt_type
+    # all preserved from the first pass.
+    assert result.fields["supplier"] == "Migros"
+    assert result.fields["date"] == "2026-04-01"
+    assert result.fields["amount"] == 42.5
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["receipt_type"] == "payment_receipt"
+
+
+def test_empty_string_supplier_triggers_merchant_only_retry(tmp_path, monkeypatch):
+    """An empty (or whitespace-only) supplier string is the same kind of
+    "couldn't read the masthead" signal as null. F1.3 patch: trigger the
+    merchant-only retry. Whitespace-only strings are tested too because
+    a model that emits a literal space character is functionally
+    identical to one that emits nothing."""
+    for empty_supplier in ("", "   ", "\t"):
+        rec = _Recorder([
+            {"date": "2026-04-01", "supplier": empty_supplier, "amount": 42.5,
+             "currency": "TRY"},
+            {"supplier": "Migros"},
+        ])
+        monkeypatch.setattr(model_router, "_vision_call", rec)
+        result = model_router.vision_extract(str(_fake_image(tmp_path)))
+        assert result is not None, f"empty supplier {empty_supplier!r} returned None"
+        assert result.escalated is True, (
+            f"empty supplier {empty_supplier!r} did not trigger retry"
+        )
+        assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+        assert result.fields["supplier"] == "Migros"
+        # First-pass date/amount/currency preserved across retry.
+        assert result.fields["date"] == "2026-04-01"
+        assert result.fields["amount"] == 42.5
+        assert result.fields["currency"] == "TRY"
 
 
 def test_first_pass_unavailable_returns_none_without_retry(tmp_path, monkeypatch):

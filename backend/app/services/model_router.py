@@ -22,12 +22,13 @@ OCR pipeline (implemented in ``vision_extract``):
   2. if critical fields are still missing, caller invokes ``vision_extract``;
   3. ``vision_extract`` runs the standard prompt against ``VISION_MODEL``
      and reads date / amount / supplier / receipt_type normally;
-  4. ONLY when supplier comes back as the ``UNREADABLE_MERCHANT``
-     sentinel does the router retry against the same ``VISION_MODEL``
-     with a STRICTER merchant-only prompt. The retry rewrites supplier
-     ONLY — first-pass date / amount / currency / receipt_type are
-     preserved verbatim. A retry never blanks a date or amount that
-     the first pass extracted.
+  4. when the first-pass supplier is missing — the ``UNREADABLE_MERCHANT``
+     sentinel, ``None``, or an empty string — the router retries against
+     the same ``VISION_MODEL`` with a STRICTER merchant-only prompt. The
+     retry rewrites supplier ONLY; first-pass date / amount / currency /
+     receipt_type are preserved verbatim. A missing date or amount on the
+     first pass does NOT trigger the retry — the retry exists for
+     merchant ambiguity only and would not re-extract those fields.
 
 The real model identifiers are env-driven so non-production environments
 can point at fakes/stubs without code changes.
@@ -239,6 +240,31 @@ def _count_missing(fields: dict[str, Any]) -> list[str]:
 
 def _is_unreadable_merchant_sentinel(value: Any) -> bool:
     return isinstance(value, str) and value.strip().upper() == UNREADABLE_MERCHANT_SENTINEL
+
+
+def _supplier_needs_merchant_retry(value: Any) -> bool:
+    """True when the first-pass supplier value should trigger the
+    merchant-only retry.
+
+    The retry exists to recover the merchant masthead when the first
+    pass couldn't read it. Three first-pass shapes count as "couldn't
+    read it":
+      - the explicit ``UNREADABLE_MERCHANT`` abstention sentinel;
+      - a literal ``None`` (model emitted no value);
+      - an empty / whitespace-only string.
+
+    The retry is merchant-only and preserves first-pass date / amount /
+    currency / receipt_type, so it cannot blank good fields — making
+    it safe to fire on the broader "supplier missing" signal, not just
+    the explicit sentinel.
+    """
+    if _is_unreadable_merchant_sentinel(value):
+        return True
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
 
 
 def _normalize_unreadable_supplier(fields: dict[str, Any]) -> dict[str, Any]:
@@ -782,16 +808,19 @@ def vision_extract(storage_path: str) -> VisionResult | None:
       1. Call the full vision model with ``_VISION_PROMPT`` and read all
          fields (date, amount, supplier, currency, business_or_personal,
          receipt_type) from the response.
-      2. If supplier comes back as the ``UNREADABLE_MERCHANT`` sentinel,
-         retry the same model with ``_VISION_PROMPT_STRICT`` (merchant-
-         only) and merge the retry's supplier over the first-pass result.
-         First-pass date / amount / currency / receipt_type are
-         preserved across the retry — supplier ambiguity must NEVER blank
-         a date or amount that the first pass extracted.
-      3. Any other shape of first-pass result (null supplier, missing
-         amount, missing date) is returned as-is. The retry is scoped
-         to merchant ambiguity per F1.3; do not blank or re-extract
-         date / amount unless the model genuinely could not read them.
+      2. If the first-pass supplier is missing — the
+         ``UNREADABLE_MERCHANT`` sentinel, ``None``, or an empty
+         string — retry the same model with ``_VISION_PROMPT_STRICT``
+         (merchant-only) and merge the retry's supplier over the
+         first-pass result. First-pass date / amount / currency /
+         receipt_type are preserved across the retry — supplier
+         ambiguity must NEVER blank a date or amount that the first
+         pass extracted.
+      3. A missing amount or missing date on the first pass does NOT
+         trigger the retry. The retry is merchant-only and would not
+         re-extract those fields anyway; a null amount or null date
+         is reported as-is rather than papered over with a second
+         guess.
 
     Returns ``None`` when the file is unsupported or the first-pass
     model call itself produced no parseable response.
@@ -823,7 +852,7 @@ def vision_extract(storage_path: str) -> VisionResult | None:
         return None
 
     first_supplier = first_fields.get("supplier")
-    if not _is_unreadable_merchant_sentinel(first_supplier):
+    if not _supplier_needs_merchant_retry(first_supplier):
         notes.append(f"Vision extraction succeeded on first pass ({VISION_MODEL}).")
         return VisionResult(
             fields=_normalize_unreadable_supplier(first_fields),
@@ -833,8 +862,14 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     # Supplier-only ambiguity → run stricter merchant-only retry. Date and
     # amount from the first pass stand: a supplier-side problem must never
     # blank fields that were already extracted cleanly.
+    if _is_unreadable_merchant_sentinel(first_supplier):
+        retry_reason = f"reported {UNREADABLE_MERCHANT_SENTINEL} for supplier"
+    elif first_supplier is None:
+        retry_reason = "returned null supplier"
+    else:
+        retry_reason = "returned empty/whitespace supplier"
     notes.append(
-        f"First pass ({VISION_MODEL}) reported {UNREADABLE_MERCHANT_SENTINEL} for supplier; "
+        f"First pass ({VISION_MODEL}) {retry_reason}; "
         "retrying merchant extraction with stricter prompt (date/amount preserved)."
     )
     retry_fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_STRICT)

@@ -59,10 +59,19 @@ def _line(*, day: int = 17, supplier: str = "Test", amount: float = 100.0,
 # ---------------------------------------------------------------------------
 
 
-def test_default_strategy_is_banner_grid() -> None:
-    """Bug 4: banner_grid replaces day_grouped_colored as the default. Old
-    strategies remain callable explicitly."""
-    assert DEFAULT_STRATEGY == "banner_grid"
+def test_banner_grid_strategy_remains_callable_explicitly() -> None:
+    """banner_grid was the default in PR #33 (Bug 4) and is now demoted to
+    a legacy strategy by paired_card (Layout D from Claude Design). The
+    strategy still ships and stays callable behind the explicit flag —
+    its end-to-end render is exercised in
+    test_create_annotated_receipts_pdf_legacy_banner_grid_still_works in
+    test_receipt_annotations_paired_card.py.
+    """
+    # paired_card is the new default (asserted in test_default_strategy_is_paired_card).
+    assert DEFAULT_STRATEGY != "banner_grid"
+    # banner_grid is still a recognized strategy keyword.
+    from app.services.receipt_annotations import _render_banner_grid_layout
+    assert callable(_render_banner_grid_layout)
 
 
 # ---------------------------------------------------------------------------

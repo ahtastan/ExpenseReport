@@ -698,8 +698,15 @@ def test_hotel_folio_multi_page_counts_as_one_for_grouping(tmp_path):
     assert len(groups[0]) == 8
 
     # And the render actually emits >1 page for the group (grid page + folio extras).
+    # This test documents legacy day_grouped_colored multi-page-folio behavior:
+    # a 3-page hotel folio gets a legend page + day grid + 2 extra folio
+    # continuation pages (≥ 3 total). Under the new paired_card default,
+    # multi-page folios collapse to a single full-A4 exception slot, so we
+    # invoke the legacy strategy explicitly to preserve the test's intent.
     out = tmp_path / "annot.pdf"
-    page_count = create_annotated_receipts_pdf(lines, out)
+    page_count = create_annotated_receipts_pdf(
+        lines, out, strategy="day_grouped_colored",
+    )
     # Legend (1) + day grid (1) + 2 extra folio pages = at least 4.
     assert page_count >= 3, f"expected ≥3 pages, got {page_count}"
 

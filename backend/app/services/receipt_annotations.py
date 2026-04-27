@@ -56,12 +56,12 @@ MAX_RECEIPTS_PER_DAY_GROUP = 9
 PDF_RASTER_DPI = 180
 PDF_MAX_PAGES = 10
 
-DEFAULT_STRATEGY = "banner_grid"
+DEFAULT_STRATEGY = "paired_card"
 
-# ─── Banner-grid layout constants (Bug 4 — Carolyn's reference) ───────────────
-# 3x3 grid with full-width green banner overlaying the top of each receipt
-# thumbnail. The banner carries amount + date + supplier so an EDT auditor
-# can scan a page without flipping back to a legend.
+# ─── Banner-grid layout constants (legacy — Carolyn's reference banner) ───────
+# Kept callable behind strategy="banner_grid" but no longer the default. The
+# new default ``paired_card`` (Layout D from Claude Design) is the EDT-style
+# B&W audit annex.
 
 BANNER_HEIGHT_PX = 160                  # ~1.5cm at 300 DPI; sized for two text lines
 BANNER_BG_HEX = "#2ca02c"               # Tableau green; matches reference PDF
@@ -71,6 +71,73 @@ BANNER_INNER_PAD_Y_TOP = 12             # space above first text line
 BANNER_LINE_GAP_PX = 56                 # vertical gap between line 1 and line 2
 THIN_BORDER_HEX = "#bdbdbd"             # 2px gray hairline around each thumb
 THIN_BORDER_WIDTH_PX = 2
+
+# ─── Paired-card layout constants (Layout D from Claude Design handoff) ───────
+# A4 portrait, 3x3 grid of "paired cards" — left half is the receipt thumbnail
+# and a small "Rxx" corner ID, right half is an info column with amount /
+# date / supplier / bucket+xlsx-ref / Business-Personal tag, plus an optional
+# GROUP X/Y line at the bottom when 2+ receipts share a single XLSX line.
+# B&W only: thin black rules + hatching for accent. Helvetica + JetBrains Mono
+# (fallback to system sans/mono per ``_font``).
+#
+# Design used 794×1123px @ 96dpi ⇒ 300dpi scale factor ≈ 3.124. Constants
+# below are pre-scaled to 300dpi so PIL renders at print resolution.
+
+INK_HEX = "#111111"          # primary text + rules (--ink)
+INK_2_HEX = "#2B2B2B"        # secondary text (--ink-2)
+INK_3_HEX = "#6B6B6B"        # tertiary / metadata (--ink-3)
+RULE_SOFT_HEX = "#C9C9C9"    # sub-rules (--rule-soft)
+PAPER_HEX = "#FFFFFF"        # background (--paper)
+
+# Page geometry (300 DPI, scaled from design's 96dpi 794×1123 = 36px margin).
+# All paired-card-specific so we don't disturb the existing MARGIN_X/Y
+# constants used by legacy strategies.
+PC_MARGIN_X = 113            # ~36 design px × 3.124
+PC_MARGIN_Y = 113
+PC_HEADER_TOP_Y = 56         # ~18 design px × 3.124  (running-header strip)
+PC_HEADER_BAND_Y = 125       # ~40 design px (RECEIPT ANNEX | period)
+PC_FOOTER_BOTTOM_Y = 56      # symmetric to header
+PC_GRID_TOP_Y = 256           # below the RECEIPT ANNEX header band
+PC_GRID_BOTTOM_Y = A4_HEIGHT - 90   # leaves room for footer
+
+PC_COLS = 3
+PC_GAP_PX = 25                # ~8 design px
+PC_GRID_WIDTH = A4_WIDTH - 2 * PC_MARGIN_X
+PC_CELL_WIDTH = (PC_GRID_WIDTH - PC_GAP_PX * (PC_COLS - 1)) // PC_COLS
+PC_CELL_HEIGHT = 1006         # ~322 design px × 3.124
+PC_CARD_BORDER_WIDTH = 3      # ~1pt at 300dpi (≈ 1.04pt/px)
+
+PC_THUMB_SIDE_PCT = 0.50      # left half is receipt thumbnail
+PC_INFO_PADDING_X = 28
+PC_INFO_PADDING_Y = 28
+
+# Bucket → Page 1A row mapping, for the "WKS NN-NN, ROW N" xlsx-ref label
+# under each card's bucket line. Mirrors the row layout in
+# report_generator._fill_workbook's fill_a().
+_BUCKET_TO_PAGE_1A_ROW: dict[str, int] = {
+    "Airfare/Bus/Ferry/Other": 7,
+    "Hotel/Lodging/Laundry": 8,
+    "Auto Rental": 9,
+    "Auto Gasoline": 10,
+    "Taxi/Parking/Tolls/Uber": 11,
+    "Other Travel Related": 14,
+    "Membership/Subscription Fees": 18,
+    "Customer Gifts": 19,
+    "Telephone/Internet": 20,
+    "Postage/Shipping": 21,
+    "Admin Supplies": 22,
+    "Lab Supplies": 23,
+    "Field Service Supplies": 24,
+    "Assets": 25,
+    "Other": 26,
+    "Meals/Snacks": 29,
+    "Breakfast": 30,
+    "Lunch": 31,
+    "Dinner": 32,
+    "Entertainment": 35,
+}
+
+_HOTEL_BUCKETS: frozenset[str] = frozenset({"Hotel/Lodging/Laundry"})
 
 # Tableau 10 palette — colorblind-aware, print-safe, max differentiation.
 LINE_COLOR_PALETTE: tuple[str, ...] = (
@@ -139,6 +206,52 @@ FONT_LEGEND_ENTRY = _font("arial.ttf", 42)
 # padding at the cell width of ~800 px.
 FONT_BANNER_AMOUNT = _font("arialbd.ttf", 44)  # line 1: "USD $X.XX | TRY YYY.YY"
 FONT_BANNER_META = _font("arial.ttf", 30)      # line 2: "DATE | SUPPLIER | B/P"
+
+# Paired-card fonts (Layout D). Sizes scaled from the design's pt sizes at
+# 300 DPI: 1pt ≈ 4.17 px. Helvetica Neue / Arial bold + JetBrains Mono
+# regular & bold. Falls back to ImageFont.load_default if no .ttf installed
+# (CI/headless containers without system fonts).
+def _font_first_available(names: tuple[str, ...], size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Try each font name in order; return the first that loads, else default.
+
+    Lets us prefer JetBrains Mono if present (matches the design exactly),
+    fall through to Roboto Mono / Menlo / Consolas / generic mono as
+    available on the host. Important on Windows-only dev boxes that don't
+    have JetBrains Mono installed by default.
+    """
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+_SANS_BOLD = ("Helvetica-Bold.ttf", "HelveticaNeue-Bold.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf")
+_SANS = ("Helvetica.ttf", "HelveticaNeue.ttf", "arial.ttf", "DejaVuSans.ttf")
+_MONO_BOLD = ("JetBrainsMono-Bold.ttf", "JetBrainsMonoNL-Bold.ttf", "RobotoMono-Bold.ttf", "consolab.ttf", "DejaVuSansMono-Bold.ttf")
+_MONO = ("JetBrainsMono-Regular.ttf", "JetBrainsMonoNL-Regular.ttf", "RobotoMono-Regular.ttf", "consola.ttf", "DejaVuSansMono.ttf")
+
+# Card body fonts (per design D)
+FONT_PC_AMOUNT_USD = _font_first_available(_MONO_BOLD, 42)    # 10pt mono bold
+FONT_PC_AMOUNT_TRY = _font_first_available(_MONO_BOLD, 35)    # 8.5pt mono bold
+FONT_PC_DATE = _font_first_available(_MONO, 35)               # 8.5pt mono
+FONT_PC_SUPPLIER = _font_first_available(_SANS_BOLD, 35)      # 8.5pt sans bold uppercase
+FONT_PC_BUCKET = _font_first_available(_SANS, 29)             # 7pt uppercase
+FONT_PC_TAG = _font_first_available(_MONO, 29)                # 7pt mono uppercase
+FONT_PC_GROUP = _font_first_available(_MONO_BOLD, 31)         # 7.5pt mono bold uppercase
+FONT_PC_CORNER_ID = _font_first_available(_MONO, 27)          # 6.5pt mono uppercase
+
+# Page chrome fonts
+FONT_PC_RUNHEAD = _font_first_available(_MONO, 31)            # 7.5pt mono uppercase
+FONT_PC_RUNFOOT = _font_first_available(_MONO, 29)            # 7pt mono uppercase
+FONT_PC_BAND_TITLE = _font_first_available(_SANS_BOLD, 42)    # 10pt sans bold uppercase
+FONT_PC_BAND_META = _font_first_available(_MONO, 31)          # 7.5pt mono uppercase
+FONT_PC_FULL_AMOUNT = _font_first_available(_MONO_BOLD, 54)   # 13pt mono bold (full-page exception)
+FONT_PC_FULL_LOCAL = _font_first_available(_MONO_BOLD, 42)    # 10pt
+FONT_PC_FULL_DATE = _font_first_available(_MONO, 38)          # 9pt
+FONT_PC_FULL_SUPPLIER = _font_first_available(_SANS_BOLD, 42) # 10pt sans bold
+FONT_PC_FULL_BUCKET = _font_first_available(_SANS, 33)        # 8pt
+FONT_PC_FULL_NOTE_ITALIC = _font_first_available(_SANS, 35)   # 8.5pt italic-ish
 
 
 # ─── Line keys, color assignment, grouping ────────────────────────────────────
@@ -811,6 +924,760 @@ def _render_banner_grid_layout(
     return len(pages)
 
 
+# ─── Paired-card layout (Layout D — Claude Design handoff) ───────────────────
+
+
+@dataclass(frozen=False)
+class _PairedCardContext:
+    """One receipt in the paired-card stream.
+
+    Mutable so we can attach the short_id ("R01" etc.) after sorting + the
+    multi-page flag after probing the file. ``group_*`` fields describe the
+    XLSX line this receipt belongs to: ``group_count`` is how many receipts
+    share the same review_row_id (and therefore the same XLSX row), and
+    ``group_total_usd`` is the sum of those receipts' USD amounts. When
+    ``group_count == 1``, the bottom of the card omits the GROUP X/Y line.
+    """
+    line: ReceiptAnnotationLine
+    group_index: int
+    group_count: int
+    group_total_usd: float
+    xlsx_ref: str
+    short_id: str = ""
+    multi_page: bool = False
+
+
+def _bucket_to_xlsx_ref(bucket: str | None, week_label: str) -> str:
+    """Format the under-bucket label, e.g. ``'WKS 41-43, ROW 32'``.
+
+    Falls back to ``ROW 26`` (the catch-all "Other" row on Page 1A) when
+    the bucket isn't in the static map — e.g. operator typed a custom
+    bucket name during a manual edit.
+    """
+    row = _BUCKET_TO_PAGE_1A_ROW.get((bucket or "").strip(), 26)
+    return f"WKS {week_label}, ROW {row}"
+
+
+def _iso_week_label(lines: list[ReceiptAnnotationLine]) -> str:
+    """Return e.g. ``'41-43'`` for the ISO-week range spanning the receipts.
+
+    Single-week input returns just ``'41'``. Used in the page chrome and
+    in each card's xlsx_ref label.
+    """
+    if not lines:
+        return "??"
+    weeks = sorted({ln.transaction_date.isocalendar()[1] for ln in lines})
+    if len(weeks) == 1:
+        return f"{weeks[0]}"
+    return f"{weeks[0]}-{weeks[-1]}"
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    """Tail-cut with ellipsis for cell-bound strings (supplier name, etc.).
+
+    Mirrors the design's ``truncate(s, n=25)`` helper. We use a real
+    ellipsis character (single glyph) so the rendered width is more
+    predictable than ``...``.
+    """
+    if not text:
+        return ""
+    return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
+
+
+def _draw_text_safe(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    *,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    fill: str = INK_HEX,
+) -> None:
+    """Wrapper around ``draw.text`` that swallows None/empty silently.
+
+    Lets card-rendering code stay readable without ``if value:`` guards
+    around every optional field.
+    """
+    if not text:
+        return
+    draw.text(xy, text, fill=fill, font=font)
+
+
+def _is_hotel_bucket(bucket: str | None) -> bool:
+    return (bucket or "").strip() in _HOTEL_BUCKETS
+
+
+def _detect_multi_page(line: ReceiptAnnotationLine) -> bool:
+    """True iff the receipt is a multi-page PDF (hotel folio)."""
+    pages = _load_receipt_pages(line)
+    return bool(pages) and len(pages) > 1
+
+
+def _build_paired_card_stream(
+    lines: list[ReceiptAnnotationLine],
+    week_label: str,
+) -> list[_PairedCardContext]:
+    """Build the paired-card stream with group context attached.
+
+    Group key: ``review_row_id`` — receipts that share an XLSX line (e.g.
+    a split-bill dinner across two card transactions) appear with
+    ``group_count > 1`` and matching ``group_total_usd``. Receipts with no
+    review_row_id are grouped each-in-its-own-row (singleton groups).
+
+    Returned list is sorted by (transaction_date, receipt_id) so the
+    paginator can chunk in chronological order. ``short_id`` ("R01"…) is
+    assigned after sort.
+    """
+    by_row: dict[object, list[ReceiptAnnotationLine]] = {}
+    for line in lines:
+        # Use review_row_id as the group key; receipts without one are
+        # treated as their own singleton group (id-keyed by transaction_id).
+        key = line.review_row_id if line.review_row_id is not None else f"_solo_{line.transaction_id}"
+        by_row.setdefault(key, []).append(line)
+
+    stream: list[_PairedCardContext] = []
+    for members in by_row.values():
+        members.sort(key=lambda m: (m.transaction_date, m.receipt_id or 0))
+        group_total = sum(float(m.amount) for m in members)
+        for idx, member in enumerate(members, start=1):
+            stream.append(_PairedCardContext(
+                line=member,
+                group_index=idx,
+                group_count=len(members),
+                group_total_usd=group_total,
+                xlsx_ref=_bucket_to_xlsx_ref(member.report_bucket, week_label),
+            ))
+
+    stream.sort(key=lambda c: (c.line.transaction_date, c.line.receipt_id or 0))
+
+    for i, ctx in enumerate(stream, start=1):
+        ctx.short_id = f"R{i:02d}"
+        ctx.multi_page = _detect_multi_page(ctx.line)
+
+    return stream
+
+
+def _format_pc_amount_usd(line: ReceiptAnnotationLine) -> str:
+    """Top of card: 'USD $X.XX' (mono bold). Currency-agnostic fallback."""
+    amt = float(line.amount or 0.0)
+    if (line.currency or "").upper() == "USD":
+        return f"USD ${amt:,.2f}"
+    return f"{line.currency or ''} {amt:,.2f}".strip()
+
+
+def _format_pc_amount_local(line: ReceiptAnnotationLine) -> str:
+    """Second line: 'TRY YYY.YY' if local-currency anchor differs from
+    report currency. Empty when the local leg matches the USD leg or is
+    absent (manual entry receipts).
+    """
+    if line.local_amount is None or not line.local_currency:
+        return ""
+    if (line.local_currency or "").upper() == (line.currency or "").upper():
+        return ""
+    return f"{line.local_currency} {float(line.local_amount):,.2f}"
+
+
+def _format_pc_supplier(line: ReceiptAnnotationLine) -> str:
+    return _truncate((line.supplier or "").upper(), 25)
+
+
+def _draw_paired_card(
+    page: Image.Image,
+    ctx: _PairedCardContext,
+    *,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+) -> None:
+    """Render one paired card at (x, y) with width w and height h.
+
+    Card border: 1pt ink. Vertical divider between left thumb and right
+    info column: 0.75pt ink. Two halves are 50/50 by design (PC_THUMB_SIDE_PCT).
+
+    Right info column field stack (top to bottom):
+      1. Amount line (USD $X.XX)
+      2. Local-currency line (TRY YYY.YY) — omitted when local==report
+      3. Soft hairline rule
+      4. Date (YYYY-MM-DD)
+      5. Supplier (uppercase, truncated to 25 chars)
+      6. Bucket — WKS NN-NN, ROW N (uppercase, gray)
+      7. (flex spacer)
+      8. BUSINESS / PERSONAL tag
+      9. (only if group_count >= 2) GROUP X/Y — TOTAL $XX.XX with 1pt top rule
+    """
+    draw = ImageDraw.Draw(page)
+    line = ctx.line
+
+    # Card border.
+    draw.rectangle((x, y, x + w - 1, y + h - 1), outline=INK_HEX, width=PC_CARD_BORDER_WIDTH)
+
+    # Left half — receipt thumbnail (centered, letterboxed) + corner ID.
+    thumb_w = int(w * PC_THUMB_SIDE_PCT)
+    info_x = x + thumb_w
+    # Vertical divider between halves.
+    draw.line(
+        ((info_x, y + 1), (info_x, y + h - 2)),
+        fill=INK_HEX, width=2,
+    )
+
+    # Receipt image: load page 1, scale into an inset box (~78% of half-width)
+    # matching the design's letterbox proportions.
+    receipt_pages = _load_receipt_pages(line) or [_placeholder_tile(line, "no file")]
+    inset_w = int(thumb_w * 0.78)
+    inset_h = h - 50
+    img = receipt_pages[0].copy()
+    img.thumbnail((inset_w, inset_h), Image.Resampling.LANCZOS)
+    img_x = x + (thumb_w - img.width) // 2
+    img_y = y + (h - img.height) // 2
+    page.paste(img, (img_x, img_y))
+
+    # Corner ID badge (top-left of left half), e.g. "R01"
+    _draw_text_safe(
+        draw, (x + 14, y + 14),
+        ctx.short_id,
+        font=FONT_PC_CORNER_ID,
+        fill=INK_3_HEX,
+    )
+
+    # Right half — info column.
+    cx = info_x + PC_INFO_PADDING_X
+    cy = y + PC_INFO_PADDING_Y
+    info_right = x + w - PC_INFO_PADDING_X
+
+    # 1. USD amount (10pt mono bold)
+    _draw_text_safe(draw, (cx, cy), _format_pc_amount_usd(line), font=FONT_PC_AMOUNT_USD)
+    cy += 50
+
+    # 2. Local-currency amount (8.5pt mono bold) — when present + different.
+    local = _format_pc_amount_local(line)
+    if local:
+        _draw_text_safe(draw, (cx, cy), local, font=FONT_PC_AMOUNT_TRY)
+    cy += 42
+
+    # 3. Soft hairline rule.
+    draw.line(((cx, cy), (info_right, cy)), fill=RULE_SOFT_HEX, width=1)
+    cy += 22
+
+    # 4. Date.
+    _draw_text_safe(draw, (cx, cy), line.transaction_date.isoformat(), font=FONT_PC_DATE)
+    cy += 50
+
+    # 5. Supplier (uppercase, truncated).
+    _draw_text_safe(draw, (cx, cy), _format_pc_supplier(line), font=FONT_PC_SUPPLIER)
+    cy += 50
+
+    # 6. Bucket — xlsx ref (uppercase, gray).
+    bucket_label = (line.report_bucket or "OTHER").upper()
+    bucket_text = f"{bucket_label} — {ctx.xlsx_ref}"
+    _draw_text_safe(draw, (cx, cy), bucket_text, font=FONT_PC_BUCKET, fill=INK_2_HEX)
+
+    # — Bottom-anchored: BUSINESS/PERSONAL tag + optional GROUP line —
+    # Tag and group line live near the bottom of the card; compute up from y+h.
+    bottom = y + h - PC_INFO_PADDING_Y
+    if ctx.group_count >= 2:
+        # Group line height: ~38px text + 8px top rule + 8px gap.
+        group_block_h = 60
+        group_y = bottom - group_block_h
+        # 1pt top rule.
+        draw.line(((cx, group_y), (info_right, group_y)), fill=INK_HEX, width=3)
+        group_text = (
+            f"GROUP {ctx.group_index}/{ctx.group_count} — "
+            f"TOTAL ${ctx.group_total_usd:,.2f}"
+        )
+        _draw_text_safe(draw, (cx, group_y + 18), group_text, font=FONT_PC_GROUP)
+        bottom = group_y - 10
+
+    # Tag (above group line if present).
+    bp = (line.business_or_personal or "").strip().upper() or "BUSINESS"
+    tag_text = "BUSINESS" if bp == "BUSINESS" else "PERSONAL"
+    tag_y = bottom - 38
+    _draw_paired_card_tag(
+        draw,
+        x=cx, y=tag_y,
+        text=tag_text,
+        solid=(tag_text == "BUSINESS"),
+    )
+
+
+def _draw_paired_card_tag(
+    draw: ImageDraw.ImageDraw,
+    *,
+    x: int,
+    y: int,
+    text: str,
+    solid: bool,
+) -> None:
+    """Draw a small uppercase tag like 'BUSINESS' (solid black) or
+    'PERSONAL' (outline only). 0.5pt border, 1px×5px padding per design.
+    """
+    pad_x, pad_y = 14, 6
+    bbox = draw.textbbox((0, 0), text, font=FONT_PC_TAG)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    box_w = text_w + 2 * pad_x
+    box_h = text_h + 2 * pad_y
+
+    if solid:
+        draw.rectangle(
+            (x, y, x + box_w, y + box_h),
+            fill=INK_HEX, outline=INK_HEX, width=2,
+        )
+        draw.text((x + pad_x, y + pad_y - 4), text, fill=PAPER_HEX, font=FONT_PC_TAG)
+    else:
+        draw.rectangle(
+            (x, y, x + box_w, y + box_h),
+            fill=PAPER_HEX, outline=INK_HEX, width=2,
+        )
+        draw.text((x + pad_x, y + pad_y - 4), text, fill=INK_HEX, font=FONT_PC_TAG)
+
+
+def _draw_paired_card_chrome(
+    page: Image.Image,
+    *,
+    page_no: int,
+    page_of: int,
+    layout_tag: str,
+    period_label: str,
+    receipt_count: int,
+    total_usd: float,
+    employee: str,
+    report_no: str,
+) -> None:
+    """Running header (top) + footer (bottom) drawn on every page.
+
+    Header: "EDT EXPENSE ANNEX · {report_no} · {employee}" left;
+            "{layout_tag} · BUSINESS · PAGE X/Y" right.
+    Footer: "PREPARED {date} · {N} RECEIPTS · ${TOTAL}" left; "X / Y" right.
+    """
+    draw = ImageDraw.Draw(page)
+    today_iso = date.today().isoformat()
+
+    head_left = f"EDT EXPENSE ANNEX · {report_no} · {employee}".upper()
+    head_right = f"{layout_tag} · BUSINESS · PAGE {page_no}/{page_of}"
+    _draw_text_safe(draw, (PC_MARGIN_X, PC_HEADER_TOP_Y), head_left,
+                    font=FONT_PC_RUNHEAD, fill=INK_3_HEX)
+
+    head_right_w = draw.textlength(head_right, font=FONT_PC_RUNHEAD)
+    _draw_text_safe(draw,
+                    (A4_WIDTH - PC_MARGIN_X - int(head_right_w), PC_HEADER_TOP_Y),
+                    head_right, font=FONT_PC_RUNHEAD, fill=INK_3_HEX)
+
+    # Footer
+    foot_left = (
+        f"PREPARED {today_iso} · {receipt_count} RECEIPTS · ${total_usd:,.2f}"
+    )
+    foot_right = f"{page_no} / {page_of}"
+    _draw_text_safe(draw, (PC_MARGIN_X, A4_HEIGHT - PC_FOOTER_BOTTOM_Y - 30),
+                    foot_left, font=FONT_PC_RUNFOOT, fill=INK_3_HEX)
+    foot_right_w = draw.textlength(foot_right, font=FONT_PC_RUNFOOT)
+    _draw_text_safe(draw,
+                    (A4_WIDTH - PC_MARGIN_X - int(foot_right_w),
+                     A4_HEIGHT - PC_FOOTER_BOTTOM_Y - 30),
+                    foot_right, font=FONT_PC_RUNFOOT, fill=INK_3_HEX)
+
+    # RECEIPT ANNEX band
+    band_y = PC_HEADER_BAND_Y + 50
+    _draw_text_safe(draw, (PC_MARGIN_X, band_y), "RECEIPT ANNEX",
+                    font=FONT_PC_BAND_TITLE)
+    band_meta = f"WKS {period_label} · {receipt_count} RECEIPTS · ${total_usd:,.2f}"
+    band_meta_w = draw.textlength(band_meta, font=FONT_PC_BAND_META)
+    _draw_text_safe(draw,
+                    (A4_WIDTH - PC_MARGIN_X - int(band_meta_w), band_y + 16),
+                    band_meta, font=FONT_PC_BAND_META, fill=INK_2_HEX)
+    # 1.5pt rule beneath the band.
+    rule_y = band_y + 60
+    draw.rectangle(
+        (PC_MARGIN_X, rule_y, A4_WIDTH - PC_MARGIN_X, rule_y + 4),
+        fill=INK_HEX,
+    )
+
+
+def _render_paired_card_grid_page(
+    chunk: list[_PairedCardContext],
+    *,
+    page_no: int,
+    page_of: int,
+    period_label: str,
+    receipt_count: int,
+    total_usd: float,
+    employee: str,
+    report_no: str,
+) -> Image.Image:
+    """Render a 3x3 grid page with up to 9 paired cards."""
+    page = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), PAPER_HEX)
+    _draw_paired_card_chrome(
+        page, page_no=page_no, page_of=page_of,
+        layout_tag="LAYOUT D · PAIRED CARD",
+        period_label=period_label,
+        receipt_count=receipt_count, total_usd=total_usd,
+        employee=employee, report_no=report_no,
+    )
+
+    grid_top = PC_GRID_TOP_Y
+    for idx, ctx in enumerate(chunk[:9]):
+        col = idx % PC_COLS
+        row = idx // PC_COLS
+        cx = PC_MARGIN_X + col * (PC_CELL_WIDTH + PC_GAP_PX)
+        cy = grid_top + row * (PC_CELL_HEIGHT + PC_GAP_PX)
+        _draw_paired_card(page, ctx, x=cx, y=cy, w=PC_CELL_WIDTH, h=PC_CELL_HEIGHT)
+    return page
+
+
+def _render_paired_card_full_page(
+    ctx: _PairedCardContext,
+    *,
+    page_no: int,
+    page_of: int,
+    period_label: str,
+    receipt_count: int,
+    total_usd: float,
+    employee: str,
+    report_no: str,
+    reason: str,
+) -> Image.Image:
+    """Full-A4 single-receipt page for hotel folios + multi-page receipts.
+
+    Top: header chrome (same as grid pages, but with a "FULL-PAGE EXCEPTION"
+    sub-band carrying the reason). Then a 3-column info strip with
+    amount/date/supplier/group. Then a large thumbnail filling the rest.
+    """
+    page = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), PAPER_HEX)
+    _draw_paired_card_chrome(
+        page, page_no=page_no, page_of=page_of,
+        layout_tag="LAYOUT D · FULL-PAGE RECEIPT",
+        period_label=period_label,
+        receipt_count=receipt_count, total_usd=total_usd,
+        employee=employee, report_no=report_no,
+    )
+
+    draw = ImageDraw.Draw(page)
+    line = ctx.line
+
+    # Sub-band: "FULL-PAGE EXCEPTION ... REASON: <reason>"
+    sub_y = PC_GRID_TOP_Y + 20
+    _draw_text_safe(draw, (PC_MARGIN_X, sub_y),
+                    "RECEIPT ANNEX · FULL-PAGE EXCEPTION",
+                    font=FONT_PC_BAND_TITLE)
+    reason_text = f"REASON: {reason}"
+    reason_w = draw.textlength(reason_text, font=FONT_PC_BAND_META)
+    _draw_text_safe(draw,
+                    (A4_WIDTH - PC_MARGIN_X - int(reason_w), sub_y + 16),
+                    reason_text, font=FONT_PC_BAND_META, fill=INK_2_HEX)
+    rule_y = sub_y + 60
+    draw.rectangle(
+        (PC_MARGIN_X, rule_y, A4_WIDTH - PC_MARGIN_X, rule_y + 4),
+        fill=INK_HEX,
+    )
+
+    # Info strip (3-column). Border 1pt; padding 14×10; 14px gap.
+    strip_top = rule_y + 30
+    strip_h = 280
+    strip_left = PC_MARGIN_X
+    strip_right = A4_WIDTH - PC_MARGIN_X
+    draw.rectangle(
+        (strip_left, strip_top, strip_right, strip_top + strip_h),
+        outline=INK_HEX, width=PC_CARD_BORDER_WIDTH,
+    )
+    col_w = (strip_right - strip_left) // 3
+
+    # Column 1: amount + date
+    c1x = strip_left + 30
+    c1y = strip_top + 30
+    _draw_text_safe(draw, (c1x, c1y), _format_pc_amount_usd(line),
+                    font=FONT_PC_FULL_AMOUNT)
+    local = _format_pc_amount_local(line)
+    if local:
+        _draw_text_safe(draw, (c1x, c1y + 70), local, font=FONT_PC_FULL_LOCAL)
+    _draw_text_safe(draw, (c1x, c1y + 140),
+                    line.transaction_date.isoformat(),
+                    font=FONT_PC_FULL_DATE, fill=INK_2_HEX)
+
+    # Column 2: supplier + bucket + tag
+    c2x = strip_left + col_w + 30
+    c2y = strip_top + 30
+    _draw_text_safe(draw, (c2x, c2y), _truncate((line.supplier or "").upper(), 32),
+                    font=FONT_PC_FULL_SUPPLIER)
+    bucket_label = (line.report_bucket or "OTHER").upper()
+    _draw_text_safe(draw, (c2x, c2y + 60),
+                    f"{bucket_label} — {ctx.xlsx_ref}",
+                    font=FONT_PC_FULL_BUCKET, fill=INK_2_HEX)
+    bp = (line.business_or_personal or "").strip().upper()
+    _draw_paired_card_tag(
+        draw, x=c2x, y=c2y + 130,
+        text="PERSONAL" if bp == "PERSONAL" else "BUSINESS",
+        solid=bp != "PERSONAL",
+    )
+
+    # Column 3: GROUP X/Y or "SOLE RECEIPT FOR LINE"
+    c3x = strip_left + 2 * col_w + 30
+    c3y = strip_top + 30
+    if ctx.group_count >= 2:
+        text = (
+            f"GROUP {ctx.group_index}/{ctx.group_count} — "
+            f"TOTAL ${ctx.group_total_usd:,.2f}"
+        )
+        _draw_text_safe(draw, (c3x, c3y), text, font=FONT_PC_GROUP)
+    else:
+        _draw_text_safe(draw, (c3x, c3y), "SOLE RECEIPT FOR LINE",
+                        font=FONT_PC_BAND_META, fill=INK_3_HEX)
+    if line.business_reason:
+        _draw_text_safe(draw, (c3x, c3y + 60),
+                        _truncate(line.business_reason, 80),
+                        font=FONT_PC_FULL_NOTE_ITALIC, fill=INK_2_HEX)
+
+    # Big thumbnail (multi-page receipts: render the first page; subsequent
+    # pages get their own _render_paired_card_full_page calls upstream so
+    # each PDF page maps to one receipt page).
+    big_top = strip_top + strip_h + 30
+    big_bottom = A4_HEIGHT - PC_FOOTER_BOTTOM_Y - 80
+    big_h = big_bottom - big_top
+    big_left = PC_MARGIN_X
+    big_right = A4_WIDTH - PC_MARGIN_X
+    big_w = big_right - big_left
+    draw.rectangle(
+        (big_left, big_top, big_right, big_bottom),
+        outline=INK_HEX, width=2,
+    )
+
+    pages = _load_receipt_pages(line) or [_placeholder_tile(line, "no file")]
+    big_img = pages[0].copy()
+    big_img.thumbnail((big_w - 30, big_h - 30), Image.Resampling.LANCZOS)
+    place_x = big_left + (big_w - big_img.width) // 2
+    place_y = big_top + (big_h - big_img.height) // 2
+    page.paste(big_img, (place_x, place_y))
+
+    return page
+
+
+def _render_paired_card_layout(
+    lines: list[ReceiptAnnotationLine],
+    output_path: Path,
+    *,
+    employee: str = "A.H. TASTAN",
+    report_no: str = "EDT-2025-WNN",
+) -> int:
+    """Render the paired-card PDF (Layout D from the Claude Design handoff).
+
+    Pagination strategy:
+      1. Build the stream from input lines, attaching group context
+         (review_row_id-keyed) and assigning short ids R01..RNN.
+      2. Split into ``grid_stream`` (regular receipts) and ``full_stream``
+         (hotel folios + multi-page PDFs).
+      3. Pack grid into 9-card pages. The last under-9 chunk is held as
+         ``remainder``.
+      4. If we have an exception AND remainder ≤ 3 cards: emit a MIXED
+         page (folio at top, spillover cards beneath). Remaining
+         exceptions emit one full-A4 page each.
+      5. Otherwise: emit remainder as its own grid page, then exceptions
+         as full-A4 pages.
+
+    Worked example matching the design: 11 receipts with one hotel folio →
+    1 grid page (9 cards) + 1 mixed page (folio + 1 spillover card OR
+    folio + remaining 2 cards). Total 2 pages. The spec says
+    "11 receipts → 2 A4 pages MAX" and this honors it.
+    """
+    if not lines:
+        raise ValueError("No receipt lines are available for annotation")
+
+    week_label = _iso_week_label(lines)
+    stream = _build_paired_card_stream(lines, week_label)
+
+    grid_stream = [c for c in stream if not (_is_hotel_bucket(c.line.report_bucket) or c.multi_page)]
+    full_stream = [c for c in stream if _is_hotel_bucket(c.line.report_bucket) or c.multi_page]
+
+    full_grid_pages: list[list[_PairedCardContext]] = []
+    remainder: list[_PairedCardContext] = []
+    chunk_size = 9
+    for i in range(0, len(grid_stream), chunk_size):
+        chunk = grid_stream[i : i + chunk_size]
+        if len(chunk) == chunk_size:
+            full_grid_pages.append(chunk)
+        else:
+            remainder = chunk
+
+    page_specs: list[tuple] = []
+    for chunk in full_grid_pages:
+        page_specs.append(("grid", chunk))
+
+    if full_stream and remainder and len(remainder) <= 3:
+        # Mixed page: first folio shares with the spillover.
+        page_specs.append(("mixed", full_stream[0], remainder))
+        for ctx in full_stream[1:]:
+            page_specs.append(("full", ctx))
+    else:
+        if remainder:
+            page_specs.append(("grid", remainder))
+        for ctx in full_stream:
+            page_specs.append(("full", ctx))
+
+    total = len(page_specs)
+    if total == 0:
+        # No data at all (shouldn't happen given non-empty check above) —
+        # emit a single blank page rather than crash on the PDF write.
+        total = 1
+        page_specs = [("grid", [])]
+
+    receipt_count = len(stream)
+    total_usd = sum(float(c.line.amount or 0.0) for c in stream)
+    rendered_pages: list[Image.Image] = []
+
+    for n, spec in enumerate(page_specs, start=1):
+        common = dict(
+            page_no=n, page_of=total,
+            period_label=week_label,
+            receipt_count=receipt_count,
+            total_usd=total_usd,
+            employee=employee,
+            report_no=report_no,
+        )
+        if spec[0] == "grid":
+            rendered_pages.append(_render_paired_card_grid_page(spec[1], **common))
+        elif spec[0] == "mixed":
+            rendered_pages.append(_render_paired_card_mixed_page(
+                spec[1], spec[2], **common,
+            ))
+        else:  # "full"
+            ctx = spec[1]
+            reason = (
+                "HOTEL FOLIO (MULTI-PAGE)"
+                if (_is_hotel_bucket(ctx.line.report_bucket) and ctx.multi_page)
+                else "HOTEL FOLIO"
+                if _is_hotel_bucket(ctx.line.report_bucket)
+                else "MULTI-PAGE RECEIPT"
+            )
+            rendered_pages.append(_render_paired_card_full_page(
+                ctx, reason=reason, **common,
+            ))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not rendered_pages:
+        rendered_pages = [Image.new("RGB", (A4_WIDTH, A4_HEIGHT), PAPER_HEX)]
+    rendered_pages[0].save(
+        output_path, save_all=True, append_images=rendered_pages[1:],
+    )
+    return len(rendered_pages)
+
+
+def _render_paired_card_mixed_page(
+    folio: _PairedCardContext,
+    spill: list[_PairedCardContext],
+    *,
+    page_no: int,
+    page_of: int,
+    period_label: str,
+    receipt_count: int,
+    total_usd: float,
+    employee: str,
+    report_no: str,
+) -> Image.Image:
+    """Mixed page: folio at top, spillover cards in a single grid row beneath.
+
+    Used when an exception (hotel folio / multi-page receipt) coexists with
+    a grid remainder of ≤ 3 cards. Saves one page over emitting them
+    separately.
+    """
+    page = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), PAPER_HEX)
+    _draw_paired_card_chrome(
+        page, page_no=page_no, page_of=page_of,
+        layout_tag="LAYOUT D · FOLIO + SPILLOVER",
+        period_label=period_label,
+        receipt_count=receipt_count, total_usd=total_usd,
+        employee=employee, report_no=report_no,
+    )
+    draw = ImageDraw.Draw(page)
+    line = folio.line
+
+    # Sub-band identifying the folio reason.
+    sub_y = PC_GRID_TOP_Y + 20
+    _draw_text_safe(draw, (PC_MARGIN_X, sub_y),
+                    "RECEIPT ANNEX · FULL-PAGE EXCEPTION + SPILLOVER",
+                    font=FONT_PC_BAND_TITLE)
+    reason = "HOTEL FOLIO (MULTI-PAGE)" if folio.multi_page else "HOTEL FOLIO"
+    reason_w = draw.textlength(f"REASON: {reason}", font=FONT_PC_BAND_META)
+    _draw_text_safe(draw,
+                    (A4_WIDTH - PC_MARGIN_X - int(reason_w), sub_y + 16),
+                    f"REASON: {reason}", font=FONT_PC_BAND_META, fill=INK_2_HEX)
+    rule_y = sub_y + 60
+    draw.rectangle(
+        (PC_MARGIN_X, rule_y, A4_WIDTH - PC_MARGIN_X, rule_y + 4),
+        fill=INK_HEX,
+    )
+
+    # Folio info strip (compressed).
+    strip_top = rule_y + 25
+    strip_h = 220
+    strip_left = PC_MARGIN_X
+    strip_right = A4_WIDTH - PC_MARGIN_X
+    draw.rectangle(
+        (strip_left, strip_top, strip_right, strip_top + strip_h),
+        outline=INK_HEX, width=PC_CARD_BORDER_WIDTH,
+    )
+    col_w = (strip_right - strip_left) // 3
+    c1x = strip_left + 30
+    c2x = strip_left + col_w + 30
+    cy_strip = strip_top + 25
+    _draw_text_safe(draw, (c1x, cy_strip), _format_pc_amount_usd(line),
+                    font=FONT_PC_FULL_AMOUNT)
+    local = _format_pc_amount_local(line)
+    if local:
+        _draw_text_safe(draw, (c1x, cy_strip + 60), local, font=FONT_PC_FULL_LOCAL)
+    _draw_text_safe(draw, (c1x, cy_strip + 120),
+                    line.transaction_date.isoformat(),
+                    font=FONT_PC_FULL_DATE, fill=INK_2_HEX)
+    _draw_text_safe(draw, (c2x, cy_strip),
+                    _truncate((line.supplier or "").upper(), 32),
+                    font=FONT_PC_FULL_SUPPLIER)
+    _draw_text_safe(draw, (c2x, cy_strip + 60),
+                    f"{(line.report_bucket or 'OTHER').upper()} — {folio.xlsx_ref}",
+                    font=FONT_PC_FULL_BUCKET, fill=INK_2_HEX)
+    _draw_paired_card_tag(
+        draw, x=c2x, y=cy_strip + 130, text="BUSINESS", solid=True,
+    )
+
+    # Folio thumbnail (half-height since we're sharing with spillover).
+    folio_top = strip_top + strip_h + 25
+    folio_bottom = folio_top + 1300
+    folio_left = PC_MARGIN_X
+    folio_right = A4_WIDTH - PC_MARGIN_X
+    folio_w = folio_right - folio_left
+    folio_h = folio_bottom - folio_top
+    draw.rectangle(
+        (folio_left, folio_top, folio_right, folio_bottom),
+        outline=INK_HEX, width=2,
+    )
+    pages_for_folio = _load_receipt_pages(line) or [_placeholder_tile(line, "no file")]
+    folio_img = pages_for_folio[0].copy()
+    folio_img.thumbnail((folio_w - 30, folio_h - 30), Image.Resampling.LANCZOS)
+    fx = folio_left + (folio_w - folio_img.width) // 2
+    fy = folio_top + (folio_h - folio_img.height) // 2
+    page.paste(folio_img, (fx, fy))
+
+    # Spillover divider.
+    spill_div_y = folio_bottom + 30
+    _draw_text_safe(draw, (PC_MARGIN_X, spill_div_y),
+                    "SPILLOVER — REMAINING RECEIPTS, DATE ORDER",
+                    font=FONT_PC_BAND_META)
+    count_text = f"{len(spill)} CARD{'S' if len(spill) != 1 else ''}"
+    count_w = draw.textlength(count_text, font=FONT_PC_BAND_META)
+    _draw_text_safe(draw,
+                    (A4_WIDTH - PC_MARGIN_X - int(count_w), spill_div_y),
+                    count_text, font=FONT_PC_BAND_META, fill=INK_3_HEX)
+    div_rule_y = spill_div_y + 36
+    draw.rectangle(
+        (PC_MARGIN_X, div_rule_y, A4_WIDTH - PC_MARGIN_X, div_rule_y + 4),
+        fill=INK_HEX,
+    )
+
+    # Spillover row (≤ 3 cards in one row).
+    spill_top = div_rule_y + 25
+    for idx, ctx in enumerate(spill[:3]):
+        cx = PC_MARGIN_X + idx * (PC_CELL_WIDTH + PC_GAP_PX)
+        _draw_paired_card(page, ctx, x=cx, y=spill_top,
+                          w=PC_CELL_WIDTH, h=PC_CELL_HEIGHT)
+
+    return page
+
+
 # ─── Public entry point ───────────────────────────────────────────────────────
 
 def create_annotated_receipts_pdf(
@@ -822,6 +1689,9 @@ def create_annotated_receipts_pdf(
     """Render the annotated receipts PDF. Returns the page count written."""
     if not lines:
         raise ValueError("No receipt lines are available for annotation")
+
+    if strategy == "paired_card":
+        return _render_paired_card_layout(lines, output_path)
 
     if strategy == "banner_grid":
         return _render_banner_grid_layout(lines, output_path)

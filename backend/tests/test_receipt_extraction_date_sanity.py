@@ -62,6 +62,13 @@ def test_date_sanity_rejects_old_date_without_statement_context() -> None:
     assert result.reason == "before_hard_floor"
 
 
+def test_date_sanity_rejects_date_after_hard_floor_but_older_than_18_months() -> None:
+    result = validate_receipt_date(date(2024, 6, 1), context=None, today=date(2026, 4, 27))
+
+    assert result.accepted is False
+    assert result.reason == "older_than_18_months"
+
+
 def test_date_sanity_accepts_statement_period_date() -> None:
     context = DateSanityContext(
         statement_import_id=123,
@@ -132,6 +139,7 @@ def test_implausible_first_pass_date_retries_and_saves_recovered_date(
                 "supplier": "YENI DUNYA TUR PET VE PET UR",
                 "amount": 175,
                 "currency": "TRY",
+                "receipt_type": "payment_receipt",
             },
             {"date": "2025-11-15"},
         ],
@@ -140,6 +148,9 @@ def test_implausible_first_pass_date_retries_and_saves_recovered_date(
     assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
     assert receipt.extracted_date == date(2025, 11, 15)
     assert receipt.extracted_local_amount == Decimal("175.0000")
+    assert receipt.extracted_currency == "TRY"
+    assert receipt.extracted_supplier == "YENI DUNYA TUR PET VE PET UR"
+    assert receipt.receipt_type == "payment_receipt"
     assert "receipt_date" not in question_keys
 
 
@@ -147,7 +158,10 @@ def test_implausible_retry_date_is_not_saved_and_asks_for_date(
     isolated_db,
     tmp_path,
     monkeypatch,
+    caplog,
 ) -> None:
+    caplog.set_level("WARNING", logger="app.services.receipt_extraction")
+
     receipt, question_keys, recorder = _extract_with_statement_context(
         isolated_db,
         tmp_path,
@@ -166,3 +180,4 @@ def test_implausible_retry_date_is_not_saved_and_asks_for_date(
     assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
     assert receipt.extracted_date is None
     assert "receipt_date" in question_keys
+    assert "retry_returned_date=2014-01-15" in caplog.text

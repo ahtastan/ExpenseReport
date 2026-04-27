@@ -254,10 +254,12 @@ def _log_date_rejection(
     context: DateSanityContext | None,
     *,
     recovered: bool,
+    retry_returned_date: date | None,
 ) -> None:
     logger.warning(
         "Receipt OCR date sanity rejected receipt_id=%s rejected_date=%s reason=%s "
-        "statement_import_id=%s statement_period=%s..%s date_retry_recovered=%s",
+        "statement_import_id=%s statement_period=%s..%s date_retry_recovered=%s "
+        "retry_returned_date=%s",
         receipt.id,
         rejected_date,
         result.reason,
@@ -265,6 +267,7 @@ def _log_date_rejection(
         context.period_start if context else None,
         context.period_end if context else None,
         recovered,
+        retry_returned_date,
     )
 
 
@@ -348,6 +351,7 @@ def extract_receipt_fields(
             result=date_sanity,
             context=date_sanity_context,
             recovered=retry_recovered,
+            retry_returned_date=retry_date,
         )
     vision_amount_raw = (vision or {}).get("amount")
     # Vision returns numeric JSON (int/float); route through str() into Decimal

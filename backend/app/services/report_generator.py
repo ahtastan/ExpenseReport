@@ -99,6 +99,32 @@ AIR_TRAVEL_ROWS_BY_SHEET = {
 }
 
 
+def is_real_flight_line(line: "ReportLine") -> bool:
+    """Discriminator: should this line populate the AIR TRAVEL RECONCILIATION block?
+
+    The "Airfare/Bus/Ferry/Other" bucket name conflates real flights (which
+    need ticket reconciliation — airline, RT/oneway, ticket cost, prior
+    value) with ground transit (bus, ferry — daily totals only). The
+    template's reconciliation block is flight-specific; bus/ferry rows
+    landing here render as half-empty entries with no airline / RT-oneway /
+    ticket-cost columns and confuse EDT auditors.
+
+    Use operator-confirmed flight metadata as the marker: a line counts as
+    a real flight only when bucket matches Airfare AND (airline name is
+    non-empty OR an explicit total_tkt_cost is set). Buses/ferries share
+    the bucket name but lack both signals; they land in row 7 daily totals
+    via _allocate's day["airfare"] path and stay out of the reconciliation
+    block.
+    """
+    if _bucket_key(line.report_bucket) != _bucket_key(AIRFARE_BUCKET):
+        return False
+    if (line.air_travel_airline or "").strip():
+        return True
+    if line.air_travel_total_tkt_cost is not None:
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class MealDetailLine:
     tx_date: date
@@ -313,7 +339,7 @@ def _fill_workbook(template_path: Path, output_path: Path, employee_name: str, t
         rows = AIR_TRAVEL_ROWS_BY_SHEET.get(sheet_name, [])
         if not rows:
             return
-        air_lines = [ln for ln in page_lines if _bucket_key(ln.report_bucket) == _bucket_key(AIRFARE_BUCKET)]
+        air_lines = [ln for ln in page_lines if is_real_flight_line(ln)]
         for row_num, ln in zip(rows, air_lines):
             value = travel_date_value(ln)
             if value is not None:

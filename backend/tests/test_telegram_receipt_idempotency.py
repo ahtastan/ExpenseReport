@@ -34,17 +34,27 @@ from app.config import get_settings  # noqa: E402
 from app.db import create_db_and_tables, engine  # noqa: E402
 from app.models import AppUser, ReceiptDocument  # noqa: E402
 from app.services import telegram as telegram_service  # noqa: E402
+from app.services.receipt_extraction import ReceiptExtraction  # noqa: E402
 
 
 class _FakeTelegramClient:
     """Records sent messages and returns a fake downloaded path."""
 
-    def __init__(self, token: str | None = None, *, download_result: Path | None = None):
+    def __init__(
+        self,
+        token: str | None = None,
+        *,
+        download_result: Path | None = None,
+        fail_messages: set[str] | None = None,
+    ):
         self.token = token
         self.messages: list[str] = []
         self._download_result = download_result
+        self._fail_messages = fail_messages or set()
 
     def send_message(self, chat_id: int, text: str) -> None:
+        if text in self._fail_messages:
+            raise RuntimeError(f"send failed for {text}")
         self.messages.append(text)
 
     def download_file(self, file_id, user_id, fallback_name):
@@ -122,6 +132,91 @@ def test_best_photo_uses_file_size_when_available() -> None:
 
     assert best is not None
     assert best["file_id"] == "large"
+
+
+def test_best_photo_mixed_file_size_falls_back_to_largest_area() -> None:
+    message = {
+        "photo": [
+            {"file_id": "small_with_size", "file_size": 5000, "width": 320, "height": 240},
+            {"file_id": "medium_without_size", "width": 800, "height": 600},
+            {"file_id": "large_without_size", "width": 1280, "height": 960},
+        ]
+    }
+
+    best = telegram_service._best_photo(message)
+
+    assert best is not None
+    assert best["file_id"] == "large_without_size"
+
+
+def test_receipt_progress_ack_sent_before_extraction(monkeypatch) -> None:
+    original_client = telegram_service.TelegramClient
+    try:
+        fake_client = _install_fake_client()
+        messages_before_extraction: list[str] = []
+
+        def fake_apply_receipt_extraction(session, receipt):
+            messages_before_extraction.extend(fake_client.messages)
+            receipt.status = "needs_extraction_review"
+            session.add(receipt)
+            session.commit()
+            session.refresh(receipt)
+            return ReceiptExtraction(
+                receipt_id=receipt.id,
+                status=receipt.status,
+                confidence=0.0,
+                missing_fields=["receipt_date", "local_amount", "supplier", "business_or_personal"],
+            )
+
+        monkeypatch.setattr(telegram_service, "apply_receipt_extraction", fake_apply_receipt_extraction)
+
+        with Session(engine) as session:
+            result = telegram_service.handle_update(
+                session,
+                _photo_payload(801, 930, 40, "ack-before-ocr"),
+            )
+
+        assert result["action"] == "receipt_captured"
+        assert messages_before_extraction == ["Reading receipt…"]
+        assert fake_client.messages[0] == "Reading receipt…"
+    finally:
+        telegram_service.TelegramClient = original_client
+
+
+def test_receipt_progress_ack_failure_logs_warning_and_continues(monkeypatch, caplog) -> None:
+    original_client = telegram_service.TelegramClient
+    try:
+        fake_client = _install_fake_client(fail_messages={"Reading receipt…"})
+        extraction_called = False
+
+        def fake_apply_receipt_extraction(session, receipt):
+            nonlocal extraction_called
+            extraction_called = True
+            receipt.status = "needs_extraction_review"
+            session.add(receipt)
+            session.commit()
+            session.refresh(receipt)
+            return ReceiptExtraction(
+                receipt_id=receipt.id,
+                status=receipt.status,
+                confidence=0.0,
+                missing_fields=["receipt_date", "local_amount", "supplier", "business_or_personal"],
+            )
+
+        monkeypatch.setattr(telegram_service, "apply_receipt_extraction", fake_apply_receipt_extraction)
+        caplog.set_level("WARNING", logger="app.services.telegram")
+
+        with Session(engine) as session:
+            result = telegram_service.handle_update(
+                session,
+                _photo_payload(802, 931, 41, "ack-fails"),
+            )
+
+        assert result["action"] == "receipt_captured"
+        assert extraction_called is True
+        assert "Telegram receipt progress ack failed" in caplog.text
+    finally:
+        telegram_service.TelegramClient = original_client
 
 
 def test_duplicate_telegram_photo_returns_existing_receipt() -> None:

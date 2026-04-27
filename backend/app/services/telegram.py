@@ -136,6 +136,18 @@ def _log_stored_receipt_media(path: Path, *, content_type: str, original_name: s
     )
 
 
+def _send_receipt_progress_ack(client: TelegramClient, chat_id: int, receipt_id: int | None) -> None:
+    try:
+        client.send_message(chat_id, "Reading receipt…")
+    except Exception as exc:
+        logger.warning(
+            "Telegram receipt progress ack failed for chat_id=%s receipt_id=%s: %s",
+            chat_id,
+            receipt_id,
+            exc,
+        )
+
+
 def _document_is_receipt(document: dict[str, Any]) -> bool:
     mime = (document.get("mime_type") or "").lower()
     name = (document.get("file_name") or "").lower()
@@ -303,6 +315,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
 
     storage_path = None
     status = "received"
+    downloaded = None
     try:
         downloaded = client.download_file(file_id, user.id, original_name) if file_id else None
         storage_path = str(downloaded) if downloaded else None
@@ -331,6 +344,9 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     session.add(receipt)
     session.commit()
     session.refresh(receipt)
+
+    if downloaded is not None:
+        _send_receipt_progress_ack(client, chat_id, receipt.id)
 
     extraction = apply_receipt_extraction(session, receipt)
     questions = ensure_receipt_review_questions(session, receipt, user.id)

@@ -6,6 +6,7 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment
 from sqlmodel import Session
 
 from app.config import get_settings
@@ -278,6 +279,44 @@ def _allocate(line: ReportLine, day_totals: dict[date, dict[str, list[Decimal]]]
         )
 
 
+def _write_irs_detail_row(
+    ws,
+    rownum: int,
+    primary: "MealDetailLine",
+    sum_components: list[Decimal] | None,
+) -> None:
+    """Write one Page 1B IRS detail row.
+
+    Per Bug 3 fix, writes full strings without [:N] truncation and applies
+    wrap_text=True to the four wide-content cells (C/D/E/F) so long values
+    flow vertically. ``row_dimensions[rownum].height`` is left None so
+    Excel auto-fits at render time.
+
+    Per Bug 2 fix, when ``sum_components`` is non-None (≥ 2 receipts
+    collapsed under same-supplier-same-code), writes a SUM formula
+    directly to the amount cell (J) so the auditor sees =A+B[+C…].
+    Otherwise leaves J alone — the template's pre-existing IF formula
+    pulls the daily total from Week 1A.
+
+    Module-level helper (rather than a closure inside _fill_workbook) so
+    tests can exercise the cell-shape contract without a real .xlsx
+    template loaded — see test_report_generator_irs_truncation.py.
+    """
+    ws[f"C{rownum}"] = primary.place
+    ws[f"D{rownum}"] = primary.location
+    ws[f"E{rownum}"] = primary.participants
+    ws[f"F{rownum}"] = primary.reason
+    _wrap_top = Alignment(wrap_text=True, vertical="top")
+    for col in ("C", "D", "E", "F"):
+        ws[f"{col}{rownum}"].alignment = _wrap_top
+    ws.row_dimensions[rownum].height = None
+    ws[f"H{rownum}"] = "x" if primary.eg else None
+    ws[f"I{rownum}"] = "x" if primary.mr else None
+    if sum_components is not None:
+        parts = [f"{amt:.2f}".rstrip("0").rstrip(".") for amt in sum_components]
+        ws[f"J{rownum}"] = "=" + "+".join(parts)
+
+
 def group_meal_details_for_irs(
     details: list["MealDetailLine"],
 ) -> list[tuple["MealDetailLine", list[Decimal] | None]]:
@@ -487,22 +526,7 @@ def _fill_workbook(
                     continue
                 used_codes.add(primary.code)
                 rownum = 8 + day_index * 5 + code_rows[primary.code]
-                ws[f"C{rownum}"] = primary.place[:40]
-                ws[f"D{rownum}"] = primary.location[:28]
-                ws[f"E{rownum}"] = primary.participants[:40]
-                ws[f"F{rownum}"] = primary.reason[:50]
-                ws[f"H{rownum}"] = "x" if primary.eg else None
-                ws[f"I{rownum}"] = "x" if primary.mr else None
-                # When 2+ receipts collapsed: write SUM formula directly to
-                # the amount column (J) so the auditor sees =A+B and can
-                # decode the component receipts. Without this, J{rownum}
-                # inherits the template's pre-existing IF formula that
-                # opaquely pulls the Week 1A daily total — which already
-                # includes the sum, but doesn't reveal the components on
-                # Page 1B itself.
-                if sum_components is not None:
-                    parts = [f"{amt:.2f}".rstrip("0").rstrip(".") for amt in sum_components]
-                    ws[f"J{rownum}"] = "=" + "+".join(parts)
+                _write_irs_detail_row(ws, rownum, primary, sum_components)
 
     first7_set = set(first7)
     next7_set = set(next7)

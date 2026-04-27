@@ -1130,15 +1130,47 @@ def _format_pc_amount_local(line: ReceiptAnnotationLine) -> str:
     return f"{line.local_currency} {float(line.local_amount):,.2f}"
 
 
-def _format_pc_supplier(line: ReceiptAnnotationLine) -> str:
-    """Hard-truncated supplier name for the right info column.
+PC_SUPPLIER_LINE_CHARS = 17     # ~311 px / 35-px sans-bold ≈ 17 chars per line
+PC_SUPPLIER_MAX_LINES = 2
 
-    Bounded by the cell's right info width: PC_CELL_WIDTH - thumb half -
-    2× PC_INFO_PADDING_X ≈ 311 px at 300 DPI. With sans-bold ~35-px font
-    that's roughly 17 chars; we use 18 for some breathing room and rely
-    on the ellipsis to land on word boundaries naturally.
+
+def _wrap_pc_supplier(line: ReceiptAnnotationLine) -> list[str]:
+    """Wrap supplier name to up to two lines for the right info column.
+
+    Excel-style ``wrap_text``: split at the latest whitespace boundary that
+    keeps the first line within ``PC_SUPPLIER_LINE_CHARS``. If the
+    remainder still overflows the second line, it is truncated with an
+    ellipsis. Single very-long words (no whitespace) fall back to a
+    one-line truncation since wrapping mid-word would look wrong.
     """
-    return _truncate((line.supplier or "").upper(), 18)
+    text = (line.supplier or "").upper().strip()
+    if not text:
+        return [""]
+    if len(text) <= PC_SUPPLIER_LINE_CHARS:
+        return [text]
+
+    words = text.split()
+    if len(words) == 1:
+        return [_truncate(text, PC_SUPPLIER_LINE_CHARS + 1)]
+
+    # Greedy: pick the largest prefix of words that still fits.
+    split_at = 0
+    for i in range(1, len(words)):
+        candidate = " ".join(words[:i])
+        if len(candidate) <= PC_SUPPLIER_LINE_CHARS:
+            split_at = i
+        else:
+            break
+
+    if split_at == 0:
+        # First word alone overflows — fall back to one-line truncation.
+        return [_truncate(text, PC_SUPPLIER_LINE_CHARS + 1)]
+
+    line1 = " ".join(words[:split_at])
+    line2 = " ".join(words[split_at:])
+    if len(line2) > PC_SUPPLIER_LINE_CHARS:
+        line2 = _truncate(line2, PC_SUPPLIER_LINE_CHARS + 1)
+    return [line1, line2]
 
 
 def _draw_paired_card(
@@ -1160,11 +1192,16 @@ def _draw_paired_card(
       2. Local-currency line (TRY YYY.YY) — omitted when local==report
       3. Soft hairline rule
       4. Date (YYYY-MM-DD)
-      5. Supplier (uppercase, truncated to 18 chars to fit info column)
+      5. Supplier (uppercase, Excel-style wrap to 1 or 2 lines)
       6. Bucket — WKS NN-NN, ROW N (uppercase, gray)
       7. (flex spacer)
       8. BUSINESS / PERSONAL tag
       9. (only if group_count >= 2) GROUP X/Y — TOTAL $XX.XX with 1pt top rule
+
+    Supplier wrapping consumes one or two lines (35 px each); the bucket
+    badge below it shifts down by ~38 px when wrap is active so the field
+    stack stays readable. Bottom-anchored elements (BP tag, group line)
+    are unaffected.
     """
     draw = ImageDraw.Draw(page)
     line = ctx.line
@@ -1249,9 +1286,11 @@ def _draw_paired_card(
     _draw_text_safe(draw, (cx, cy), line.transaction_date.isoformat(), font=FONT_PC_DATE)
     cy += 50
 
-    # 5. Supplier (uppercase, truncated).
-    _draw_text_safe(draw, (cx, cy), _format_pc_supplier(line), font=FONT_PC_SUPPLIER)
-    cy += 50
+    # 5. Supplier (uppercase, Excel-style wrap up to 2 lines).
+    supplier_lines = _wrap_pc_supplier(line)
+    for i, supplier_line in enumerate(supplier_lines):
+        _draw_text_safe(draw, (cx, cy + i * 38), supplier_line, font=FONT_PC_SUPPLIER)
+    cy += 50 + (len(supplier_lines) - 1) * 38
 
     # 6. Bucket badge (solid black tag with white text) — visually distinct
     #    so the auditor's eye lands on the category. Format: "[X] LABEL"

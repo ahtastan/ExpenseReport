@@ -57,6 +57,15 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", VISION_MODEL)
 SYNTHESIS_MODEL = os.getenv("SYNTHESIS_MODEL", VISION_MODEL)
 MATCHING_MODEL = os.getenv("MATCHING_MODEL", VISION_MODEL)
 
+# gpt-5.5 is a reasoning model: a chunk of every completion's token budget
+# is consumed by internal reasoning before any visible output is emitted.
+# At 256 (the gpt-5.4 default) reasoning consumed the entire budget,
+# finish_reason came back "length", and message.content was empty — so
+# every receipt looked like an extraction failure regardless of image
+# clarity. 2048 leaves headroom for both reasoning and the small JSON
+# objects these prompts ask for. Bump if reasoning gets denser.
+_MAX_COMPLETION_TOKENS = 2048
+
 CRITICAL_FIELDS = ("date", "supplier", "amount")
 
 UNREADABLE_MERCHANT_SENTINEL = "UNREADABLE_MERCHANT"
@@ -361,7 +370,7 @@ def _call_openai(
             content.append({"type": "image_url", "image_url": {"url": data_url}})
         response = client.chat.completions.create(
             model=model,
-            max_completion_tokens=256,
+            max_completion_tokens=_MAX_COMPLETION_TOKENS,
             messages=[{"role": "user", "content": content}],
         )
         content_text = response.choices[0].message.content or ""
@@ -529,7 +538,7 @@ def _call_openai_text(model: str, prompt: str, payload: str) -> dict[str, Any] |
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
             model=model,
-            max_completion_tokens=256,
+            max_completion_tokens=_MAX_COMPLETION_TOKENS,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": payload},

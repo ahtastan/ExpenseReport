@@ -139,6 +139,60 @@ _BUCKET_TO_PAGE_1A_ROW: dict[str, int] = {
 
 _HOTEL_BUCKETS: frozenset[str] = frozenset({"Hotel/Lodging/Laundry"})
 
+# Single-letter EDT codes for the per-card bucket badge. Keeps the auditor
+# scanning categories at-a-glance: [F] for Fuel, [D] for Dinner, etc.
+# The letter precedes the short label inside the solid-black bucket tag.
+_BUCKET_LETTER_CODE: dict[str, str] = {
+    "Airfare/Bus/Ferry/Other":         "A",
+    "Hotel/Lodging/Laundry":           "H",
+    "Auto Rental":                     "R",
+    "Auto Gasoline":                   "F",   # F = Fuel (per PM spec)
+    "Taxi/Parking/Tolls/Uber":         "T",
+    "Other Travel Related":            "O",
+    "Membership/Subscription Fees":    "S",   # S = Subscription
+    "Customer Gifts":                  "G",
+    "Telephone/Internet":              "P",   # P = Phone
+    "Postage/Shipping":                "X",   # X = shipping
+    "Admin Supplies":                  "U",   # U = supplies
+    "Lab Supplies":                    "K",   # K = lab
+    "Field Service Supplies":          "V",   # V = service
+    "Assets":                          "Z",
+    "Other":                           "O",
+    "Meals/Snacks":                    "M",
+    "Breakfast":                       "B",
+    "Lunch":                           "L",
+    "Dinner":                          "D",
+    "Entertainment":                   "E",
+}
+
+# Short bucket labels for the badge — full bucket names like
+# "Airfare/Bus/Ferry/Other" overflow the cell width at 7pt mono. The
+# auditor can still identify the bucket from the prefix letter + the
+# short form; the exact long name is also on the XLSX itself via the
+# WKS NN-NN, ROW N reference under the badge.
+_BUCKET_SHORT_LABEL: dict[str, str] = {
+    "Airfare/Bus/Ferry/Other":         "AIRFARE/BUS",
+    "Hotel/Lodging/Laundry":           "HOTEL/LODGING",
+    "Auto Rental":                     "AUTO RENTAL",
+    "Auto Gasoline":                   "AUTO GASOLINE",
+    "Taxi/Parking/Tolls/Uber":         "TAXI/PARKING",
+    "Other Travel Related":            "OTHER TRAVEL",
+    "Membership/Subscription Fees":    "MEMBERSHIP",
+    "Customer Gifts":                  "CUSTOMER GIFTS",
+    "Telephone/Internet":              "TEL/INTERNET",
+    "Postage/Shipping":                "POSTAGE",
+    "Admin Supplies":                  "ADMIN SUPPLY",
+    "Lab Supplies":                    "LAB SUPPLY",
+    "Field Service Supplies":          "FIELD SVC",
+    "Assets":                          "ASSETS",
+    "Other":                           "OTHER",
+    "Meals/Snacks":                    "MEALS/SNACKS",
+    "Breakfast":                       "BREAKFAST",
+    "Lunch":                           "LUNCH",
+    "Dinner":                          "DINNER",
+    "Entertainment":                   "ENTERTAIN",
+}
+
 # Tableau 10 palette — colorblind-aware, print-safe, max differentiation.
 LINE_COLOR_PALETTE: tuple[str, ...] = (
     "#1f77b4",  # blue
@@ -1077,7 +1131,14 @@ def _format_pc_amount_local(line: ReceiptAnnotationLine) -> str:
 
 
 def _format_pc_supplier(line: ReceiptAnnotationLine) -> str:
-    return _truncate((line.supplier or "").upper(), 25)
+    """Hard-truncated supplier name for the right info column.
+
+    Bounded by the cell's right info width: PC_CELL_WIDTH - thumb half -
+    2× PC_INFO_PADDING_X ≈ 311 px at 300 DPI. With sans-bold ~35-px font
+    that's roughly 17 chars; we use 18 for some breathing room and rely
+    on the ellipsis to land on word boundaries naturally.
+    """
+    return _truncate((line.supplier or "").upper(), 18)
 
 
 def _draw_paired_card(
@@ -1099,7 +1160,7 @@ def _draw_paired_card(
       2. Local-currency line (TRY YYY.YY) — omitted when local==report
       3. Soft hairline rule
       4. Date (YYYY-MM-DD)
-      5. Supplier (uppercase, truncated to 25 chars)
+      5. Supplier (uppercase, truncated to 18 chars to fit info column)
       6. Bucket — WKS NN-NN, ROW N (uppercase, gray)
       7. (flex spacer)
       8. BUSINESS / PERSONAL tag
@@ -1139,6 +1200,32 @@ def _draw_paired_card(
         fill=INK_3_HEX,
     )
 
+    # Hotel folio "FOLIO" badge — top-right corner of the card. Single-page
+    # hotel receipts now stay in the grid (post-FIX-2); the corner badge
+    # is the visual cue that this card is a hotel folio so the auditor can
+    # spot it without reading the bucket badge inside.
+    if _is_hotel_bucket(line.report_bucket):
+        folio_text = "FOLIO"
+        # Compute the badge box size using the same padding as
+        # _draw_paired_card_tag so the badge sits flush against the card's
+        # top-right inside corner.
+        bbox = draw.textbbox((0, 0), folio_text, font=FONT_PC_TAG)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        pad_x, pad_y = 14, 6
+        badge_w = text_w + 2 * pad_x
+        badge_h = text_h + 2 * pad_y
+        bx = x + w - badge_w - 12
+        by = y + 12
+        draw.rectangle(
+            (bx, by, bx + badge_w, by + badge_h),
+            fill=INK_HEX, outline=INK_HEX, width=2,
+        )
+        draw.text(
+            (bx + pad_x, by + pad_y - 4),
+            folio_text, fill=PAPER_HEX, font=FONT_PC_TAG,
+        )
+
     # Right half — info column.
     cx = info_x + PC_INFO_PADDING_X
     cy = y + PC_INFO_PADDING_Y
@@ -1166,10 +1253,17 @@ def _draw_paired_card(
     _draw_text_safe(draw, (cx, cy), _format_pc_supplier(line), font=FONT_PC_SUPPLIER)
     cy += 50
 
-    # 6. Bucket — xlsx ref (uppercase, gray).
-    bucket_label = (line.report_bucket or "OTHER").upper()
-    bucket_text = f"{bucket_label} — {ctx.xlsx_ref}"
-    _draw_text_safe(draw, (cx, cy), bucket_text, font=FONT_PC_BUCKET, fill=INK_2_HEX)
+    # 6. Bucket badge (solid black tag with white text) — visually distinct
+    #    so the auditor's eye lands on the category. Format: "[X] LABEL"
+    #    where X is the single-letter EDT code (F = Fuel, M = Meals, etc.).
+    code = _BUCKET_LETTER_CODE.get(line.report_bucket or "", "O")
+    label = _BUCKET_SHORT_LABEL.get(line.report_bucket or "", (line.report_bucket or "OTHER").upper())
+    badge_text = f"[{code}] {label}"
+    _draw_paired_card_tag(draw, x=cx, y=cy, text=badge_text, solid=True)
+    cy += 50
+
+    # 7. WKS NN-NN, ROW N — plain meta line beneath the badge.
+    _draw_text_safe(draw, (cx, cy), ctx.xlsx_ref, font=FONT_PC_BUCKET, fill=INK_3_HEX)
 
     # — Bottom-anchored: BUSINESS/PERSONAL tag + optional GROUP line —
     # Tag and group line live near the bottom of the card; compute up from y+h.
@@ -1482,8 +1576,15 @@ def _render_paired_card_layout(
     week_label = _iso_week_label(lines)
     stream = _build_paired_card_stream(lines, week_label)
 
-    grid_stream = [c for c in stream if not (_is_hotel_bucket(c.line.report_bucket) or c.multi_page)]
-    full_stream = [c for c in stream if _is_hotel_bucket(c.line.report_bucket) or c.multi_page]
+    # Only MULTI-PAGE receipts (typically hotel folios spanning multiple PDF
+    # pages) trigger the full-A4 exception path. Single-page hotel receipts
+    # — e.g. a payment-slip-only "45BUSINESSHOTEL" with one card-machine
+    # printout — fit fine in the regular 3x3 grid alongside other receipts.
+    # The hotel-vs-non-hotel distinction surfaces visually via a small
+    # "FOLIO" badge in the card corner (drawn in _draw_paired_card), not
+    # via page layout. (Per PM revision on PR #34.)
+    grid_stream = [c for c in stream if not c.multi_page]
+    full_stream = [c for c in stream if c.multi_page]
 
     full_grid_pages: list[list[_PairedCardContext]] = []
     remainder: list[_PairedCardContext] = []
@@ -1538,10 +1639,11 @@ def _render_paired_card_layout(
             ))
         else:  # "full"
             ctx = spec[1]
+            # Reason for the full-A4 exception: it's always a multi-page
+            # receipt at this point (single-page hotels stay in the grid
+            # post-FIX-2). Sub-classify hotel-vs-other for the header band.
             reason = (
                 "HOTEL FOLIO (MULTI-PAGE)"
-                if (_is_hotel_bucket(ctx.line.report_bucket) and ctx.multi_page)
-                else "HOTEL FOLIO"
                 if _is_hotel_bucket(ctx.line.report_bucket)
                 else "MULTI-PAGE RECEIPT"
             )

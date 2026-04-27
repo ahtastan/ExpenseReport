@@ -168,6 +168,12 @@ class ReportLine:
     meal_location: str | None = None
     meal_eg: bool = False
     meal_mr: bool = False
+    # Local-currency amount + currency from the BMO statement side. Used by
+    # the annotated-receipts PDF banner renderer (Bug 4) to show "USD $X.XX
+    # | TRY YYY.YY" without losing the original-currency anchor. Sourced
+    # from the snapshot's source.statement payload during _confirmed_lines.
+    local_amount: Decimal | None = None
+    local_currency: str | None = None
 
 
 def _parse_optional_date(value: object) -> date | None:
@@ -216,6 +222,22 @@ def _confirmed_lines(
         if not tx_date_raw or amount is None:
             continue
         tx_date = date.fromisoformat(str(tx_date_raw))
+        # Local-currency anchor for the annotated-receipts PDF banner.
+        # source.statement is the BMO-side authoritative amount; falls back
+        # to source.receipt.extracted_local_amount when the statement side
+        # is absent (manual-entry path).
+        statement_block = (row.get("source") or {}).get("statement") or {}
+        receipt_block = (row.get("source") or {}).get("receipt") or {}
+        local_amount = _parse_optional_decimal(
+            statement_block.get("local_amount")
+        ) or _parse_optional_decimal(
+            receipt_block.get("extracted_local_amount")
+        )
+        local_currency = (
+            statement_block.get("local_currency")
+            or receipt_block.get("extracted_currency")
+            or None
+        )
         lines.append(
             ReportLine(
                 transaction_id=int(row["transaction_id"]),
@@ -245,6 +267,8 @@ def _confirmed_lines(
                 meal_location=row.get("meal_location") or None,
                 meal_eg=_parse_bool(row.get("meal_eg")),
                 meal_mr=_parse_bool(row.get("meal_mr")),
+                local_amount=local_amount,
+                local_currency=local_currency,
             )
         )
     return sorted(lines, key=lambda line: (line.transaction_date, line.review_row_id or 0))
@@ -671,6 +695,8 @@ def _annotation_lines(lines: list[ReportLine]) -> list[ReceiptAnnotationLine]:
             report_bucket=line.report_bucket,
             business_reason=line.business_reason,
             attendees=line.attendees,
+            local_amount=float(line.local_amount) if line.local_amount is not None else None,
+            local_currency=line.local_currency,
         )
         for line in lines
     ]

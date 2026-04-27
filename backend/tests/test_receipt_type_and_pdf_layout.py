@@ -482,9 +482,27 @@ def test_group_receipts_for_pdf_packs_date_ordered_receipts_without_overcrowding
 
 
 def test_create_annotated_receipts_pdf_renders_with_default_strategy(tmp_path):
+    """Default is now banner_grid (Bug 4): 3 receipts fit on one A4 page,
+    no legend. The legacy day_grouped_colored layout still works when
+    invoked explicitly — see the next test.
+    """
     lines = [_make_line(transaction_id=i, tx_date=date(2026, 4, 1)) for i in range(3)]
     out = tmp_path / "annot.pdf"
     page_count = create_annotated_receipts_pdf(lines, out)
+    assert out.exists()
+    assert out.stat().st_size > 0
+    # banner_grid: 3 receipts → 1 page (3x3 grid, no legend).
+    assert page_count == 1
+
+
+def test_create_annotated_receipts_pdf_renders_with_legacy_day_grouped_colored(tmp_path):
+    """Legacy day_grouped_colored still renders correctly when explicitly
+    selected: legend page + day group page = 2 pages min."""
+    lines = [_make_line(transaction_id=i, tx_date=date(2026, 4, 1)) for i in range(3)]
+    out = tmp_path / "annot_legacy.pdf"
+    page_count = create_annotated_receipts_pdf(
+        lines, out, strategy="day_grouped_colored"
+    )
     assert out.exists()
     assert out.stat().st_size > 0
     # Legend (1 page for 3 lines) + 1 day group page = 2 pages minimum.

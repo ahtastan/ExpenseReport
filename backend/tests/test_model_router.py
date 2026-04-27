@@ -1,11 +1,19 @@
-"""Tests for the staged OCR model-routing policy.
+"""Tests for the single-tier OCR vision pipeline (post-F1.3 rollback).
 
 The router must:
-  - try the mini model first;
-  - return the mini result when all critical fields are present;
-  - escalate to the full model when the mini result is missing critical fields;
-  - escalate when the mini call itself returns ``None``;
-  - fall back to partial mini data if the full call also fails.
+  - call the full vision model exactly once on the happy path;
+  - retry with the stricter merchant-only prompt when the first-pass
+    supplier is missing — the ``UNREADABLE_MERCHANT`` sentinel,
+    ``None``, or an empty/whitespace string — since all three shapes
+    mean the model couldn't read the merchant masthead;
+  - on retry, swap supplier from the retry response while preserving
+    first-pass date / amount / currency / receipt_type;
+  - NOT retry on missing date or missing amount — the merchant-only
+    retry can't recover those fields, and re-extracting them would
+    risk overwriting valid data with a second guess;
+  - return ``None`` when the first-pass call itself produced no
+    parseable response (no retry on transient API failure — retry is
+    scoped to merchant ambiguity, per the F1.3 PM directive).
 """
 
 from __future__ import annotations
@@ -41,84 +49,125 @@ class _Recorder:
         return self._responses.pop(0)
 
 
-def run(tmp_dir: Path) -> None:
-    img = _fake_image(tmp_dir)
-    original = model_router._vision_call
-    try:
-        # Case 1: mini returns complete fields -> no escalation.
+def test_clean_first_pass_returns_without_retry(tmp_path, monkeypatch):
+    """A clear receipt — supplier present and non-sentinel — must extract
+    in a single model call. No merchant-only retry should fire."""
+    rec = _Recorder([
+        {"date": "2026-04-01", "supplier": "Migros", "amount": 42.5,
+         "currency": "TRY", "receipt_type": "payment_receipt"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is not None
+    assert result.escalated is False
+    assert rec.calls == [model_router.VISION_MODEL]
+    assert result.fields["date"] == "2026-04-01"
+    assert result.fields["amount"] == 42.5
+    assert result.fields["supplier"] == "Migros"
+
+
+def test_missing_amount_does_not_trigger_retry(tmp_path, monkeypatch):
+    """Per F1.3: amount absence is NOT merchant ambiguity. The router
+    must accept a null amount from the first pass and not run the
+    merchant-only retry — the retry would not re-extract the amount
+    anyway, and we'd rather report an honest null than a hallucinated
+    figure from a second guess."""
+    rec = _Recorder([
+        {"date": "2026-04-01", "supplier": "Migros", "amount": None},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is not None
+    assert result.escalated is False
+    assert rec.calls == [model_router.VISION_MODEL]
+    assert result.fields["amount"] is None
+    assert result.fields["supplier"] == "Migros"
+
+
+def test_missing_date_does_not_trigger_retry(tmp_path, monkeypatch):
+    """Same scoping rule as missing amount — date absence is not the
+    merchant ambiguity the retry exists to fix."""
+    rec = _Recorder([
+        {"date": None, "supplier": "Migros", "amount": 42.5, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is not None
+    assert result.escalated is False
+    assert rec.calls == [model_router.VISION_MODEL]
+    assert result.fields["date"] is None
+
+
+def test_null_supplier_triggers_merchant_only_retry(tmp_path, monkeypatch):
+    """A null supplier means the model couldn't read the merchant — the
+    same condition the explicit sentinel signals. F1.3 patch: retry on
+    null supplier as well as on the sentinel. The retry is merchant-only
+    and preserves first-pass date / amount / currency, so it cannot
+    blank good fields — making it safe to fire on the broader
+    "supplier missing" signal."""
+    rec = _Recorder([
+        {"date": "2026-04-01", "supplier": None, "amount": 42.5,
+         "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "Migros"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is not None
+    assert result.escalated is True
+    assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    # Supplier comes from the retry; date/amount/currency/receipt_type
+    # all preserved from the first pass.
+    assert result.fields["supplier"] == "Migros"
+    assert result.fields["date"] == "2026-04-01"
+    assert result.fields["amount"] == 42.5
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["receipt_type"] == "payment_receipt"
+
+
+def test_empty_string_supplier_triggers_merchant_only_retry(tmp_path, monkeypatch):
+    """An empty (or whitespace-only) supplier string is the same kind of
+    "couldn't read the masthead" signal as null. F1.3 patch: trigger the
+    merchant-only retry. Whitespace-only strings are tested too because
+    a model that emits a literal space character is functionally
+    identical to one that emits nothing."""
+    for empty_supplier in ("", "   ", "\t"):
         rec = _Recorder([
-            {"date": "2026-04-01", "supplier": "Migros", "amount": 42.5, "currency": "TRY"},
+            {"date": "2026-04-01", "supplier": empty_supplier, "amount": 42.5,
+             "currency": "TRY"},
+            {"supplier": "Migros"},
         ])
-        model_router._vision_call = rec
-        result = model_router.vision_extract(str(img))
-        assert result is not None
-        assert result.model == model_router.MINI_MODEL
-        assert result.escalated is False
-        assert rec.calls == [model_router.MINI_MODEL]
-        print("mini-only path: OK")
-
-        # Case 2: mini missing amount -> escalate to full.
-        rec = _Recorder([
-            {"date": "2026-04-01", "supplier": "Migros", "amount": None},
-            {"date": "2026-04-01", "supplier": "Migros", "amount": 42.5, "currency": "TRY"},
-        ])
-        model_router._vision_call = rec
-        result = model_router.vision_extract(str(img))
-        assert result is not None
-        assert result.model == model_router.FULL_MODEL
-        assert result.escalated is True
-        assert rec.calls == [model_router.MINI_MODEL, model_router.FULL_MODEL]
-        print("escalation path: OK")
-
-        # Case 3: mini call returns None (unavailable) -> escalate, full succeeds.
-        rec = _Recorder([
-            None,
-            {"date": "2026-04-01", "supplier": "Migros", "amount": 42.5},
-        ])
-        model_router._vision_call = rec
-        result = model_router.vision_extract(str(img))
-        assert result is not None
-        assert result.model == model_router.FULL_MODEL
-        assert result.escalated is True
-        print("mini-unavailable path: OK")
-
-        # Case 4: both tiers fail -> returns None.
-        rec = _Recorder([None, None])
-        model_router._vision_call = rec
-        result = model_router.vision_extract(str(img))
-        assert result is None
-        print("both-fail path: OK")
-
-        # Case 5: mini returns partial, full unavailable -> partial mini result kept.
-        rec = _Recorder([
-            {"date": "2026-04-01", "supplier": None, "amount": 42.5},
-            None,
-        ])
-        model_router._vision_call = rec
-        result = model_router.vision_extract(str(img))
-        assert result is not None
-        assert result.model == model_router.MINI_MODEL
-        assert result.escalated is False
-        assert result.fields["supplier"] is None
-        print("partial-mini fallback: OK")
-
-        # Case 6: unsupported file type -> no model calls.
-        unsupported = tmp_dir / "receipt.txt"
-        unsupported.write_text("not an image")
-        rec = _Recorder([])
-        model_router._vision_call = rec
-        result = model_router.vision_extract(str(unsupported))
-        assert result is None
-        assert rec.calls == []
-        print("unsupported-file path: OK")
-
-        print("model_router_tests=passed")
-    finally:
-        model_router._vision_call = original
+        monkeypatch.setattr(model_router, "_vision_call", rec)
+        result = model_router.vision_extract(str(_fake_image(tmp_path)))
+        assert result is not None, f"empty supplier {empty_supplier!r} returned None"
+        assert result.escalated is True, (
+            f"empty supplier {empty_supplier!r} did not trigger retry"
+        )
+        assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+        assert result.fields["supplier"] == "Migros"
+        # First-pass date/amount/currency preserved across retry.
+        assert result.fields["date"] == "2026-04-01"
+        assert result.fields["amount"] == 42.5
+        assert result.fields["currency"] == "TRY"
 
 
-if __name__ == "__main__":
-    import tempfile
+def test_first_pass_unavailable_returns_none_without_retry(tmp_path, monkeypatch):
+    """If the first call returns ``None`` (no API key, parse failure,
+    transient error), the router must surface ``None`` rather than
+    burning a second LLM call. The merchant-only retry would not help
+    and would just double the latency penalty for an already-failed
+    extraction."""
+    rec = _Recorder([None])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is None
+    assert rec.calls == [model_router.VISION_MODEL]
 
-    with tempfile.TemporaryDirectory() as tmp:
-        run(Path(tmp))
+
+def test_unsupported_file_extension_makes_no_model_calls(tmp_path, monkeypatch):
+    rec = _Recorder([])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    unsupported = tmp_path / "receipt.txt"
+    unsupported.write_text("not an image")
+    result = model_router.vision_extract(str(unsupported))
+    assert result is None
+    assert rec.calls == []

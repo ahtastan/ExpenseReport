@@ -1,21 +1,23 @@
-"""F1 hardening — OCR merchant hallucination guard.
+"""F1 / F1.3 hardening — OCR merchant hallucination guard.
 
 When the OCR model can't confidently read the printed merchant name
 (e.g. it's only seeing address text, district names, or VAT-line
 fragments) it must emit the literal sentinel ``UNREADABLE_MERCHANT``
-instead of inventing a name. The router must then retry with a
-stricter prompt — same code path as a null/missing supplier — and
-surface the sentinel to downstream callers as a plain ``None`` so a
-literal ``"UNREADABLE_MERCHANT"`` string never lands in the supplier
-field.
+instead of inventing a name. The router must then retry the SAME
+model with a stricter merchant-only prompt and surface the sentinel
+to downstream callers as a plain ``None`` so a literal
+``"UNREADABLE_MERCHANT"`` string never lands in the supplier field.
 
-Post-F1 the second pass is a stricter-prompt retry, not a tier
-upgrade — both passes target ``gpt-5.5`` by default. The
+Post-F1.3 the second pass is a merchant-only stricter-prompt retry
+against the same single tier (``gpt-5.4`` full by default). The
 ``MINI_MODEL`` / ``FULL_MODEL`` constants are kept as aliases (both
 default to ``VISION_MODEL``) so existing tests' naming is preserved
-without forcing a rename. The semantically meaningful assertion is
-"second pass uses ``_VISION_PROMPT_STRICT``", verified by the
-prompt-aware recorder below.
+without forcing a rename. The retry rewrites supplier ONLY — the
+first-pass date / amount / currency / receipt_type are preserved
+verbatim. A merchant-side problem must never blank a date or amount
+that the first pass extracted cleanly. That preservation contract is
+pinned in ``test_unreadable_merchant_retry_preserves_first_pass_*``
+below.
 
 These tests mock ``_vision_call`` so they exercise the prompt-retry
 contract without hitting the live OpenAI API. A real-OCR integration
@@ -276,3 +278,93 @@ def test_mini_sentinel_full_unavailable_returns_partial_with_null_supplier(monke
     assert result.escalated is False
     assert result.fields["supplier"] is None
     assert result.fields["amount"] == 580.0
+
+
+# ---------------------------------------------------------------------------
+# F1.3 — merchant-only retry must preserve first-pass date/amount/currency
+# ---------------------------------------------------------------------------
+
+
+def test_unreadable_merchant_retry_preserves_first_pass_date_amount_currency(monkeypatch) -> None:
+    """F1.3 invariant: the merchant-only retry rewrites supplier ONLY.
+
+    A previous version of the retry path re-extracted every field from
+    the second response, which meant a supplier-side problem on a
+    receipt could silently blank a perfectly-good date or amount the
+    first pass already captured. PM directive: never blank date/amount
+    just because the merchant masthead was ambiguous.
+
+    Here the retry deliberately returns DIFFERENT date/amount values to
+    prove they are ignored — only supplier from the retry survives.
+    """
+    recorder = _Recorder([
+        # First pass: clean date+amount, abstained on merchant.
+        {"date": "2025-10-15", "supplier": UNREADABLE_MERCHANT_SENTINEL,
+         "amount": 580.0, "currency": "TRY", "receipt_type": "payment_receipt"},
+        # Retry: hostile values for date/amount/currency to confirm the
+        # merge ignores them. Only supplier should propagate.
+        {"date": "1999-01-01", "supplier": "Yeni Truva Tur Pet",
+         "amount": 9999.99, "currency": "EUR", "receipt_type": "invoice"},
+    ])
+    _patch_vision_call(monkeypatch, recorder)
+    with TemporaryDirectory() as tmp:
+        img = _fake_image(Path(tmp))
+        result = model_router.vision_extract(str(img))
+    assert result is not None
+    assert result.escalated is True
+    assert result.fields["supplier"] == "Yeni Truva Tur Pet"
+    # Date / amount / currency / receipt_type all from the FIRST pass.
+    assert result.fields["date"] == "2025-10-15"
+    assert result.fields["amount"] == 580.0
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["receipt_type"] == "payment_receipt"
+
+
+def test_unreadable_merchant_retry_returning_only_supplier_still_merges(monkeypatch) -> None:
+    """The merchant-only stricter prompt asks for ``{"supplier": ...}``
+    alone — nothing else. A retry response that obeys that contract
+    (no date / amount keys at all) must still merge cleanly: the
+    first-pass date/amount stay, and supplier comes from the retry.
+    """
+    recorder = _Recorder([
+        {"date": "2025-10-15", "supplier": UNREADABLE_MERCHANT_SENTINEL,
+         "amount": 580.0, "currency": "TRY"},
+        {"supplier": "Yeni Truva Tur Pet"},  # merchant-only response shape
+    ])
+    _patch_vision_call(monkeypatch, recorder)
+    with TemporaryDirectory() as tmp:
+        img = _fake_image(Path(tmp))
+        result = model_router.vision_extract(str(img))
+    assert result is not None
+    assert result.escalated is True
+    assert result.fields["supplier"] == "Yeni Truva Tur Pet"
+    assert result.fields["date"] == "2025-10-15"
+    assert result.fields["amount"] == 580.0
+    assert result.fields["currency"] == "TRY"
+
+
+def test_strict_retry_prompt_is_merchant_only(monkeypatch) -> None:
+    """The F1.3 stricter retry prompt must be scoped to merchant
+    extraction only. It must not re-instruct the model on amount or
+    date selection — those fields were already captured cleanly on the
+    first pass. Re-instructing them risks the model second-guessing a
+    valid date/amount and returning a different value, which the merge
+    is supposed to ignore — but the cheapest defense is a prompt that
+    doesn't even bring those fields up."""
+    prompt = model_router._VISION_PROMPT_STRICT
+    # The merchant rules must still be present.
+    assert "MERCHANT NAME" in prompt
+    assert UNREADABLE_MERCHANT_SENTINEL in prompt
+    # The retry prompt must NOT instruct on amount or date selection —
+    # those fields are owned by the first pass under F1.3.
+    lowered = prompt.lower()
+    assert "total amount" not in lowered, (
+        "F1.3 retry prompt must not re-instruct on amount selection — "
+        "the first pass already captured amount; a retry is supposed to "
+        "rewrite supplier only."
+    )
+    assert "tutar" not in lowered, (
+        "F1.3 retry prompt must not reference amount labels — same reason."
+    )
+    # The prompt must explicitly state it's asking for supplier only.
+    assert "supplier" in lowered

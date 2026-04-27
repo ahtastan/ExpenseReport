@@ -1,29 +1,34 @@
 """Model routing policy for OCR, matching, and report synthesis.
 
-Policy (post-F1 hardening, 2026-04):
-  - vision OCR model       = OCR_VISION_MODEL (single tier, ``gpt-5.5``)
-  - report synthesis model = OCR_VISION_MODEL (was full, now unified)
-  - chat + matching model  = OCR_VISION_MODEL (was mini, now unified)
+Policy (post-F1.3 rollback, 2026-04):
+  - vision OCR model       = OCR_VISION_MODEL (single tier, ``gpt-5.4`` full)
+  - report synthesis model = OCR_VISION_MODEL (unified)
+  - chat + matching model  = OCR_VISION_MODEL (unified)
 
-The previous mini→full tier system collapsed once we moved to gpt-5.5,
-which has no "mini" variant in its family — the upgrade absorbed both
-ends of the previous cost/quality split. ``MINI_MODEL`` and
-``FULL_MODEL`` Python constants are kept as aliases (both default to
-``VISION_MODEL``) so existing callers and env-var overrides keep
-working. Set ``OCR_MINI_MODEL`` or ``OCR_FULL_MODEL`` separately if you
-need to A/B against a different model in dev.
+F1 moved to ``gpt-5.5`` for OCR, which proved too slow and too
+conservative on the live receipt corpus. F1.3 rolls the receipt-OCR
+path back to the previous working ``gpt-5.4`` full-vision snapshot —
+the strongest model that has produced acceptable quality in
+production. The ``gpt-5.4-mini`` tier from the original mini→full
+architecture is intentionally NOT restored: leadership requires
+near-perfect first-pass OCR and mini's accuracy is insufficient.
+``MINI_MODEL`` and ``FULL_MODEL`` Python constants are kept as
+aliases (both default to ``VISION_MODEL``) so existing callers and
+env-var overrides keep working — but with both pointing at the same
+full model, "mini" is effectively disabled for OCR.
 
-Staged OCR pipeline (implemented in ``vision_extract``):
+OCR pipeline (implemented in ``vision_extract``):
   1. caller runs deterministic parsing first (regex over caption/filename);
   2. if critical fields are still missing, caller invokes ``vision_extract``;
-  3. ``vision_extract`` runs the standard prompt against ``MINI_MODEL``;
-  4. if the result is invalid, missing critical fields, or returns
-     ``UNREADABLE_MERCHANT`` for supplier, the router retries against
-     ``FULL_MODEL`` with a STRICTER prompt variant that explicitly lists
-     hallucination antipatterns (composing names from address fragments,
-     VAT IDs, MERSIS numbers, surrounding context). With both models
-     defaulting to gpt-5.5, the second call's value comes from the
-     prompt swap, not a tier upgrade.
+  3. ``vision_extract`` runs the standard prompt against ``VISION_MODEL``
+     and reads date / amount / supplier / receipt_type normally;
+  4. when the first-pass supplier is missing — the ``UNREADABLE_MERCHANT``
+     sentinel, ``None``, or an empty string — the router retries against
+     the same ``VISION_MODEL`` with a STRICTER merchant-only prompt. The
+     retry rewrites supplier ONLY; first-pass date / amount / currency /
+     receipt_type are preserved verbatim. A missing date or amount on the
+     first pass does NOT trigger the retry — the retry exists for
+     merchant ambiguity only and would not re-extract those fields.
 
 The real model identifiers are env-driven so non-production environments
 can point at fakes/stubs without code changes.
@@ -45,25 +50,29 @@ from app.json_utils import DecimalEncoder
 
 logger = logging.getLogger(__name__)
 
-# Single-tier vision model. Snapshot-pinned per leadership directive
-# (alias upgrades require explicit re-test against the receipt corpus).
-VISION_MODEL = os.getenv("OCR_VISION_MODEL", "gpt-5.5-2026-04-23")
+# Single-tier vision model. F1.3 reverts the OCR path to the previous
+# working ``gpt-5.4`` full snapshot after gpt-5.5 proved too slow and
+# too conservative on live receipts. ``gpt-5.4-mini`` is deliberately
+# NOT used here — leadership requires near-perfect first-pass OCR and
+# mini's quality is below that bar.
+VISION_MODEL = os.getenv("OCR_VISION_MODEL", "gpt-5.4")
 
 # Backwards-compat aliases — both default to the unified VISION_MODEL but
-# can be overridden independently via env for A/B testing.
+# can be overridden independently via env for A/B testing. With both
+# defaulting to the same full snapshot, the "mini tier" is effectively
+# disabled for receipt OCR until an env override re-enables it.
 MINI_MODEL = os.getenv("OCR_MINI_MODEL", VISION_MODEL)
 FULL_MODEL = os.getenv("OCR_FULL_MODEL", VISION_MODEL)
 CHAT_MODEL = os.getenv("CHAT_MODEL", VISION_MODEL)
 SYNTHESIS_MODEL = os.getenv("SYNTHESIS_MODEL", VISION_MODEL)
 MATCHING_MODEL = os.getenv("MATCHING_MODEL", VISION_MODEL)
 
-# gpt-5.5 is a reasoning model: a chunk of every completion's token budget
-# is consumed by internal reasoning before any visible output is emitted.
-# At 256 (the gpt-5.4 default) reasoning consumed the entire budget,
-# finish_reason came back "length", and message.content was empty — so
-# every receipt looked like an extraction failure regardless of image
-# clarity. 2048 leaves headroom for both reasoning and the small JSON
-# objects these prompts ask for. Bump if reasoning gets denser.
+# Lower bound for the OpenAI completion-token budget. Originally raised
+# to 2048 in F1.1 to accommodate gpt-5.5's reasoning overhead; gpt-5.4
+# has no such overhead and would be fine at the original 256. Kept high
+# because it costs nothing at non-reasoning models (max, not target),
+# leaves headroom if a future env override re-enables a reasoning model,
+# and keeps the F1.1 regression guard meaningful.
 _MAX_COMPLETION_TOKENS = 2048
 
 CRITICAL_FIELDS = ("date", "supplier", "amount")
@@ -113,18 +122,22 @@ _VISION_PROMPT = (
     "Return only the JSON object, no other text."
 )
 
-# Stricter retry variant — used when the first pass returned the
-# UNREADABLE_MERCHANT sentinel, missing critical fields, or otherwise
-# came back unusable. Front-loads the antipattern list so the model
-# isn't tempted to re-invent the same hallucination on the second try.
+# Stricter retry variant — used ONLY when the first pass returned the
+# UNREADABLE_MERCHANT sentinel for supplier. The retry is scoped to
+# merchant/supplier ambiguity: it asks the model to re-read the masthead
+# more carefully and ignore everything else. Date and amount from the
+# first pass are preserved by the caller, so this prompt deliberately
+# does NOT re-instruct the model on amount or date selection — those
+# fields stay valid even when supplier was unreadable.
 _VISION_PROMPT_STRICT = (
-    "You already failed to extract clean fields from this receipt on a "
-    "first pass. Try again — slowly, more carefully — and obey these "
-    "rules without exception:\n"
+    "Look at this receipt image one more time. The first extraction pass "
+    "could not read the merchant name with confidence and abstained with "
+    "a sentinel. Date and amount have already been captured — your only "
+    "task here is to re-read the merchant masthead.\n"
     "\n"
-    "MERCHANT NAME — the most common failure mode. Output the merchant "
-    "name EXACTLY as printed on the masthead (the topmost line of the "
-    "receipt header).\n"
+    "MERCHANT NAME RULES — obey without exception:\n"
+    "  Output the merchant name EXACTLY as printed on the masthead (the "
+    "topmost line of the receipt header).\n"
     "  DO NOT compose merchant names from any of the following — these "
     "are all NOT the merchant:\n"
     "    - address fragments (street names, neighborhood/district names, "
@@ -142,19 +155,10 @@ _VISION_PROMPT_STRICT = (
     f"\"{UNREADABLE_MERCHANT_SENTINEL}\" — DO NOT guess. We would rather "
     f"see the sentinel than a hallucinated name.\n"
     "\n"
-    "TOTAL AMOUNT — pick the LARGEST line at the bottom of the receipt "
-    "labeled TUTAR, TOPLAM, AMOUNT, GENEL TOPLAM, or equivalent. NEVER "
-    "pick ARA TOPLAM (subtotal), KDV (tax-only), or per-line subtotals. "
-    "If multiple totals exist, pick the largest unless one is explicitly "
-    "marked DISCOUNT/INDIRIM.\n"
-    "\n"
-    "DATE — the receipt is recent. If you find yourself reading a year "
-    "more than 6 months in the past, double-check — you are probably "
-    "misreading the year digit (e.g., reading \"2022\" when it actually "
-    "says \"2025\" or \"2026\").\n"
-    "\n"
-    "Return ONLY the JSON object with the same keys as before. No prose, "
-    "no code fences, no explanation."
+    "Return ONLY a JSON object with exactly one key:\n"
+    "  supplier (string — the merchant name, or the sentinel above).\n"
+    "Do not include date, amount, or any other fields. No prose, no code "
+    "fences, no explanation."
 )
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -175,11 +179,11 @@ _PDF_MAX_PAGES = 10
 
 @dataclass(frozen=True)
 class VisionResult:
-    """Outcome of a staged vision call."""
+    """Outcome of a single-tier vision call (with optional merchant retry)."""
 
     fields: dict[str, Any]
-    model: str  # which tier actually produced the fields
-    escalated: bool  # true if the full model was used after the mini attempt
+    model: str  # the model that produced the fields (single-tier post-F1.3)
+    escalated: bool  # true when the merchant-only stricter retry was used
     notes: list[str]
 
 
@@ -236,6 +240,31 @@ def _count_missing(fields: dict[str, Any]) -> list[str]:
 
 def _is_unreadable_merchant_sentinel(value: Any) -> bool:
     return isinstance(value, str) and value.strip().upper() == UNREADABLE_MERCHANT_SENTINEL
+
+
+def _supplier_needs_merchant_retry(value: Any) -> bool:
+    """True when the first-pass supplier value should trigger the
+    merchant-only retry.
+
+    The retry exists to recover the merchant masthead when the first
+    pass couldn't read it. Three first-pass shapes count as "couldn't
+    read it":
+      - the explicit ``UNREADABLE_MERCHANT`` abstention sentinel;
+      - a literal ``None`` (model emitted no value);
+      - an empty / whitespace-only string.
+
+    The retry is merchant-only and preserves first-pass date / amount /
+    currency / receipt_type, so it cannot blank good fields — making
+    it safe to fire on the broader "supplier missing" signal, not just
+    the explicit sentinel.
+    """
+    if _is_unreadable_merchant_sentinel(value):
+        return True
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
 
 
 def _normalize_unreadable_supplier(fields: dict[str, Any]) -> dict[str, Any]:
@@ -768,14 +797,33 @@ def generate_travel_reason_summary(business_reasons: list[str]) -> str | None:
 
 
 def vision_extract(storage_path: str) -> VisionResult | None:
-    """Run the staged vision pipeline (mini → full) for one image or PDF.
+    """Run the single-tier vision pipeline for one image or PDF.
 
     For PDFs, every page (capped at ``_PDF_MAX_PAGES``) is rasterized once
     and all page images are sent together in each model call, preserving
     cross-page context (e.g. totals on a later page referencing bookings
     on the first).
 
-    Returns ``None`` when the file is unsupported or no model responded.
+    Pipeline:
+      1. Call the full vision model with ``_VISION_PROMPT`` and read all
+         fields (date, amount, supplier, currency, business_or_personal,
+         receipt_type) from the response.
+      2. If the first-pass supplier is missing — the
+         ``UNREADABLE_MERCHANT`` sentinel, ``None``, or an empty
+         string — retry the same model with ``_VISION_PROMPT_STRICT``
+         (merchant-only) and merge the retry's supplier over the
+         first-pass result. First-pass date / amount / currency /
+         receipt_type are preserved across the retry — supplier
+         ambiguity must NEVER blank a date or amount that the first
+         pass extracted.
+      3. A missing amount or missing date on the first pass does NOT
+         trigger the retry. The retry is merchant-only and would not
+         re-extract those fields anyway; a null amount or null date
+         is reported as-is rather than papered over with a second
+         guess.
+
+    Returns ``None`` when the file is unsupported or the first-pass
+    model call itself produced no parseable response.
     """
     path = Path(storage_path)
     suffix = path.suffix.lower()
@@ -795,44 +843,55 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     else:
         return None
 
-    first_fields = _vision_call(MINI_MODEL, images)
-    if first_fields is not None:
-        missing = _count_missing(first_fields)
-        if not missing:
-            notes.append(f"Vision extraction succeeded on first pass ({MINI_MODEL}).")
-            return VisionResult(
-                fields=_normalize_unreadable_supplier(first_fields),
-                model=MINI_MODEL, escalated=False, notes=notes,
-            )
-        if "supplier" in missing and _is_unreadable_merchant_sentinel(first_fields.get("supplier")):
-            notes.append(
-                f"First pass ({MINI_MODEL}) reported {UNREADABLE_MERCHANT_SENTINEL} for supplier; "
-                "retrying with stricter prompt."
-            )
-        else:
-            notes.append(
-                f"First pass ({MINI_MODEL}) returned missing critical fields {missing}; "
-                "retrying with stricter prompt."
-            )
-    else:
-        notes.append(f"First pass ({MINI_MODEL}) unavailable or invalid; retrying with stricter prompt.")
-
-    retry_fields = _vision_call(FULL_MODEL, images, _VISION_PROMPT_STRICT)
-    if retry_fields is not None:
-        notes.append(f"Vision extraction succeeded on stricter retry ({FULL_MODEL}).")
-        return VisionResult(
-            fields=_normalize_unreadable_supplier(retry_fields),
-            model=FULL_MODEL, escalated=True, notes=notes,
+    first_fields = _vision_call(VISION_MODEL, images)
+    if first_fields is None:
+        notes.append(
+            f"First pass ({VISION_MODEL}) unavailable or returned invalid JSON; "
+            "no retry (retry is scoped to merchant ambiguity)."
         )
+        return None
 
-    # Both passes failed but the first attempt produced *something* — prefer
-    # returning partial data over nothing so deterministic fields still merge.
-    if first_fields is not None:
-        notes.append("Stricter retry unavailable; returning partial first-pass fields.")
+    first_supplier = first_fields.get("supplier")
+    if not _supplier_needs_merchant_retry(first_supplier):
+        notes.append(f"Vision extraction succeeded on first pass ({VISION_MODEL}).")
         return VisionResult(
             fields=_normalize_unreadable_supplier(first_fields),
-            model=MINI_MODEL, escalated=False, notes=notes,
+            model=VISION_MODEL, escalated=False, notes=notes,
         )
 
-    notes.append("All vision passes failed.")
-    return None
+    # Supplier-only ambiguity → run stricter merchant-only retry. Date and
+    # amount from the first pass stand: a supplier-side problem must never
+    # blank fields that were already extracted cleanly.
+    if _is_unreadable_merchant_sentinel(first_supplier):
+        retry_reason = f"reported {UNREADABLE_MERCHANT_SENTINEL} for supplier"
+    elif first_supplier is None:
+        retry_reason = "returned null supplier"
+    else:
+        retry_reason = "returned empty/whitespace supplier"
+    notes.append(
+        f"First pass ({VISION_MODEL}) {retry_reason}; "
+        "retrying merchant extraction with stricter prompt (date/amount preserved)."
+    )
+    retry_fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_STRICT)
+    merged = dict(first_fields)
+    # ``escalated`` reflects whether the retry actually contributed to the
+    # returned result. A None retry response means the retry didn't run (or
+    # ran and failed to parse) — we keep the first-pass fields unchanged,
+    # which is semantically the same as "no retry happened" from the
+    # downstream caller's perspective.
+    retry_contributed = retry_fields is not None and "supplier" in retry_fields
+    if retry_contributed:
+        merged["supplier"] = retry_fields.get("supplier")
+        notes.append(
+            f"Stricter merchant retry ({VISION_MODEL}) returned supplier="
+            f"{retry_fields.get('supplier')!r}; date/amount/etc. preserved from first pass."
+        )
+    else:
+        notes.append(
+            "Stricter merchant retry unavailable; keeping first-pass fields with supplier "
+            "normalized to None."
+        )
+    return VisionResult(
+        fields=_normalize_unreadable_supplier(merged),
+        model=VISION_MODEL, escalated=retry_contributed, notes=notes,
+    )

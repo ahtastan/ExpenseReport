@@ -8,12 +8,10 @@ The router must:
     mean the model couldn't read the merchant masthead;
   - on retry, swap supplier from the retry response while preserving
     first-pass date / amount / currency / receipt_type;
-  - NOT retry on missing date or missing amount — the merchant-only
-    retry can't recover those fields, and re-extracting them would
-    risk overwriting valid data with a second guess;
+  - run focused date-only and amount-only retries when those fields are
+    missing, without overwriting clean first-pass values;
   - return ``None`` when the first-pass call itself produced no
-    parseable response (no retry on transient API failure — retry is
-    scoped to merchant ambiguity, per the F1.3 PM directive).
+    parseable response (focused retries require a valid first-pass payload).
 """
 
 from __future__ import annotations
@@ -41,9 +39,12 @@ class _Recorder:
     def __init__(self, responses: list[dict | None]):
         self._responses = list(responses)
         self.calls: list[str] = []
+        self.prompts: list[str] = []
 
     def __call__(self, model, images, *args, **kwargs):  # matches the real signature
         self.calls.append(model)
+        prompt = args[0] if args else kwargs.get("prompt")
+        self.prompts.append(prompt if prompt is not None else "<default>")
         if not self._responses:
             return None
         return self._responses.pop(0)
@@ -66,36 +67,123 @@ def test_clean_first_pass_returns_without_retry(tmp_path, monkeypatch):
     assert result.fields["supplier"] == "Migros"
 
 
-def test_missing_amount_does_not_trigger_retry(tmp_path, monkeypatch):
-    """Per F1.3: amount absence is NOT merchant ambiguity. The router
-    must accept a null amount from the first pass and not run the
-    merchant-only retry — the retry would not re-extract the amount
-    anyway, and we'd rather report an honest null than a hallucinated
-    figure from a second guess."""
+def test_missing_amount_triggers_amount_only_retry(tmp_path, monkeypatch):
+    """F1.4: amount absence gets one focused amount/currency retry."""
     rec = _Recorder([
         {"date": "2026-04-01", "supplier": "Migros", "amount": None},
+        {"amount": 42.5, "currency": "TRY"},
     ])
     monkeypatch.setattr(model_router, "_vision_call", rec)
     result = model_router.vision_extract(str(_fake_image(tmp_path)))
     assert result is not None
-    assert result.escalated is False
-    assert rec.calls == [model_router.VISION_MODEL]
-    assert result.fields["amount"] is None
+    assert result.escalated is True
+    assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    assert rec.prompts[1] == model_router._VISION_PROMPT_AMOUNT_ONLY
+    assert result.fields["amount"] == 42.5
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["date"] == "2026-04-01"
     assert result.fields["supplier"] == "Migros"
 
 
-def test_missing_date_does_not_trigger_retry(tmp_path, monkeypatch):
-    """Same scoping rule as missing amount — date absence is not the
-    merchant ambiguity the retry exists to fix."""
+def test_missing_date_triggers_date_only_retry(tmp_path, monkeypatch):
+    """F1.4: date absence gets one focused date retry."""
     rec = _Recorder([
         {"date": None, "supplier": "Migros", "amount": 42.5, "currency": "TRY"},
+        {"date": "2026-04-01"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is not None
+    assert result.escalated is True
+    assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    assert rec.prompts[1] == model_router._VISION_PROMPT_DATE_ONLY
+    assert result.fields["date"] == "2026-04-01"
+    assert result.fields["amount"] == 42.5
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["supplier"] == "Migros"
+
+
+def test_missing_date_does_not_trigger_amount_or_supplier_retry(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": None, "supplier": "Migros", "amount": 42.5, "currency": "TRY"},
+        {"date": "2026-04-01"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is not None
+    assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    assert rec.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+
+
+def test_missing_amount_does_not_trigger_date_or_supplier_retry(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": "2026-04-01", "supplier": "Migros", "amount": None, "currency": "TRY"},
+        {"amount": 42.5, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is not None
+    assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    assert rec.prompts == ["<default>", model_router._VISION_PROMPT_AMOUNT_ONLY]
+
+
+def test_missing_currency_retries_without_overwriting_first_pass_amount(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": "2026-04-01", "supplier": "Migros", "amount": 42.5, "currency": None},
+        {"amount": 9999.99, "currency": "TRY", "date": "1999-01-01", "supplier": "Wrong"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is not None
+    assert result.escalated is True
+    assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    assert rec.prompts[1] == model_router._VISION_PROMPT_AMOUNT_ONLY
+    assert result.fields["date"] == "2026-04-01"
+    assert result.fields["supplier"] == "Migros"
+    assert result.fields["amount"] == 42.5
+    assert result.fields["currency"] == "TRY"
+
+
+def test_focused_retries_only_fill_missing_fields(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": None, "supplier": None, "amount": None, "currency": None,
+         "receipt_type": "payment_receipt"},
+        {"supplier": "Migros", "date": "1999-01-01", "amount": 9999.99},
+        {"date": "2026-04-01", "supplier": "Wrong", "amount": 9999.99},
+        {"amount": 42.5, "currency": "TRY", "date": "1999-01-01", "supplier": "Wrong"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+    assert result is not None
+    assert result.escalated is True
+    assert rec.prompts == [
+        "<default>",
+        model_router._VISION_PROMPT_STRICT,
+        model_router._VISION_PROMPT_DATE_ONLY,
+        model_router._VISION_PROMPT_AMOUNT_ONLY,
+    ]
+    assert result.fields["supplier"] == "Migros"
+    assert result.fields["date"] == "2026-04-01"
+    assert result.fields["amount"] == 42.5
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["receipt_type"] == "payment_receipt"
+
+
+def test_failed_focused_retries_keep_first_pass_fields(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": None, "supplier": "Migros", "amount": 42.5, "currency": "TRY"},
+        {"date": None, "amount": 9999.99, "supplier": "Wrong"},
     ])
     monkeypatch.setattr(model_router, "_vision_call", rec)
     result = model_router.vision_extract(str(_fake_image(tmp_path)))
     assert result is not None
     assert result.escalated is False
-    assert rec.calls == [model_router.VISION_MODEL]
+    assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    assert rec.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
     assert result.fields["date"] is None
+    assert result.fields["supplier"] == "Migros"
+    assert result.fields["amount"] == 42.5
+    assert result.fields["currency"] == "TRY"
 
 
 def test_null_supplier_triggers_merchant_only_retry(tmp_path, monkeypatch):

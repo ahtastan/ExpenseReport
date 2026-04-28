@@ -158,7 +158,7 @@ def test_implausible_first_pass_date_retries_and_saves_recovered_date(
 
 @pytest.mark.parametrize(
     "retry_value",
-    ["15-11-2025", "15/11/2025", "15.11.2025"],
+    ["15-11-2025", "15/11/2025", "15.11.2025", "2025/11/15"],
 )
 def test_date_retry_normalizes_turkish_pos_date_formats(
     isolated_db,
@@ -290,8 +290,9 @@ def test_date_only_retry_prompt_calls_out_turkish_pos_receipt_dates() -> None:
     assert "DD-MM-YYYY" in prompt
     assert "DD/MM/YYYY" in prompt
     assert "DD.MM.YYYY" in prompt
+    assert "YYYY/MM/DD" in prompt
     assert "receipt date, not the card transaction date" in prompt
     assert "current date" in prompt
     assert "upload date" in prompt
     assert "Telegram timestamp" in prompt
-    assert "impossible years" in prompt
+    assert "implausibly old years" not in prompt

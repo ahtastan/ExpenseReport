@@ -23,7 +23,7 @@ AMOUNT_RE = re.compile(
     r"(?:(?P<currency>TRY|TL|USD|EUR|\$|₺)\s*)?(?P<amount>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2}))\s*(?P<trailing>TRY|TL|USD|EUR)?",
     re.IGNORECASE,
 )
-ISO_DATE_RE = re.compile(r"(?<!\d)(?P<year>20\d{2})[-_.](?P<month>\d{1,2})[-_.](?P<day>\d{1,2})(?!\d)")
+ISO_DATE_RE = re.compile(r"(?<!\d)(?P<year>20\d{2})[-_.\/](?P<month>\d{1,2})[-_.\/](?P<day>\d{1,2})(?!\d)")
 LOCAL_DATE_RE = re.compile(r"(?<!\d)(?P<day>\d{1,2})[-_.\/](?P<month>\d{1,2})[-_.\/](?P<year>20\d{2})(?!\d)")
 MERCHANT_HINT_RE = re.compile(r"(?:merchant|vendor|supplier|store|restaurant)\s*[:=-]\s*(?P<merchant>[^|,\n]+)", re.IGNORECASE)
 # Platform-generated placeholder stems produced by services/telegram.py when a

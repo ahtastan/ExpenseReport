@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -147,6 +148,12 @@ def test_best_photo_mixed_file_size_falls_back_to_largest_area() -> None:
 
     assert best is not None
     assert best["file_id"] == "large_without_size"
+
+
+def test_telegram_receipt_amount_display_uses_two_decimals() -> None:
+    assert telegram_service._format_receipt_amount(Decimal("175.0000"), "TRY") == "175.00 TRY"
+    assert telegram_service._format_receipt_amount(Decimal("715.0000"), "TRY") == "715.00 TRY"
+    assert telegram_service._format_receipt_amount(Decimal("15680.0000"), "TRY") == "15680.00 TRY"
 
 
 def test_receipt_progress_ack_sent_before_extraction(monkeypatch) -> None:

@@ -202,6 +202,153 @@ def test_suspicious_small_try_amount_uses_amount_retry_when_larger_total_found(
     assert result.fields["receipt_type"] == "payment_receipt"
 
 
+def test_first_pass_amount_text_overrides_locale_damaged_numeric_amount(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {
+            "date": "2025-11-15",
+            "supplier": "45BUSINESSHOTEL",
+            "amount_text": "15.680,00 TL",
+            "amount": 15.68,
+            "currency": "TRY",
+            "receipt_type": "payment_receipt",
+        },
+        {"supplier": "45BUSINESSHOTEL"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] == 15680
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["amount_text"] == "15.680,00 TL"
+
+
+def test_first_pass_amount_text_handles_us_grouped_total(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {
+            "date": "2025-11-15",
+            "supplier": "45BUSINESSHOTEL",
+            "amount_text": "15,680.00 TL",
+            "amount": 15.68,
+            "currency": "TRY",
+            "receipt_type": "payment_receipt",
+        },
+        {"supplier": "45BUSINESSHOTEL"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] == 15680
+    assert result.fields["currency"] == "TRY"
+
+
+def test_first_pass_amount_text_handles_space_and_plain_turkish_totals(tmp_path, monkeypatch):
+    for raw_text in ("15 680,00 TL", "15680,00 TL"):
+        rec = _Recorder([
+            {
+                "date": "2025-11-15",
+                "supplier": "45BUSINESSHOTEL",
+                "amount_text": raw_text,
+                "amount": 15.68,
+                "currency": "TRY",
+                "receipt_type": "payment_receipt",
+            },
+            {"supplier": "45BUSINESSHOTEL"},
+        ])
+        monkeypatch.setattr(model_router, "_vision_call", rec)
+
+        result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+        assert result is not None
+        assert result.fields["amount"] == 15680
+        assert result.fields["currency"] == "TRY"
+
+
+def test_amount_text_keeps_small_turkish_amounts_correct(tmp_path, monkeypatch):
+    for raw_text, expected in (("175,00 TL", 175), ("715,00 TL", 715)):
+        rec = _Recorder([
+            {
+                "date": "2025-11-15",
+                "supplier": "Restaurant",
+                "amount_text": raw_text,
+                "amount": expected,
+                "currency": "TRY",
+                "receipt_type": "payment_receipt",
+            },
+            {"supplier": "Restaurant"},
+            {"amount": None, "currency": "TRY"},
+        ])
+        monkeypatch.setattr(model_router, "_vision_call", rec)
+
+        result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+        assert result is not None
+        assert result.fields["amount"] == expected
+        assert result.fields["currency"] == "TRY"
+
+
+def test_amount_retry_amount_text_overrides_locale_damaged_retry_number(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "45BUSINESSHOTEL", "amount": 580,
+         "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "45BUSINESSHOTEL"},
+        {"amount_text": "15.680,00 TL", "amount": 15.68, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] == 15680
+    assert result.fields["currency"] == "TRY"
+
+
+def test_amount_text_invalid_falls_back_to_numeric_amount(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {
+            "date": "2025-11-15",
+            "supplier": "Restaurant",
+            "amount_text": "TOTAL UNREADABLE",
+            "amount": 715,
+            "currency": "TRY",
+            "receipt_type": "payment_receipt",
+        },
+        {"supplier": "Restaurant"},
+        {"amount": None, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] == 715
+    assert result.fields["currency"] == "TRY"
+
+
+def test_kdv_only_amount_text_does_not_use_same_numeric_value_as_total(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {
+            "date": "2025-11-15",
+            "supplier": "Hotel",
+            "amount_text": "KDV TOPLAM 1.568,00 TL",
+            "amount": 1568,
+            "currency": "TRY",
+            "receipt_type": "payment_receipt",
+        },
+        {"amount": None, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] is None
+    assert result.fields["currency"] == "TRY"
+
+
 def test_suspicious_amount_retry_null_preserves_first_pass_amount(tmp_path, monkeypatch):
     rec = _Recorder([
         {"date": "2025-11-15", "supplier": "ISMAIL KOSE PETROL", "amount": 715,

@@ -107,7 +107,7 @@ def test_suspicious_amount_retry_preserves_context_fields(
         {"date": "2025-11-15", "supplier": "45BUSINESSHOTEL",
          "amount": 680, "currency": "TRY", "receipt_type": "payment_receipt"},
         {"supplier": "45BUSINESSHOTEL"},
-        {"amount": 15680, "currency": "TRY"},
+        {"amount_text": "15.680,00 TL", "amount": 15.68, "currency": "TRY"},
     ])
     monkeypatch.setattr(model_router, "_vision_call", recorder)
 

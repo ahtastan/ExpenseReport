@@ -3,6 +3,7 @@ import logging
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -146,6 +147,18 @@ def _send_receipt_progress_ack(client: TelegramClient, chat_id: int, receipt_id:
             receipt_id,
             exc,
         )
+
+
+def _format_receipt_amount(amount: Any, currency: str | None) -> str:
+    if amount is None:
+        amount_text = "?"
+    else:
+        try:
+            amount_text = f"{Decimal(str(amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+        except (InvalidOperation, ValueError):
+            amount_text = str(amount)
+    currency_text = (currency or "").strip()
+    return f"{amount_text} {currency_text}".strip()
 
 
 def _document_is_receipt(document: dict[str, Any]) -> bool:
@@ -298,7 +311,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                     summary = (
                         f"I read: {existing.extracted_date or '?'} | "
                         f"{existing.extracted_supplier or '?'} | "
-                        f"{existing.extracted_local_amount or '?'} {existing.extracted_currency or ''}."
+                        f"{_format_receipt_amount(existing.extracted_local_amount, existing.extracted_currency)}."
                     )
                     client.send_message(chat_id, f"{summary}\n{open_questions[0].question_text}")
                 else:
@@ -355,7 +368,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
             summary = (
                 f"I read: {receipt.extracted_date or '?'} | "
                 f"{receipt.extracted_supplier or '?'} | "
-                f"{receipt.extracted_local_amount or '?'} {receipt.extracted_currency or ''}."
+                f"{_format_receipt_amount(receipt.extracted_local_amount, receipt.extracted_currency)}."
             )
             client.send_message(chat_id, f"{summary}\n{questions[0].question_text}")
         else:

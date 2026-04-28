@@ -255,6 +255,11 @@ def test_implausible_first_pass_date_retry_uses_enhanced_image_path(
 
     assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
     assert receipt.extracted_date == date(2025, 11, 15)
+    # Non-date fields from the first pass must survive the enhanced retry.
+    assert receipt.extracted_local_amount == Decimal("175.0000")
+    assert receipt.extracted_currency == "TRY"
+    assert receipt.extracted_supplier == "YENI DUNYA TUR PET VE PET UR"
+    assert receipt.receipt_type == "payment_receipt"
     assert "receipt_date" not in question_keys
     assert len(seen_paths) == 2
     assert seen_paths[0].endswith("telegram_photo_2014.png")
@@ -294,6 +299,11 @@ def test_missing_first_pass_date_retry_uses_enhanced_image_path(
 
     assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
     assert receipt.extracted_date == date(2025, 11, 15)
+    # Non-date fields from the first pass must survive the enhanced retry.
+    assert receipt.extracted_local_amount == Decimal("175.0000")
+    assert receipt.extracted_currency == "TRY"
+    assert receipt.extracted_supplier == "YENI DUNYA TUR PET VE PET UR"
+    assert receipt.receipt_type == "payment_receipt"
     assert "receipt_date" not in question_keys
     assert len(seen_paths) == 2
     assert seen_paths[0].endswith("telegram_photo_2014.png")

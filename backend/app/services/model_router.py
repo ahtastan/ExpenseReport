@@ -163,6 +163,9 @@ _VISION_PROMPT_STRICT = (
 _VISION_PROMPT_DATE_ONLY = (
     "Look at this receipt image one more time. Date is the only missing "
     "field from the first extraction pass. Your only task is to find the "
+    "printed receipt date. The image may contain multiple zoomed crops "
+    "of the same receipt stacked vertically to aid readability; treat "
+    "them as views of the same receipt and return any clearly visible "
     "printed receipt date.\n"
     "\n"
     "DATE RULES:\n"

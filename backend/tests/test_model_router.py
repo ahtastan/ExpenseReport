@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -360,3 +361,27 @@ def test_unsupported_file_extension_makes_no_model_calls(tmp_path, monkeypatch):
     result = model_router.vision_extract(str(unsupported))
     assert result is None
     assert rec.calls == []
+
+
+@pytest.mark.parametrize(
+    "width,height",
+    [(1, 1), (222, 521), (2400, 3000), (5000, 5000)],
+)
+def test_scale_for_date_retry_crop_respects_bounds(width: int, height: int) -> None:
+    """The scale factor must always be in [1, 4]. The helper either fits
+    the upscaled crop within the 2400-largest-side cap or, for inputs
+    already at/above the cap, returns scale=1 (no further upscale, no
+    downscale)."""
+    scale = model_router._scale_for_date_retry_crop(width, height)
+    assert 1 <= scale <= 4
+    largest_side = max(width, height)
+    # Cap is honored: either the upscaled side fits within 2400, or the
+    # input was already large enough that the helper backs off to scale=1.
+    assert scale * largest_side <= max(2400, largest_side)
+
+
+def test_scale_for_date_retry_crop_upscales_low_res_meaningfully() -> None:
+    """The actual prod failure mode (a 222x521 Telegram thumbnail) must
+    receive a non-trivial upscale so the date retry sees readable pixels."""
+    scale = model_router._scale_for_date_retry_crop(222, 521)
+    assert scale >= 2, f"low-res 222x521 must be upscaled at least 2x, got scale={scale}"

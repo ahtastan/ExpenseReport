@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 AMOUNT_RE = re.compile(
-    r"(?:(?P<currency>TRY|TL|USD|EUR|\$|₺)\s*)?(?P<amount>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2}))\s*(?P<trailing>TRY|TL|USD|EUR)?",
+    r"(?:(?P<currency>TRY|TL|USD|EUR|\$|₺)\s*)?"
+    r"(?P<amount>\d{1,3}(?:[\s\u00a0.,]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2}))"
+    r"\s*(?P<trailing>TRY|TL|USD|EUR)?",
     re.IGNORECASE,
 )
 ISO_DATE_RE = re.compile(r"(?<!\d)(?P<year>20\d{2})[-_.\/](?P<month>\d{1,2})[-_.\/](?P<day>\d{1,2})(?!\d)")
@@ -109,7 +111,7 @@ def validate_receipt_date(
 
 
 def _coerce_amount(raw: str) -> Decimal | None:
-    text = raw.strip()
+    text = raw.strip().replace("\u00a0", " ").replace(" ", "")
     if not text:
         return None
     if "," in text and "." in text:
@@ -120,6 +122,29 @@ def _coerce_amount(raw: str) -> Decimal | None:
         return Decimal(text).quantize(_AMOUNT_QUANT)
     except (InvalidOperation, ValueError):
         return None
+
+
+def _amount_label_score(line: str) -> int:
+    normalized = line.upper()
+    negative = any(label in normalized for label in ("KDV", "VAT", "TAX", "VERGI", "VERGİ"))
+    positive_labels = (
+        "GENEL TOPLAM",
+        "SATIS TUTAR",
+        "SATIŞ TUTAR",
+        "ISLEM TUTARI",
+        "İŞLEM TUTARI",
+        "TOPLAM",
+        "TUTAR",
+        "AMOUNT",
+        "ODENEN",
+        "ÖDENEN",
+    )
+    positive = any(label in normalized for label in positive_labels)
+    if negative and not any(label in normalized for label in ("SATIS TUTAR", "SATIŞ TUTAR")):
+        return -100
+    if positive:
+        return 100
+    return 0
 
 
 def _parse_date(text: str) -> date | None:
@@ -153,20 +178,25 @@ def _coerce_vision_date(value: object) -> date | None:
 
 
 def _parse_amount(text: str) -> tuple[Decimal | None, str | None]:
-    candidates: list[tuple[Decimal, str | None]] = []
-    for match in AMOUNT_RE.finditer(text):
-        amount = _coerce_amount(match.group("amount"))
-        if amount is None:
+    candidates: list[tuple[int, Decimal, str | None]] = []
+    for line in text.splitlines() or [text]:
+        score = _amount_label_score(line)
+        if score < 0:
             continue
-        currency = (match.group("currency") or match.group("trailing") or "").upper()
-        if currency == "$":
-            currency = "USD"
-        elif currency in {"TL", "₺"}:
-            currency = "TRY"
-        candidates.append((amount, currency or None))
+        for match in AMOUNT_RE.finditer(line):
+            amount = _coerce_amount(match.group("amount"))
+            if amount is None:
+                continue
+            currency = (match.group("currency") or match.group("trailing") or "").upper()
+            if currency == "$":
+                currency = "USD"
+            elif currency in {"TL", "₺"}:
+                currency = "TRY"
+            candidates.append((score, amount, currency or None))
     if not candidates:
         return None, None
-    return max(candidates, key=lambda item: item[0])
+    _, amount, currency = max(candidates, key=lambda item: (item[0], item[1]))
+    return amount, currency
 
 
 def _clean_merchant(value: str) -> str | None:

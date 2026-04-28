@@ -42,6 +42,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -196,19 +197,26 @@ _VISION_PROMPT_DATE_ONLY = (
 
 _VISION_PROMPT_AMOUNT_ONLY = (
     "Look at this receipt image one more time. Amount and/or currency is "
-    "the only missing field from the first extraction pass. Your only task "
-    "is to find the final paid total and its currency.\n"
+    "missing or may have dropped leading thousands from the first extraction "
+    "pass. Your only task is to find the final payable total / card charge "
+    "amount and its currency.\n"
     "\n"
     "AMOUNT RULES:\n"
-    "  Return the final grand total / paid amount, not subtotals, taxes, "
-    "change, card balances, installments, tips-only lines, or per-item "
-    "prices.\n"
+    "  Return the final grand total / paid amount / card charge amount, not "
+    "subtotals, KDV/VAT/taxes, change, card balances, installments, tips-only "
+    "lines, invoice numbers, terminal IDs, tax IDs, or per-item prices.\n"
     "  For Turkish receipts, totals may be labeled TOPLAM, GENEL TOPLAM, "
-    "TUTAR, ODENEN, or ISLEM TUTARI. TRY, TL, and the Turkish lira symbol "
-    "all map to TRY.\n"
-    "  Preserve decimals as a number. If only currency is readable, return "
-    "amount null and the currency. If only amount is readable, return amount "
-    "and currency null.\n"
+    "TUTAR, SATIŞ TUTAR, SATIS TUTAR, AMOUNT, ODENEN, or ISLEM TUTARI. TRY, "
+    "TL, and the Turkish lira symbol all map to TRY.\n"
+    "  Turkish number formats use either comma or dot for thousands/decimals: "
+    "15.680,00 TL, 15,680.00 TL, 15 680,00 TL, and 15680,00 TL all mean "
+    "15680.00 TRY. Do not drop leading thousands.\n"
+    "  If multiple totals exist, prefer the final POS/card/payment total or "
+    "the line nearest TOPLAM/TUTAR/SATIŞ TUTAR over KDV/tax or line-item "
+    "amounts.\n"
+    "  Preserve decimals as a JSON number. If only currency is readable, "
+    "return amount null and the currency. If only amount is readable, return "
+    "amount and currency null.\n"
     "\n"
     "Return ONLY a JSON object with exactly these keys:\n"
     "  amount (number, or null),\n"
@@ -252,6 +260,13 @@ class _PreparedDateRetryImage:
 
 @dataclass(frozen=True)
 class _PreparedSupplierRetryImage:
+    path: Path
+    notes: list[str]
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _PreparedAmountRetryImage:
     path: Path
     notes: list[str]
     metadata: dict[str, Any]
@@ -357,6 +372,56 @@ def _date_missing(value: Any) -> bool:
 
 def _amount_missing(value: Any) -> bool:
     return value is None
+
+
+def _currency_code(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    if normalized in {"TL", "₺"}:
+        return "TRY"
+    return normalized or None
+
+
+def _amount_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    text = str(value).strip().replace("\u00a0", " ").replace(" ", "")
+    if not text:
+        return None
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".") if text.rfind(",") > text.rfind(".") else text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _amount_cents_text(value: Decimal) -> str:
+    cents = (value * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return str(abs(int(cents)))
+
+
+def _amount_looks_truncated_suffix(first_amount: Any, retry_amount: Any) -> bool:
+    first = _amount_decimal(first_amount)
+    retry = _amount_decimal(retry_amount)
+    if first is None or retry is None or retry <= first:
+        return False
+    first_cents = _amount_cents_text(first)
+    retry_cents = _amount_cents_text(retry)
+    return len(retry_cents) > len(first_cents) and retry_cents.endswith(first_cents)
+
+
+def _amount_needs_sanity_retry(amount: Any, currency: Any) -> bool:
+    value = _amount_decimal(amount)
+    if value is None:
+        return False
+    # Live F2 failure class: Turkish/POS totals with leading thousands dropped,
+    # e.g. 15,680.00 read as 680.00. Keep this bounded to avoid retrying every
+    # correct small receipt.
+    return _currency_code(currency) == "TRY" and Decimal("500") <= value < Decimal("1000")
 
 
 def _currency_missing(value: Any) -> bool:
@@ -672,6 +737,155 @@ def _supplier_retry_images_for_path(
     notes.extend(original_notes)
     if original_images is not None:
         notes.append("Supplier retry used original image because enhancement was unavailable.")
+    return original_images, notes, metadata
+
+
+def _create_enhanced_amount_retry_image(storage_path: str) -> _PreparedAmountRetryImage | None:
+    path = Path(storage_path)
+    if path.suffix.lower() not in _IMAGE_EXTENSIONS:
+        return None
+
+    temp_path: Path | None = None
+    try:
+        from PIL import Image, ImageEnhance, ImageOps  # deferred import
+
+        original_bytes = path.stat().st_size
+        with Image.open(path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return None
+
+        half_height = max(1, int(height * 0.50))
+        middle_start = max(0, min(height - half_height, int(height * 0.25)))
+        bottom_start = max(0, height - half_height)
+        crop_specs = [
+            ("top_50", (0, 0, width, min(height, half_height))),
+            ("middle_50", (0, middle_start, width, min(height, middle_start + half_height))),
+            ("bottom_50", (0, bottom_start, width, height)),
+            ("full_context", (0, 0, width, height)),
+        ]
+
+        enhanced_parts = []
+        for name, box in crop_specs:
+            crop = image.crop(box)
+            crop = ImageOps.grayscale(crop)
+            crop = ImageOps.autocontrast(crop)
+            crop = ImageEnhance.Contrast(crop).enhance(1.7)
+            scale = _scale_for_date_retry_crop(crop.width, crop.height)
+            if name == "full_context":
+                scale = min(scale, 2)
+            if scale > 1:
+                crop = crop.resize(
+                    (crop.width * scale, crop.height * scale),
+                    Image.Resampling.LANCZOS,
+                )
+            enhanced_parts.append((name, crop))
+
+        separator = 24
+        sheet_width = max(part.width for _, part in enhanced_parts)
+        sheet_height = sum(part.height for _, part in enhanced_parts) + separator * (
+            len(enhanced_parts) - 1
+        )
+        sheet = Image.new("L", (sheet_width, sheet_height), 255)
+        y = 0
+        for _, part in enhanced_parts:
+            x = (sheet_width - part.width) // 2
+            sheet.paste(part, (x, y))
+            y += part.height + separator
+
+        max_side = max(sheet.width, sheet.height)
+        if max_side > 3600:
+            ratio = 3600 / max_side
+            sheet = sheet.resize(
+                (max(1, int(sheet.width * ratio)), max(1, int(sheet.height * ratio))),
+                Image.Resampling.LANCZOS,
+            )
+
+        handle = tempfile.NamedTemporaryFile(
+            prefix="dcexpense-amount-retry-",
+            suffix=".png",
+            delete=False,
+        )
+        temp_path = Path(handle.name)
+        handle.close()
+        sheet.save(temp_path, format="PNG", optimize=True)
+        enhanced_bytes = temp_path.stat().st_size
+        metadata = {
+            "enhanced_used": True,
+            "original_width": width,
+            "original_height": height,
+            "original_bytes": original_bytes,
+            "enhanced_width": sheet.width,
+            "enhanced_height": sheet.height,
+            "enhanced_bytes": enhanced_bytes,
+            "crop_strategy": "top_50+middle_50+bottom_50+full_context_grayscale_autocontrast_contrast_upscale",
+        }
+        notes = [
+            "Enhanced amount retry image created using crop strategy "
+            "top_50+middle_50+bottom_50+full_context, grayscale/autocontrast/contrast, capped upscale.",
+            (
+                "Amount retry image metadata: "
+                f"original_width={width} original_height={height} original_bytes={original_bytes} "
+                f"enhanced_width={sheet.width} enhanced_height={sheet.height} "
+                f"enhanced_bytes={enhanced_bytes}"
+            ),
+        ]
+        logger.info(
+            "Amount retry enhanced image created original_path=%s original_width=%s "
+            "original_height=%s original_bytes=%s enhanced_path=%s enhanced_width=%s "
+            "enhanced_height=%s enhanced_bytes=%s crop_strategy=%s reason=amount_total_retry",
+            path,
+            width,
+            height,
+            original_bytes,
+            temp_path,
+            sheet.width,
+            sheet.height,
+            enhanced_bytes,
+            metadata["crop_strategy"],
+        )
+        return _PreparedAmountRetryImage(path=temp_path, notes=notes, metadata=metadata)
+    except Exception as exc:
+        logger.warning(
+            "Amount retry enhanced image creation failed path=%s error=%s; "
+            "falling back to original image.",
+            path,
+            exc,
+        )
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        return None
+
+
+def _amount_retry_images_for_path(
+    storage_path: str,
+) -> tuple[list[tuple[str, str]] | None, list[str], dict[str, Any]]:
+    notes: list[str] = []
+    metadata: dict[str, Any] = {"enhanced_used": False}
+    prepared = _create_enhanced_amount_retry_image(storage_path)
+    if prepared is not None:
+        notes.extend(prepared.notes)
+        metadata.update(prepared.metadata)
+        try:
+            enhanced_images, enhanced_notes = _vision_images_for_path(str(prepared.path))
+            notes.extend(enhanced_notes)
+            if enhanced_images is not None:
+                return enhanced_images, notes, metadata
+            notes.append(
+                "Enhanced amount retry image could not be encoded; falling back to original image."
+            )
+            logger.warning(
+                "Amount retry enhanced image could not be encoded path=%s; falling back to original image.",
+                prepared.path,
+            )
+        finally:
+            prepared.path.unlink(missing_ok=True)
+
+    original_images, original_notes = _vision_images_for_path(storage_path)
+    notes.extend(original_notes)
+    if original_images is not None:
+        notes.append("Amount retry used original image because enhancement was unavailable.")
     return original_images, notes, metadata
 
 
@@ -1326,18 +1540,40 @@ def vision_extract(storage_path: str) -> VisionResult | None:
 
     amount_missing = _amount_missing(merged.get("amount"))
     currency_missing = _currency_missing(merged.get("currency"))
-    if amount_missing or currency_missing:
+    amount_sanity_retry = (
+        not amount_missing
+        and not currency_missing
+        and Path(storage_path).suffix.lower() in _IMAGE_EXTENSIONS
+        and _amount_needs_sanity_retry(merged.get("amount"), merged.get("currency"))
+    )
+    if amount_missing or currency_missing or amount_sanity_retry:
         missing_names = [
             name
             for name, missing in (("amount", amount_missing), ("currency", currency_missing))
             if missing
         ]
-        notes.append(
-            f"{'/'.join(missing_names).capitalize()} missing after first pass ({VISION_MODEL}); "
-            "retrying amount-only extraction."
-        )
+        if amount_sanity_retry:
+            notes.append(
+                f"Amount {merged.get('amount')!r} {merged.get('currency')!r} may have "
+                "dropped leading thousands; retrying amount-only final-total extraction."
+            )
+        else:
+            notes.append(
+                f"{'/'.join(missing_names).capitalize()} missing after first pass ({VISION_MODEL}); "
+                "retrying amount-only extraction."
+            )
         retry_attempted = True
-        retry_fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_AMOUNT_ONLY)
+        retry_images, retry_image_notes, retry_image_metadata = (
+            _amount_retry_images_for_path(storage_path)
+            if Path(storage_path).suffix.lower() in _IMAGE_EXTENSIONS
+            else (images, [], {"enhanced_used": False})
+        )
+        notes.extend(retry_image_notes)
+        retry_fields = (
+            _vision_call(VISION_MODEL, retry_images, _VISION_PROMPT_AMOUNT_ONLY)
+            if retry_images is not None
+            else None
+        )
         retry_filled: list[str] = []
         if retry_fields is not None:
             retry_amount = retry_fields.get("amount")
@@ -1348,6 +1584,38 @@ def vision_extract(storage_path: str) -> VisionResult | None:
             if currency_missing and not _currency_missing(retry_currency):
                 merged["currency"] = retry_currency
                 retry_filled.append("currency")
+            if amount_sanity_retry and _amount_looks_truncated_suffix(
+                merged.get("amount"), retry_amount
+            ):
+                retry_currency_code = _currency_code(retry_currency)
+                current_currency_code = _currency_code(merged.get("currency"))
+                merged["amount"] = retry_amount
+                retry_filled.append("amount")
+                if retry_currency_code and retry_currency_code != current_currency_code:
+                    merged["currency"] = retry_currency_code
+                    retry_filled.append("currency")
+        metadata["amount_total_retry"] = {
+            **retry_image_metadata,
+            "first_pass_amount": first_fields.get("amount"),
+            "first_pass_currency": first_fields.get("currency"),
+            "retry_amount_raw": retry_fields.get("amount") if retry_fields else None,
+            "retry_currency_raw": retry_fields.get("currency") if retry_fields else None,
+            "final_amount": merged.get("amount"),
+            "final_currency": merged.get("currency"),
+            "reason": "amount_total_retry",
+        }
+        logger.info(
+            "Amount total retry completed first_pass_amount=%r first_pass_currency=%r "
+            "retry_amount_raw=%r retry_currency_raw=%r final_amount=%r final_currency=%r "
+            "enhanced_used=%s reason=amount_total_retry",
+            first_fields.get("amount"),
+            first_fields.get("currency"),
+            retry_fields.get("amount") if retry_fields else None,
+            retry_fields.get("currency") if retry_fields else None,
+            merged.get("amount"),
+            merged.get("currency"),
+            retry_image_metadata.get("enhanced_used"),
+        )
         if retry_filled:
             retry_contributed = True
             notes.append(

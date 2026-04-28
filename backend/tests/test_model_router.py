@@ -175,6 +175,67 @@ def test_missing_amount_triggers_amount_only_retry(tmp_path, monkeypatch):
     assert result.fields["supplier"] == "Migros"
 
 
+def test_suspicious_small_try_amount_uses_amount_retry_when_larger_total_found(
+    tmp_path,
+    monkeypatch,
+):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "45BUSINESSHOTEL", "amount": 680,
+         "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "45BUSINESSHOTEL"},
+        {"amount": 15680, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert rec.prompts == [
+        "<default>",
+        model_router._VISION_PROMPT_STRICT,
+        model_router._VISION_PROMPT_AMOUNT_ONLY,
+    ]
+    assert result.fields["amount"] == 15680
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["date"] == "2025-11-15"
+    assert result.fields["supplier"] == "45BUSINESSHOTEL"
+    assert result.fields["receipt_type"] == "payment_receipt"
+
+
+def test_suspicious_amount_retry_null_preserves_first_pass_amount(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "ISMAIL KOSE PETROL", "amount": 715,
+         "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "ISMAIL KOSE PETROL"},
+        {"amount": None, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] == 715
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["date"] == "2025-11-15"
+    assert result.fields["supplier"] == "ISMAIL KOSE PETROL"
+
+
+def test_suspicious_amount_retry_requires_truncated_suffix_pattern(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "ISMAIL KOSE PETROL", "amount": 715,
+         "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "ISMAIL KOSE PETROL"},
+        {"amount": 9999, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] == 715
+    assert result.fields["currency"] == "TRY"
+
+
 def test_missing_date_triggers_date_only_retry(tmp_path, monkeypatch):
     """F1.4: date absence gets one focused date retry."""
     rec = _Recorder([

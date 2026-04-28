@@ -239,6 +239,7 @@ _MEDIA_TYPES = {
 
 _PDF_RASTER_DPI = 180
 _PDF_MAX_PAGES = 10
+_AMOUNT_TRUNCATION_MIN_RATIO = Decimal("5")
 
 
 @dataclass(frozen=True)
@@ -408,6 +409,8 @@ def _amount_looks_truncated_suffix(first_amount: Any, retry_amount: Any) -> bool
     first = _amount_decimal(first_amount)
     retry = _amount_decimal(retry_amount)
     if first is None or retry is None or retry <= first:
+        return False
+    if first == 0 or retry / first < _AMOUNT_TRUNCATION_MIN_RATIO:
         return False
     first_cents = _amount_cents_text(first)
     retry_cents = _amount_cents_text(retry)

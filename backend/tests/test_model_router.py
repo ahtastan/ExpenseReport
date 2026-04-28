@@ -236,6 +236,22 @@ def test_suspicious_amount_retry_requires_truncated_suffix_pattern(tmp_path, mon
     assert result.fields["currency"] == "TRY"
 
 
+def test_suspicious_amount_retry_requires_large_multiplier(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "ISMAIL KOSE PETROL", "amount": 715,
+         "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "ISMAIL KOSE PETROL"},
+        {"amount": 1715, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] == 715
+    assert result.fields["currency"] == "TRY"
+
+
 def test_missing_date_triggers_date_only_retry(tmp_path, monkeypatch):
     """F1.4: date absence gets one focused date retry."""
     rec = _Recorder([

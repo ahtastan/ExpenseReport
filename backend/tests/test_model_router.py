@@ -267,6 +267,35 @@ def test_first_pass_amount_text_handles_space_and_plain_turkish_totals(tmp_path,
         assert result.fields["currency"] == "TRY"
 
 
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        "TOPLAM (KDV DAHIL) 15.680,00 TL",
+        "GENEL TOPLAM KDV DAHIL 15.680,00 TL",
+        "ÖDENECEK TUTAR (KDV DAHIL) 15.680,00 TL",
+    ],
+)
+def test_first_pass_amount_text_accepts_kdv_dahil_total_labels(tmp_path, monkeypatch, raw_text):
+    rec = _Recorder([
+        {
+            "date": "2025-11-15",
+            "supplier": "Restaurant",
+            "amount_text": raw_text,
+            "amount": 15.68,
+            "currency": "TRY",
+            "receipt_type": "payment_receipt",
+        },
+        {"supplier": "Restaurant"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] == 15680
+    assert result.fields["currency"] == "TRY"
+
+
 def test_amount_text_keeps_small_turkish_amounts_correct(tmp_path, monkeypatch):
     for raw_text, expected in (("175,00 TL", 175), ("715,00 TL", 715)):
         rec = _Recorder([
@@ -335,6 +364,28 @@ def test_kdv_only_amount_text_does_not_use_same_numeric_value_as_total(tmp_path,
             "supplier": "Hotel",
             "amount_text": "KDV TOPLAM 1.568,00 TL",
             "amount": 1568,
+            "currency": "TRY",
+            "receipt_type": "payment_receipt",
+        },
+        {"amount": None, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] is None
+    assert result.fields["currency"] == "TRY"
+
+
+@pytest.mark.parametrize("raw_text", ["KDV 62,85 TL", "TOPKDV 62,85 TL"])
+def test_tax_only_amount_text_does_not_use_same_numeric_value_as_total(tmp_path, monkeypatch, raw_text):
+    rec = _Recorder([
+        {
+            "date": "2025-11-15",
+            "supplier": "Restaurant",
+            "amount_text": raw_text,
+            "amount": 62.85,
             "currency": "TRY",
             "receipt_type": "payment_receipt",
         },

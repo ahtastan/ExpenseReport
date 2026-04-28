@@ -273,11 +273,14 @@ _AMOUNT_POSITIVE_LABELS = (
     "TOPLAM",
     "TUTAR",
     "AMOUNT",
+    "ODENECEK",
+    "ÖDENECEK",
     "ODENEN",
     "ÖDENEN",
 )
 _AMOUNT_TAX_LABELS = ("KDV", "VAT", "TAX", "VERGI", "VERGİ")
 _AMOUNT_SALES_LABELS = ("SATIS TUTAR", "SATIŞ TUTAR")
+_AMOUNT_TAX_INCLUDED_MODIFIERS = ("KDV DAHIL", "KDV DAHİL")
 
 
 @dataclass(frozen=True)
@@ -451,7 +454,10 @@ def _amount_text_label_score(line: str) -> int:
     normalized = line.upper()
     negative = any(label in normalized for label in _AMOUNT_TAX_LABELS)
     positive = any(label in normalized for label in _AMOUNT_POSITIVE_LABELS)
+    tax_included_modifier = any(label in normalized for label in _AMOUNT_TAX_INCLUDED_MODIFIERS)
     if negative and not any(label in normalized for label in _AMOUNT_SALES_LABELS):
+        if positive and tax_included_modifier:
+            return 100
         return -100
     if positive:
         return 100

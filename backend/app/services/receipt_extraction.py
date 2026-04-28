@@ -136,11 +136,16 @@ def _amount_label_score(line: str) -> int:
         "TOPLAM",
         "TUTAR",
         "AMOUNT",
+        "ODENECEK",
+        "ÖDENECEK",
         "ODENEN",
         "ÖDENEN",
     )
     positive = any(label in normalized for label in positive_labels)
+    tax_included_modifier = any(label in normalized for label in ("KDV DAHIL", "KDV DAHİL"))
     if negative and not any(label in normalized for label in ("SATIS TUTAR", "SATIŞ TUTAR")):
+        if positive and tax_included_modifier:
+            return 100
         return -100
     if positive:
         return 100

@@ -45,6 +45,26 @@ def test_kdv_amount_is_not_chosen_over_total_label() -> None:
     assert currency == "TRY"
 
 
+def test_kdv_dahil_total_labels_are_not_treated_as_tax_only() -> None:
+    for raw in (
+        "TOPLAM (KDV DAHIL) 15.680,00 TL",
+        "GENEL TOPLAM KDV DAHIL 15.680,00 TL",
+        "ÖDENECEK TUTAR (KDV DAHIL) 15.680,00 TL",
+    ):
+        amount, currency = _amount(raw)
+
+        assert amount == Decimal("15680.0000")
+        assert currency == "TRY"
+
+
+def test_standalone_tax_amounts_are_not_selected_as_totals() -> None:
+    for raw in ("KDV 62,85 TL", "TOPKDV 62,85 TL", "VAT 62.85", "TAX 62.85"):
+        amount, currency = _amount(raw)
+
+        assert amount is None
+        assert currency is None
+
+
 def test_smaller_line_item_is_not_chosen_over_total_label() -> None:
     amount, currency = _amount(
         """

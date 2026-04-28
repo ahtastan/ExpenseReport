@@ -1,11 +1,14 @@
+import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from sqlmodel import Session, select
 
-from app.models import ClarificationQuestion, ReceiptDocument
+from app.config import get_settings
+from app.models import AppUser, ClarificationQuestion, ReceiptDocument
 
 _AMOUNT_QUANT = Decimal("0.0001")
+logger = logging.getLogger(__name__)
 
 
 def _question_exists(session: Session, receipt_id: int | None, key: str) -> bool:
@@ -17,6 +20,33 @@ def _question_exists(session: Session, receipt_id: int | None, key: str) -> bool
             )
         ).first()
     )
+
+
+def _business_personal_allowlisted(session: Session, user_id: int | None) -> tuple[bool, int | None]:
+    if user_id is None:
+        return False, None
+    user = session.get(AppUser, user_id)
+    telegram_user_id = user.telegram_user_id if user else None
+    if telegram_user_id is None:
+        return False, None
+    return (
+        telegram_user_id in get_settings().business_personal_clarification_telegram_ids,
+        telegram_user_id,
+    )
+
+
+def _should_default_business_for_telegram_receipt(
+    session: Session,
+    receipt: ReceiptDocument,
+    user_id: int | None,
+) -> tuple[bool, bool, int | None]:
+    allowlisted, telegram_user_id = _business_personal_allowlisted(session, user_id)
+    is_telegram_receipt = (
+        receipt.source == "telegram"
+        and receipt.uploader_user_id is not None
+        and telegram_user_id is not None
+    )
+    return is_telegram_receipt and not allowlisted, allowlisted, telegram_user_id
 
 
 def _parse_date(value: str) -> date | None:
@@ -126,6 +156,23 @@ def ensure_receipt_review_questions(
     user_id: int | None,
 ) -> list[ClarificationQuestion]:
     questions: list[ClarificationQuestion] = []
+    default_business, allowlisted, telegram_user_id = _should_default_business_for_telegram_receipt(
+        session,
+        receipt,
+        user_id,
+    )
+    if receipt.business_or_personal is None and default_business:
+        receipt.business_or_personal = "Business"
+        logger.info(
+            "Defaulted receipt business_or_personal to Business receipt_id=%s "
+            "uploader_user_id=%s telegram_user_id=%s reason=default_business_policy "
+            "allowlisted=%s",
+            receipt.id,
+            receipt.uploader_user_id,
+            telegram_user_id,
+            allowlisted,
+        )
+
     specs: list[tuple[bool, str, str]] = [
         (
             receipt.extracted_date is None,

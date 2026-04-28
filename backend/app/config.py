@@ -12,6 +12,8 @@ class Settings(BaseModel):
     telegram_bot_token: str | None = None
     telegram_webhook_secret: str | None = None
     allowed_telegram_user_ids: set[int] = Field(default_factory=set)
+    # Read through cached settings; changing this env var on the VPS requires
+    # restarting dcexpense.service.
     business_personal_clarification_telegram_ids: set[int] = Field(default_factory=set)
     report_template_path: Path | None = None
 

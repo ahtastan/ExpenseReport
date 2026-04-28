@@ -105,6 +105,54 @@ def test_allowlisted_telegram_user_still_gets_business_personal_question(
         assert "attendees" not in keys
 
 
+def test_non_telegram_receipt_still_gets_business_personal_question(
+    isolated_db,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("BUSINESS_PERSONAL_CLARIFICATION_TELEGRAM_IDS", raising=False)
+    get_settings.cache_clear()
+
+    with Session(isolated_db) as session:
+        user = _user(session, telegram_user_id=100008)
+        receipt = _complete_telegram_receipt(session, user)
+        receipt.source = "review_ui"
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+
+        questions = ensure_receipt_review_questions(session, receipt, user.id)
+        session.refresh(receipt)
+
+        assert receipt.business_or_personal is None
+        keys = [question.question_key for question in questions]
+        assert "business_or_personal" in keys
+        assert "business_reason" not in keys
+        assert "attendees" not in keys
+
+
+def test_existing_personal_value_is_preserved_for_default_telegram_user(
+    isolated_db,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("BUSINESS_PERSONAL_CLARIFICATION_TELEGRAM_IDS", raising=False)
+    get_settings.cache_clear()
+
+    with Session(isolated_db) as session:
+        user = _user(session, telegram_user_id=100009)
+        receipt = _complete_telegram_receipt(session, user)
+        receipt.business_or_personal = "Personal"
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+
+        questions = ensure_receipt_review_questions(session, receipt, user.id)
+        session.refresh(receipt)
+
+        assert receipt.business_or_personal == "Personal"
+        assert questions == []
+        assert _question_keys(session, receipt) == []
+
+
 def test_allowlisted_user_answering_personal_closes_without_business_reason(
     isolated_db,
     monkeypatch,

@@ -19,6 +19,7 @@ The router must:
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -224,6 +225,28 @@ def test_first_pass_amount_text_overrides_locale_damaged_numeric_amount(tmp_path
     assert result.fields["amount_text"] == "15.680,00 TL"
 
 
+def test_first_pass_clean_amount_text_ignores_tax_only_amount_label(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {
+            "date": "2025-11-15",
+            "supplier": "45BUSINESSHOTEL",
+            "amount_text": "15.680,00 TL",
+            "amount_label": "KDV",
+            "amount": 15.68,
+            "currency": "TRY",
+            "receipt_type": "payment_receipt",
+        },
+        {"supplier": "45BUSINESSHOTEL"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] == 15680
+    assert result.fields["currency"] == "TRY"
+
+
 def test_first_pass_amount_text_handles_us_grouped_total(tmp_path, monkeypatch):
     rec = _Recorder([
         {
@@ -398,6 +421,70 @@ def test_tax_only_amount_text_does_not_use_same_numeric_value_as_total(tmp_path,
     assert result is not None
     assert result.fields["amount"] is None
     assert result.fields["currency"] == "TRY"
+
+
+def test_tax_label_with_small_clean_amount_text_blocks_numeric_fallback(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {
+            "date": "2025-11-15",
+            "supplier": "Restaurant",
+            "amount_text": "62,85 TL",
+            "amount_label": "KDV",
+            "amount": 62.85,
+            "currency": "TRY",
+            "receipt_type": "payment_receipt",
+        },
+        {"amount": None, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["amount"] is None
+    assert result.fields["currency"] == "TRY"
+
+
+def test_missing_amount_retry_completion_logs_at_info(tmp_path, monkeypatch, caplog):
+    rec = _Recorder([
+        {"date": "2026-04-01", "supplier": "Migros", "amount": None, "currency": "TRY"},
+        {"amount": 42.5, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    caplog.set_level(logging.INFO, logger="app.services.model_router")
+
+    result = model_router.vision_extract(str(_valid_receipt_image(tmp_path)))
+
+    assert result is not None
+    amount_retry_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("Amount total retry completed")
+    ]
+    assert amount_retry_records
+    assert all(record.levelno == logging.INFO for record in amount_retry_records)
+
+
+def test_suspicious_amount_retry_completion_logs_warning(tmp_path, monkeypatch, caplog):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "45BUSINESSHOTEL", "amount": 680,
+         "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "45BUSINESSHOTEL"},
+        {"amount": 15680, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+    caplog.set_level(logging.INFO, logger="app.services.model_router")
+
+    result = model_router.vision_extract(str(_valid_receipt_image(tmp_path)))
+
+    assert result is not None
+    amount_retry_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("Amount total retry completed")
+    ]
+    assert amount_retry_records
+    assert any(record.levelno == logging.WARNING for record in amount_retry_records)
 
 
 def test_suspicious_amount_retry_null_preserves_first_pass_amount(tmp_path, monkeypatch):

@@ -469,8 +469,11 @@ def _parse_amount_text(value: Any, amount_label: Any = None) -> _ParsedAmountTex
         return _ParsedAmountText()
 
     text = value.strip()
-    if isinstance(amount_label, str) and amount_label.strip():
-        text = f"{amount_label.strip()} {text}"
+    label_is_tax_only = (
+        isinstance(amount_label, str)
+        and amount_label.strip()
+        and _amount_text_label_score(amount_label) < 0
+    )
 
     candidates: list[tuple[int, Decimal, str | None]] = []
     blocked_numeric_fallback = False
@@ -484,6 +487,9 @@ def _parse_amount_text(value: Any, amount_label: Any = None) -> _ParsedAmountTex
         for match in matches:
             amount = _amount_decimal(match.group("amount"))
             if amount is None:
+                continue
+            if label_is_tax_only and score == 0 and amount < Decimal("1000"):
+                blocked_numeric_fallback = True
                 continue
             currency = _currency_code(match.group("currency") or match.group("trailing"))
             candidates.append((score, amount, currency))
@@ -1748,7 +1754,8 @@ def vision_extract(storage_path: str) -> VisionResult | None:
             "final_currency": merged.get("currency"),
             "reason": "amount_total_retry",
         }
-        logger.warning(
+        retry_log = logger.warning if amount_sanity_retry else logger.info
+        retry_log(
             "Amount total retry completed first_pass_amount=%r first_pass_currency=%r "
             "first_pass_amount_text=%r retry_amount_raw=%r retry_amount_text_raw=%r "
             "retry_currency_raw=%r final_amount=%r final_currency=%r enhanced_used=%s "

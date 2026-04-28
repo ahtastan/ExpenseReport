@@ -84,8 +84,14 @@ _VISION_PROMPT = (
     "receipt image and return ONLY a JSON object with exactly these keys:\n"
     "  date (ISO 8601 string YYYY-MM-DD or null),\n"
     "  supplier (string or null),\n"
+    "  amount_text (raw visible text for the selected final amount, including "
+    "currency/label if visible, or null),\n"
     "  amount (number or null),\n"
     "  currency (3-letter ISO code string or null),\n"
+    "  amount_label (label near the selected amount, e.g. TOPLAM, TUTAR, "
+    "GENEL TOPLAM, AMOUNT, SATIŞ TUTAR, or null),\n"
+    "  amount_section (one of \"itemized_receipt\", \"payment_slip\", "
+    "\"card_slip\", \"unknown\", or null),\n"
     "  business_or_personal (\"Business\" or \"Personal\" or null),\n"
     "  receipt_type (one of \"itemized\", \"payment_receipt\", \"invoice\", "
     "\"confirmation\", \"unknown\").\n"
@@ -106,6 +112,11 @@ _VISION_PROMPT = (
     "DD/MM/YYYY or DD.MM.YYYY; convert it to YYYY-MM-DD.\n"
     "Payment slips may label the transaction date as ISLEM with a value like "
     "DD/MM/YYYY - HH:MM; use that as the receipt date.\n"
+    "For amount extraction, preserve the raw printed final-total text in "
+    "amount_text. Turkish/European totals such as 15.680,00 TL, 15,680.00 TL, "
+    "15 680,00 TL, and 15680,00 TL all mean 15680.00 TRY; do not collapse "
+    "them into a JSON number such as 15.68. The numeric amount may contain "
+    "your parse, but amount_text must carry the visible source text.\n"
     "Classify receipt_type using this rubric:\n"
     "  itemized         — individual line items with prices are visible (a "
     "restaurant bill showing each dish; a hotel folio showing nightly rate "
@@ -214,13 +225,20 @@ _VISION_PROMPT_AMOUNT_ONLY = (
     "  If multiple totals exist, prefer the final POS/card/payment total or "
     "the line nearest TOPLAM/TUTAR/SATIŞ TUTAR over KDV/tax or line-item "
     "amounts.\n"
-    "  Preserve decimals as a JSON number. If only currency is readable, "
-    "return amount null and the currency. If only amount is readable, return "
-    "amount and currency null.\n"
+    "  Preserve the raw printed final-total text in amount_text. amount may "
+    "contain your numeric parse, but the application will prefer amount_text "
+    "when present. If only currency is readable, return amount_text null, "
+    "amount null, and the currency. If only amount text is readable, return "
+    "amount_text and currency null.\n"
     "\n"
     "Return ONLY a JSON object with exactly these keys:\n"
+    "  amount_text (raw visible text for the selected final amount, including "
+    "currency/label if visible, or null),\n"
     "  amount (number, or null),\n"
-    "  currency (3-letter ISO code string such as TRY, USD, EUR, or null).\n"
+    "  currency (3-letter ISO code string such as TRY, USD, EUR, or null),\n"
+    "  amount_label (label near the selected amount, or null),\n"
+    "  amount_section (one of itemized_receipt, payment_slip, card_slip, "
+    "unknown, or null).\n"
     "Do not include date, supplier, or any other fields. No prose, no code "
     "fences, no explanation."
 )
@@ -240,6 +258,29 @@ _MEDIA_TYPES = {
 _PDF_RASTER_DPI = 180
 _PDF_MAX_PAGES = 10
 _AMOUNT_TRUNCATION_MIN_RATIO = Decimal("5")
+_AMOUNT_TEXT_RE = re.compile(
+    r"(?:(?P<currency>TRY|TL|USD|EUR|\$|₺)\s*)?"
+    r"(?P<amount>\d{1,3}(?:[\s\u00a0.,]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2}))"
+    r"\s*(?P<trailing>TRY|TL|USD|EUR|₺)?",
+    re.IGNORECASE,
+)
+_AMOUNT_POSITIVE_LABELS = (
+    "GENEL TOPLAM",
+    "SATIS TUTAR",
+    "SATIŞ TUTAR",
+    "ISLEM TUTARI",
+    "İŞLEM TUTARI",
+    "TOPLAM",
+    "TUTAR",
+    "AMOUNT",
+    "ODENECEK",
+    "ÖDENECEK",
+    "ODENEN",
+    "ÖDENEN",
+)
+_AMOUNT_TAX_LABELS = ("KDV", "VAT", "TAX", "VERGI", "VERGİ")
+_AMOUNT_SALES_LABELS = ("SATIS TUTAR", "SATIŞ TUTAR")
+_AMOUNT_TAX_INCLUDED_MODIFIERS = ("KDV DAHIL", "KDV DAHİL")
 
 
 @dataclass(frozen=True)
@@ -271,6 +312,13 @@ class _PreparedAmountRetryImage:
     path: Path
     notes: list[str]
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ParsedAmountText:
+    amount: Decimal | None = None
+    currency: str | None = None
+    blocked_numeric_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -381,6 +429,8 @@ def _currency_code(value: Any) -> str | None:
     normalized = value.strip().upper()
     if normalized in {"TL", "₺"}:
         return "TRY"
+    if normalized == "$":
+        return "USD"
     return normalized or None
 
 
@@ -398,6 +448,79 @@ def _amount_decimal(value: Any) -> Decimal | None:
         return Decimal(text)
     except (InvalidOperation, ValueError):
         return None
+
+
+def _amount_text_label_score(line: str) -> int:
+    normalized = line.upper()
+    negative = any(label in normalized for label in _AMOUNT_TAX_LABELS)
+    positive = any(label in normalized for label in _AMOUNT_POSITIVE_LABELS)
+    tax_included_modifier = any(label in normalized for label in _AMOUNT_TAX_INCLUDED_MODIFIERS)
+    if negative and not any(label in normalized for label in _AMOUNT_SALES_LABELS):
+        if positive and tax_included_modifier:
+            return 100
+        return -100
+    if positive:
+        return 100
+    return 0
+
+
+def _parse_amount_text(value: Any, amount_label: Any = None) -> _ParsedAmountText:
+    if not isinstance(value, str) or not value.strip():
+        return _ParsedAmountText()
+
+    text = value.strip()
+    label_is_tax_only = (
+        isinstance(amount_label, str)
+        and amount_label.strip()
+        and _amount_text_label_score(amount_label) < 0
+    )
+
+    candidates: list[tuple[int, Decimal, str | None]] = []
+    blocked_numeric_fallback = False
+    for line in text.splitlines() or [text]:
+        score = _amount_text_label_score(line)
+        matches = list(_AMOUNT_TEXT_RE.finditer(line))
+        if score < 0:
+            if matches:
+                blocked_numeric_fallback = True
+            continue
+        for match in matches:
+            amount = _amount_decimal(match.group("amount"))
+            if amount is None:
+                continue
+            if label_is_tax_only and score == 0 and amount < Decimal("1000"):
+                blocked_numeric_fallback = True
+                continue
+            currency = _currency_code(match.group("currency") or match.group("trailing"))
+            candidates.append((score, amount, currency))
+
+    if not candidates:
+        return _ParsedAmountText(blocked_numeric_fallback=blocked_numeric_fallback)
+
+    _, amount, currency = max(candidates, key=lambda item: (item[0], item[1]))
+    return _ParsedAmountText(amount=amount, currency=currency)
+
+
+def _normalize_amount_contract_fields(fields: dict[str, Any]) -> tuple[dict[str, Any], _ParsedAmountText]:
+    normalized = dict(fields)
+    parsed = _parse_amount_text(normalized.get("amount_text"), normalized.get("amount_label"))
+    if parsed.amount is not None:
+        normalized["amount"] = parsed.amount
+        if parsed.currency is not None:
+            normalized["currency"] = parsed.currency
+    elif parsed.blocked_numeric_fallback:
+        normalized["amount"] = None
+    return normalized, parsed
+
+
+def _amount_text_retry_can_replace(first_amount: Any, retry_amount: Any) -> bool:
+    first = _amount_decimal(first_amount)
+    retry = _amount_decimal(retry_amount)
+    if first is None or retry is None or retry <= first:
+        return False
+    if first == 0:
+        return False
+    return retry / first >= _AMOUNT_TRUNCATION_MIN_RATIO
 
 
 def _amount_cents_text(value: Decimal) -> str:
@@ -1422,7 +1545,11 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     if images is None:
         return None
 
-    first_fields = _vision_call(VISION_MODEL, images)
+    first_fields_raw = _vision_call(VISION_MODEL, images)
+    first_fields = None
+    first_amount_text_parse = _ParsedAmountText()
+    if first_fields_raw is not None:
+        first_fields, first_amount_text_parse = _normalize_amount_contract_fields(first_fields_raw)
     if first_fields is None:
         notes.append(
             f"First pass ({VISION_MODEL}) unavailable or returned invalid JSON; "
@@ -1572,11 +1699,15 @@ def vision_extract(storage_path: str) -> VisionResult | None:
             else (images, [], {"enhanced_used": False})
         )
         notes.extend(retry_image_notes)
-        retry_fields = (
+        retry_fields_raw = (
             _vision_call(VISION_MODEL, retry_images, _VISION_PROMPT_AMOUNT_ONLY)
             if retry_images is not None
             else None
         )
+        retry_fields = None
+        retry_amount_text_parse = _ParsedAmountText()
+        if retry_fields_raw is not None:
+            retry_fields, retry_amount_text_parse = _normalize_amount_contract_fields(retry_fields_raw)
         retry_filled: list[str] = []
         if retry_fields is not None:
             retry_amount = retry_fields.get("amount")
@@ -1587,7 +1718,19 @@ def vision_extract(storage_path: str) -> VisionResult | None:
             if currency_missing and not _currency_missing(retry_currency):
                 merged["currency"] = retry_currency
                 retry_filled.append("currency")
-            if amount_sanity_retry and _amount_looks_truncated_suffix(
+            if (
+                amount_sanity_retry
+                and retry_amount_text_parse.amount is not None
+                and _amount_text_retry_can_replace(merged.get("amount"), retry_amount)
+            ):
+                retry_currency_code = _currency_code(retry_currency)
+                current_currency_code = _currency_code(merged.get("currency"))
+                merged["amount"] = retry_amount
+                retry_filled.append("amount")
+                if retry_currency_code and retry_currency_code != current_currency_code:
+                    merged["currency"] = retry_currency_code
+                    retry_filled.append("currency")
+            elif amount_sanity_retry and _amount_looks_truncated_suffix(
                 merged.get("amount"), retry_amount
             ):
                 retry_currency_code = _currency_code(retry_currency)
@@ -1601,19 +1744,27 @@ def vision_extract(storage_path: str) -> VisionResult | None:
             **retry_image_metadata,
             "first_pass_amount": first_fields.get("amount"),
             "first_pass_currency": first_fields.get("currency"),
+            "first_pass_amount_text": first_fields.get("amount_text"),
+            "first_pass_amount_from_text": first_amount_text_parse.amount is not None,
             "retry_amount_raw": retry_fields.get("amount") if retry_fields else None,
+            "retry_amount_text_raw": retry_fields.get("amount_text") if retry_fields else None,
+            "retry_amount_from_text": retry_amount_text_parse.amount is not None,
             "retry_currency_raw": retry_fields.get("currency") if retry_fields else None,
             "final_amount": merged.get("amount"),
             "final_currency": merged.get("currency"),
             "reason": "amount_total_retry",
         }
-        logger.info(
+        retry_log = logger.warning if amount_sanity_retry else logger.info
+        retry_log(
             "Amount total retry completed first_pass_amount=%r first_pass_currency=%r "
-            "retry_amount_raw=%r retry_currency_raw=%r final_amount=%r final_currency=%r "
-            "enhanced_used=%s reason=amount_total_retry",
+            "first_pass_amount_text=%r retry_amount_raw=%r retry_amount_text_raw=%r "
+            "retry_currency_raw=%r final_amount=%r final_currency=%r enhanced_used=%s "
+            "reason=amount_total_retry",
             first_fields.get("amount"),
             first_fields.get("currency"),
+            first_fields.get("amount_text"),
             retry_fields.get("amount") if retry_fields else None,
+            retry_fields.get("amount_text") if retry_fields else None,
             retry_fields.get("currency") if retry_fields else None,
             merged.get("amount"),
             merged.get("currency"),

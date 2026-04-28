@@ -144,9 +144,9 @@ def test_first_pass_returning_unreadable_merchant_triggers_stricter_retry(monkey
     """
     recorder = _Recorder([
         {"date": "2025-10-15", "supplier": UNREADABLE_MERCHANT_SENTINEL,
-         "amount": 580.0, "currency": "TRY"},
+         "amount": 42.5, "currency": "TRY"},
         {"date": "2025-10-15", "supplier": "Yeni Truva Tur Pet",
-         "amount": 580.0, "currency": "TRY"},
+         "amount": 42.5, "currency": "TRY"},
     ])
     _patch_vision_call(monkeypatch, recorder)
     with TemporaryDirectory() as tmp:
@@ -205,9 +205,9 @@ def test_stricter_retry_uses_strict_prompt_not_default_prompt(monkeypatch) -> No
     """
     recorder = _Recorder([
         {"date": "2025-10-15", "supplier": UNREADABLE_MERCHANT_SENTINEL,
-         "amount": 580.0, "currency": "TRY"},
+         "amount": 42.5, "currency": "TRY"},
         {"date": "2025-10-15", "supplier": "Yeni Truva Tur Pet",
-         "amount": 580.0, "currency": "TRY"},
+         "amount": 42.5, "currency": "TRY"},
     ])
     _patch_vision_call(monkeypatch, recorder)
     with TemporaryDirectory() as tmp:

@@ -98,6 +98,57 @@ def test_amount_retry_prevents_amount_clarification(isolated_db, tmp_path, monke
     assert "local_amount" not in question_keys
 
 
+def test_suspicious_amount_retry_preserves_context_fields(
+    isolated_db,
+    tmp_path,
+    monkeypatch,
+):
+    recorder = _Recorder([
+        {"date": "2025-11-15", "supplier": "45BUSINESSHOTEL",
+         "amount": 680, "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "45BUSINESSHOTEL"},
+        {"amount": 15680, "currency": "TRY"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", recorder)
+
+    with Session(isolated_db) as session:
+        user = AppUser(telegram_user_id=900079)
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+        receipt = ReceiptDocument(
+            uploader_user_id=user.id,
+            content_type="photo",
+            original_file_name="telegram_photo_79.jpg",
+            storage_path=str(_fake_image(tmp_path)),
+            receipt_type="payment_receipt",
+            business_or_personal="Business",
+            business_reason="Leadership hotel stay",
+            attendees="Hakan",
+        )
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+
+        apply_receipt_extraction(session, receipt)
+        session.refresh(receipt)
+
+        assert recorder.prompts == [
+            "<default>",
+            model_router._VISION_PROMPT_STRICT,
+            model_router._VISION_PROMPT_AMOUNT_ONLY,
+        ]
+        assert receipt.extracted_local_amount == Decimal("15680.0000")
+        assert receipt.extracted_currency == "TRY"
+        assert receipt.extracted_date == date(2025, 11, 15)
+        assert receipt.extracted_supplier == "45BUSINESSHOTEL"
+        assert receipt.receipt_type == "payment_receipt"
+        assert receipt.business_or_personal == "Business"
+        assert receipt.business_reason == "Leadership hotel stay"
+        assert receipt.attendees == "Hakan"
+
+
 def test_supplier_retry_prevents_supplier_clarification(isolated_db, tmp_path, monkeypatch):
     receipt, question_keys, recorder = _extract_and_question_keys(
         isolated_db,
@@ -143,6 +194,7 @@ def test_supplier_header_retry_preserves_existing_context_fields(
         {"date": "2025-11-15", "supplier": "İSRAİL KÖSE",
          "amount": 715, "currency": "TRY", "receipt_type": "invoice"},
         {"supplier": "İSMAİL KÖSE PETROL LTD. ŞTİ."},
+        {"amount": None, "currency": "TRY"},
     ])
     monkeypatch.setattr(model_router, "_vision_call", recorder)
 
@@ -169,7 +221,11 @@ def test_supplier_header_retry_preserves_existing_context_fields(
         apply_receipt_extraction(session, receipt)
         session.refresh(receipt)
 
-        assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_STRICT]
+        assert recorder.prompts == [
+            "<default>",
+            model_router._VISION_PROMPT_STRICT,
+            model_router._VISION_PROMPT_AMOUNT_ONLY,
+        ]
         assert receipt.extracted_supplier == "İSMAİL KÖSE PETROL LTD. ŞTİ."
         assert receipt.extracted_date == date(2025, 11, 15)
         assert receipt.extracted_local_amount == Decimal("715.0000")

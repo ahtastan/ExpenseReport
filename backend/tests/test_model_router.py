@@ -1,7 +1,10 @@
 """Tests for the single-tier OCR vision pipeline (post-F1.3 rollback).
 
 The router must:
-  - call the full vision model exactly once on the happy path;
+  - call the full vision model for the first pass;
+  - run a supplier/header retry for image receipts with otherwise complete
+    first-pass facts, so wrong-but-confident merchant OCR can be corrected
+    from an enhanced header crop before saving;
   - retry with the stricter merchant-only prompt when the first-pass
     supplier is missing — the ``UNREADABLE_MERCHANT`` sentinel,
     ``None``, or an empty/whitespace string — since all three shapes
@@ -60,21 +63,98 @@ class _Recorder:
         return self._responses.pop(0)
 
 
-def test_clean_first_pass_returns_without_retry(tmp_path, monkeypatch):
-    """A clear receipt — supplier present and non-sentinel — must extract
-    in a single model call. No merchant-only retry should fire."""
+def test_clean_first_pass_runs_supplier_header_retry_without_changing_facts(tmp_path, monkeypatch):
+    """A clear image receipt still gets a supplier/header retry, but date,
+    amount, currency, and receipt_type stay anchored to the first pass."""
     rec = _Recorder([
         {"date": "2026-04-01", "supplier": "Migros", "amount": 42.5,
          "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "Migros"},
     ])
     monkeypatch.setattr(model_router, "_vision_call", rec)
     result = model_router.vision_extract(str(_fake_image(tmp_path)))
     assert result is not None
-    assert result.escalated is False
-    assert rec.calls == [model_router.VISION_MODEL]
+    assert result.escalated is True
+    assert rec.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    assert rec.prompts == ["<default>", model_router._VISION_PROMPT_STRICT]
     assert result.fields["date"] == "2026-04-01"
     assert result.fields["amount"] == 42.5
+    assert result.fields["currency"] == "TRY"
     assert result.fields["supplier"] == "Migros"
+    assert result.fields["receipt_type"] == "payment_receipt"
+
+
+def test_supplier_header_retry_prefers_yeni_irma_over_wrong_confident_first_pass(
+    tmp_path,
+    monkeypatch,
+):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "YENI DUNYA TUR PET VE PET UR",
+         "amount": 175, "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "YENI IRMA TUR PET VE PET UR"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.escalated is True
+    assert rec.prompts == ["<default>", model_router._VISION_PROMPT_STRICT]
+    assert result.fields["supplier"] == "YENI IRMA TUR PET VE PET UR"
+    assert result.fields["date"] == "2025-11-15"
+    assert result.fields["amount"] == 175
+    assert result.fields["currency"] == "TRY"
+    assert result.fields["receipt_type"] == "payment_receipt"
+
+
+def test_supplier_header_retry_prefers_turkish_legal_name_over_ocr_confusion(
+    tmp_path,
+    monkeypatch,
+):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "İSRAİL KÖSE",
+         "amount": 715, "currency": "TRY", "receipt_type": "payment_receipt"},
+        {"supplier": "İSMAİL KÖSE PETROL LTD. ŞTİ."},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.fields["supplier"] == "İSMAİL KÖSE PETROL LTD. ŞTİ."
+    assert result.fields["date"] == "2025-11-15"
+    assert result.fields["amount"] == 715
+    assert result.fields["currency"] == "TRY"
+
+
+def test_supplier_header_retry_null_preserves_first_pass_supplier(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "YENI DUNYA TUR PET VE PET UR",
+         "amount": 175, "currency": "TRY"},
+        {"supplier": None},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.escalated is False
+    assert result.fields["supplier"] == "YENI DUNYA TUR PET VE PET UR"
+
+
+def test_supplier_header_retry_unreadable_preserves_first_pass_supplier(tmp_path, monkeypatch):
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "YENI DUNYA TUR PET VE PET UR",
+         "amount": 175, "currency": "TRY"},
+        {"supplier": model_router.UNREADABLE_MERCHANT_SENTINEL},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(_fake_image(tmp_path)))
+
+    assert result is not None
+    assert result.escalated is False
+    assert result.fields["supplier"] == "YENI DUNYA TUR PET VE PET UR"
 
 
 def test_missing_amount_triggers_amount_only_retry(tmp_path, monkeypatch):
@@ -203,6 +283,51 @@ def test_date_retry_preprocessing_failure_falls_back_to_original(tmp_path, monke
     assert result is not None
     assert seen_paths == [str(original)]
     assert result.fields["date"] == "2026-04-01"
+
+
+def test_supplier_retry_preprocessing_creates_larger_header_contact_sheet(tmp_path):
+    original = _valid_receipt_image(tmp_path)
+    original_bytes = original.read_bytes()
+
+    prepared = model_router._create_enhanced_supplier_retry_image(str(original))
+
+    assert prepared is not None
+    try:
+        assert prepared.path.exists()
+        with Image.open(original) as source, Image.open(prepared.path) as enhanced:
+            assert enhanced.width > source.width
+            assert enhanced.height > source.height
+        assert original.read_bytes() == original_bytes
+        assert any("header_25" in note for note in prepared.notes)
+        assert any("top_50" in note for note in prepared.notes)
+        assert prepared.metadata["enhanced_used"] is True
+    finally:
+        prepared.path.unlink(missing_ok=True)
+
+
+def test_supplier_retry_temp_enhanced_image_is_cleaned_up(tmp_path, monkeypatch):
+    original = _valid_receipt_image(tmp_path)
+    seen_paths: list[str] = []
+
+    def fake_images_for_path(storage_path):
+        seen_paths.append(str(storage_path))
+        return [("image/png", Path(storage_path).name)], []
+
+    rec = _Recorder([
+        {"date": "2025-11-15", "supplier": "YENI DUNYA TUR PET VE PET UR",
+         "amount": 175, "currency": "TRY"},
+        {"supplier": "YENI IRMA TUR PET VE PET UR"},
+    ])
+    monkeypatch.setattr(model_router, "_vision_images_for_path", fake_images_for_path)
+    monkeypatch.setattr(model_router, "_vision_call", rec)
+
+    result = model_router.vision_extract(str(original))
+
+    assert result is not None
+    assert result.fields["supplier"] == "YENI IRMA TUR PET VE PET UR"
+    assert len(seen_paths) == 2
+    assert Path(seen_paths[1]).name.startswith("dcexpense-supplier-retry-")
+    assert not Path(seen_paths[1]).exists()
 
 
 def test_missing_date_does_not_trigger_amount_or_supplier_retry(tmp_path, monkeypatch):

@@ -112,3 +112,69 @@ def test_supplier_retry_prevents_supplier_clarification(isolated_db, tmp_path, m
     assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_STRICT]
     assert receipt.extracted_supplier == "Yeni Truva Market"
     assert "supplier" not in question_keys
+
+
+def test_failed_supplier_retry_still_creates_supplier_clarification(
+    isolated_db,
+    tmp_path,
+    monkeypatch,
+):
+    receipt, question_keys, recorder = _extract_and_question_keys(
+        isolated_db,
+        tmp_path,
+        monkeypatch,
+        [
+            {"date": "2025-11-15", "supplier": None, "amount": 175, "currency": "TRY"},
+            {"supplier": None},
+        ],
+    )
+
+    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_STRICT]
+    assert receipt.extracted_supplier is None
+    assert "supplier" in question_keys
+
+
+def test_supplier_header_retry_preserves_existing_context_fields(
+    isolated_db,
+    tmp_path,
+    monkeypatch,
+):
+    recorder = _Recorder([
+        {"date": "2025-11-15", "supplier": "İSRAİL KÖSE",
+         "amount": 715, "currency": "TRY", "receipt_type": "invoice"},
+        {"supplier": "İSMAİL KÖSE PETROL LTD. ŞTİ."},
+    ])
+    monkeypatch.setattr(model_router, "_vision_call", recorder)
+
+    with Session(isolated_db) as session:
+        user = AppUser(telegram_user_id=900078)
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+        receipt = ReceiptDocument(
+            uploader_user_id=user.id,
+            content_type="photo",
+            original_file_name="telegram_photo_78.jpg",
+            storage_path=str(_fake_image(tmp_path)),
+            receipt_type="payment_receipt",
+            business_or_personal="Business",
+            business_reason="Kartonsan service visit",
+            attendees="Hakan, customer team",
+        )
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+
+        apply_receipt_extraction(session, receipt)
+        session.refresh(receipt)
+
+        assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_STRICT]
+        assert receipt.extracted_supplier == "İSMAİL KÖSE PETROL LTD. ŞTİ."
+        assert receipt.extracted_date == date(2025, 11, 15)
+        assert receipt.extracted_local_amount == Decimal("715.0000")
+        assert receipt.extracted_currency == "TRY"
+        assert receipt.receipt_type == "payment_receipt"
+        assert receipt.business_or_personal == "Business"
+        assert receipt.business_reason == "Kartonsan service visit"
+        assert receipt.attendees == "Hakan, customer team"

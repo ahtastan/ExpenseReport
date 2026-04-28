@@ -145,11 +145,16 @@ def test_implausible_first_pass_date_retries_and_saves_recovered_date(
                 "currency": "TRY",
                 "receipt_type": "payment_receipt",
             },
+            {"supplier": "YENI DUNYA TUR PET VE PET UR"},
             {"date": "2025-11-15"},
         ],
     )
 
-    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert recorder.prompts == [
+        "<default>",
+        model_router._VISION_PROMPT_STRICT,
+        model_router._VISION_PROMPT_DATE_ONLY,
+    ]
     assert receipt.extracted_date == date(2025, 11, 15)
     assert receipt.extracted_local_amount == Decimal("175.0000")
     assert receipt.extracted_currency == "TRY"
@@ -210,11 +215,16 @@ def test_implausible_first_pass_date_saves_local_format_retry_date(
                 "currency": "TRY",
                 "receipt_type": "payment_receipt",
             },
+            {"supplier": "YENI DUNYA TUR PET VE PET UR"},
             {"date": "15-11-2025"},
         ],
     )
 
-    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert recorder.prompts == [
+        "<default>",
+        model_router._VISION_PROMPT_STRICT,
+        model_router._VISION_PROMPT_DATE_ONLY,
+    ]
     assert receipt.extracted_date == date(2025, 11, 15)
     assert receipt.extracted_local_amount == Decimal("175.0000")
     assert receipt.extracted_currency == "TRY"
@@ -249,11 +259,16 @@ def test_implausible_first_pass_date_retry_uses_enhanced_image_path(
                 "currency": "TRY",
                 "receipt_type": "payment_receipt",
             },
+            {"supplier": "YENI DUNYA TUR PET VE PET UR"},
             {"date": "15-11-2025"},
         ],
     )
 
-    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert recorder.prompts == [
+        "<default>",
+        model_router._VISION_PROMPT_STRICT,
+        model_router._VISION_PROMPT_DATE_ONLY,
+    ]
     assert receipt.extracted_date == date(2025, 11, 15)
     # Non-date fields from the first pass must survive the enhanced retry.
     assert receipt.extracted_local_amount == Decimal("175.0000")
@@ -261,10 +276,12 @@ def test_implausible_first_pass_date_retry_uses_enhanced_image_path(
     assert receipt.extracted_supplier == "YENI DUNYA TUR PET VE PET UR"
     assert receipt.receipt_type == "payment_receipt"
     assert "receipt_date" not in question_keys
-    assert len(seen_paths) == 2
+    assert len(seen_paths) == 3
     assert seen_paths[0].endswith("telegram_photo_2014.png")
     assert seen_paths[1] != seen_paths[0]
-    assert Path(seen_paths[1]).name.startswith("dcexpense-date-retry-")
+    assert Path(seen_paths[1]).name.startswith("dcexpense-supplier-retry-")
+    assert seen_paths[2] != seen_paths[0]
+    assert Path(seen_paths[2]).name.startswith("dcexpense-date-retry-")
 
 
 def test_missing_first_pass_date_retry_uses_enhanced_image_path(
@@ -327,11 +344,16 @@ def test_invalid_calendar_retry_date_is_not_saved_and_asks_for_date(
                 "amount": 175,
                 "currency": "TRY",
             },
+            {"supplier": "YENI DUNYA TUR PET VE PET UR"},
             {"date": "31-02-2025"},
         ],
     )
 
-    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert recorder.prompts == [
+        "<default>",
+        model_router._VISION_PROMPT_STRICT,
+        model_router._VISION_PROMPT_DATE_ONLY,
+    ]
     assert receipt.extracted_date is None
     assert "receipt_date" in question_keys
 
@@ -355,11 +377,16 @@ def test_implausible_retry_date_is_not_saved_and_asks_for_date(
                 "amount": 175,
                 "currency": "TRY",
             },
+            {"supplier": "YENI DUNYA TUR PET VE PET UR"},
             {"date": "2014-01-15"},
         ],
     )
 
-    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert recorder.prompts == [
+        "<default>",
+        model_router._VISION_PROMPT_STRICT,
+        model_router._VISION_PROMPT_DATE_ONLY,
+    ]
     assert receipt.extracted_date is None
     assert "receipt_date" in question_keys
     assert "retry_raw_date='2014-01-15'" in caplog.text
@@ -387,11 +414,16 @@ def test_missing_retry_date_log_is_not_marked_sanity_accepted(
                 "amount": 175,
                 "currency": "TRY",
             },
+            {"supplier": "YENI DUNYA TUR PET VE PET UR"},
             {"date": None},
         ],
     )
 
-    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert recorder.prompts == [
+        "<default>",
+        model_router._VISION_PROMPT_STRICT,
+        model_router._VISION_PROMPT_DATE_ONLY,
+    ]
     assert receipt.extracted_date is None
     assert "receipt_date" in question_keys
     assert "retry_raw_date=None" in caplog.text

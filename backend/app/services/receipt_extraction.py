@@ -284,6 +284,27 @@ def _log_date_rejection(
     )
 
 
+def _log_supplier_header_retry(receipt: ReceiptDocument, metadata: dict[str, object]) -> None:
+    logger.info(
+        "Receipt OCR supplier header retry receipt_id=%s first_pass_supplier=%r "
+        "retry_supplier_raw=%r final_supplier=%r enhanced_used=%s "
+        "original_width=%s original_height=%s original_bytes=%s "
+        "enhanced_width=%s enhanced_height=%s enhanced_bytes=%s reason=%s",
+        receipt.id,
+        metadata.get("first_pass_supplier"),
+        metadata.get("retry_supplier_raw"),
+        metadata.get("final_supplier"),
+        metadata.get("enhanced_used"),
+        metadata.get("original_width"),
+        metadata.get("original_height"),
+        metadata.get("original_bytes"),
+        metadata.get("enhanced_width"),
+        metadata.get("enhanced_height"),
+        metadata.get("enhanced_bytes"),
+        metadata.get("reason") or "supplier_header_retry",
+    )
+
+
 def extract_receipt_fields(
     receipt: ReceiptDocument,
     *,
@@ -313,6 +334,9 @@ def extract_receipt_fields(
         if vision_result is not None:
             vision = vision_result.fields
             notes.extend(vision_result.notes)
+            supplier_retry_metadata = vision_result.metadata.get("supplier_header_retry")
+            if isinstance(supplier_retry_metadata, dict):
+                _log_supplier_header_retry(receipt, supplier_retry_metadata)
 
     def _vision_date() -> date | None:
         raw = (vision or {}).get("date")

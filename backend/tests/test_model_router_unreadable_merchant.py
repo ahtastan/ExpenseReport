@@ -238,25 +238,28 @@ def test_full_model_also_returning_sentinel_surfaces_as_null_supplier(monkeypatc
         img = _fake_image(Path(tmp))
         result = model_router.vision_extract(str(img))
     assert result is not None
-    assert result.escalated is True
+    assert result.escalated is False
     assert result.fields["supplier"] is None, (
         "literal UNREADABLE_MERCHANT must never reach downstream callers"
     )
 
 
-def test_mini_real_supplier_does_not_escalate(monkeypatch) -> None:
-    """Sanity: the new escalation gate doesn't fire on normal happy paths."""
+def test_real_supplier_runs_header_retry_before_returning(monkeypatch) -> None:
+    """F1.9: normal image receipts get supplier/header retry too, so
+    wrong-but-confident merchant OCR can be corrected before save."""
     recorder = _Recorder([
         {"date": "2025-10-15", "supplier": "Migros", "amount": 42.5,
          "currency": "TRY"},
+        {"supplier": "Migros"},
     ])
     _patch_vision_call(monkeypatch, recorder)
     with TemporaryDirectory() as tmp:
         img = _fake_image(Path(tmp))
         result = model_router.vision_extract(str(img))
     assert result is not None
-    assert recorder.calls == [model_router.MINI_MODEL]
-    assert result.escalated is False
+    assert recorder.calls == [model_router.VISION_MODEL, model_router.VISION_MODEL]
+    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_STRICT]
+    assert result.escalated is True
     assert result.fields["supplier"] == "Migros"
 
 

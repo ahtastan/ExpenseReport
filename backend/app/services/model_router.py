@@ -41,7 +41,7 @@ import logging
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -121,22 +121,23 @@ _VISION_PROMPT = (
     "Return only the JSON object, no other text."
 )
 
-# Stricter retry variant — used ONLY when the first pass returned the
-# UNREADABLE_MERCHANT sentinel for supplier. The retry is scoped to
-# merchant/supplier ambiguity: it asks the model to re-read the masthead
-# more carefully and ignore everything else. Date and amount from the
-# first pass are preserved by the caller, so this prompt deliberately
-# does NOT re-instruct the model on amount or date selection — those
-# fields stay valid even when supplier was unreadable.
+# Stricter supplier retry variant. It is scoped to merchant/supplier header
+# OCR only: it asks the model to re-read the masthead/header and ignore
+# everything else. Date and amount from the first pass are preserved by the
+# caller, so this prompt deliberately does NOT re-instruct the model on
+# amount or date selection.
 _VISION_PROMPT_STRICT = (
-    "Look at this receipt image one more time. The first extraction pass "
-    "could not read the merchant name with confidence and abstained with "
-    "a sentinel. Date and amount have already been captured — your only "
-    "task here is to re-read the merchant masthead.\n"
+    "Look at this receipt image one more time. The image may contain "
+    "zoomed crops of the receipt header stacked vertically to aid "
+    "readability. Date and amount have already been captured — your only "
+    "task here is to re-read the merchant/supplier/legal business name "
+    "printed at the top/header of the receipt.\n"
     "\n"
     "MERCHANT NAME RULES — obey without exception:\n"
     "  Output the merchant name EXACTLY as printed on the masthead (the "
-    "topmost line of the receipt header).\n"
+    "topmost/header line of the receipt). For Turkish receipts, preserve "
+    "Turkish letters when visible.\n"
+    "  DO NOT guess. If uncertain, return null or the unreadable sentinel.\n"
     "  DO NOT compose merchant names from any of the following — these "
     "are all NOT the merchant:\n"
     "    - address fragments (street names, neighborhood/district names, "
@@ -144,18 +145,21 @@ _VISION_PROMPT_STRICT = (
     "    - VAT IDs / vergi numarası lines\n"
     "    - MERSIS numbers\n"
     "    - tax-office labels (e.g. \"VERGİ DAİRESİ\")\n"
-    "    - payment processor names (\"BKM\", \"ISBANK POS\", \"ZIRAAT POS\")\n"
+    "    - payment processor or bank names (\"HALKBANK\", \"AKBANK\", "
+    "\"BKM\", \"ISBANK POS\", \"ZIRAAT POS\")\n"
+    "    - card brands or terminal/payment text (\"Mastercard\", \"Visa\", "
+    "\"TEMASSIZ\", \"SATIŞ\", \"KREDİ KARTI\")\n"
     "    - line items inside the bill body\n"
     "    - cashier/operator names (e.g. \"KASIYER: ...\")\n"
     "    - slogans, taglines, or descriptive subtitles below the masthead\n"
     "  DO NOT infer merchant from category context (e.g. seeing fuel-pump "
     "line items does NOT mean the merchant is \"Generic Petrol Station\").\n"
     f"  If you still cannot read the masthead with confidence, output "
-    f"\"{UNREADABLE_MERCHANT_SENTINEL}\" — DO NOT guess. We would rather "
-    f"see the sentinel than a hallucinated name.\n"
+    f"null or \"{UNREADABLE_MERCHANT_SENTINEL}\" — DO NOT guess. We would "
+    f"rather see null than a hallucinated name.\n"
     "\n"
     "Return ONLY a JSON object with exactly one key:\n"
-    "  supplier (string — the merchant name, or the sentinel above).\n"
+    "  supplier (string — the merchant name, null, or the sentinel above).\n"
     "Do not include date, amount, or any other fields. No prose, no code "
     "fences, no explanation."
 )
@@ -237,12 +241,20 @@ class VisionResult:
     model: str  # the model that produced the fields (single-tier post-F1.3)
     escalated: bool  # true when a focused retry contributed to the result
     notes: list[str]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class _PreparedDateRetryImage:
     path: Path
     notes: list[str]
+
+
+@dataclass(frozen=True)
+class _PreparedSupplierRetryImage:
+    path: Path
+    notes: list[str]
+    metadata: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -323,6 +335,16 @@ def _supplier_needs_merchant_retry(value: Any) -> bool:
     if isinstance(value, str) and not value.strip():
         return True
     return False
+
+
+def _is_clear_supplier_retry(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    if not value.strip():
+        return False
+    if _is_unreadable_merchant_sentinel(value):
+        return False
+    return True
 
 
 def _date_missing(value: Any) -> bool:
@@ -502,6 +524,155 @@ def _date_retry_images_for_path(storage_path: str) -> tuple[list[tuple[str, str]
     if original_images is not None:
         notes.append("Date retry used original image because enhancement was unavailable.")
     return original_images, notes
+
+
+def _create_enhanced_supplier_retry_image(storage_path: str) -> _PreparedSupplierRetryImage | None:
+    path = Path(storage_path)
+    if path.suffix.lower() not in _IMAGE_EXTENSIONS:
+        return None
+
+    temp_path: Path | None = None
+    try:
+        from PIL import Image, ImageEnhance, ImageOps  # deferred import
+
+        original_bytes = path.stat().st_size
+        with Image.open(path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return None
+
+        header_height = max(1, int(height * 0.25))
+        top_half_height = max(1, int(height * 0.50))
+        crop_specs = [
+            ("header_25", (0, 0, width, min(height, header_height))),
+            ("top_50", (0, 0, width, min(height, top_half_height))),
+            ("full_context", (0, 0, width, height)),
+        ]
+
+        enhanced_parts = []
+        for name, box in crop_specs:
+            crop = image.crop(box)
+            crop = ImageOps.grayscale(crop)
+            crop = ImageOps.autocontrast(crop)
+            crop = ImageEnhance.Contrast(crop).enhance(1.7)
+            scale = _scale_for_date_retry_crop(crop.width, crop.height)
+            if name == "full_context":
+                scale = min(scale, 2)
+            if scale > 1:
+                crop = crop.resize(
+                    (crop.width * scale, crop.height * scale),
+                    Image.Resampling.LANCZOS,
+                )
+            enhanced_parts.append((name, crop))
+
+        separator = 24
+        sheet_width = max(part.width for _, part in enhanced_parts)
+        sheet_height = sum(part.height for _, part in enhanced_parts) + separator * (
+            len(enhanced_parts) - 1
+        )
+        sheet = Image.new("L", (sheet_width, sheet_height), 255)
+        y = 0
+        for _, part in enhanced_parts:
+            x = (sheet_width - part.width) // 2
+            sheet.paste(part, (x, y))
+            y += part.height + separator
+
+        max_side = max(sheet.width, sheet.height)
+        if max_side > 3600:
+            ratio = 3600 / max_side
+            sheet = sheet.resize(
+                (max(1, int(sheet.width * ratio)), max(1, int(sheet.height * ratio))),
+                Image.Resampling.LANCZOS,
+            )
+
+        handle = tempfile.NamedTemporaryFile(
+            prefix="dcexpense-supplier-retry-",
+            suffix=".png",
+            delete=False,
+        )
+        temp_path = Path(handle.name)
+        handle.close()
+        sheet.save(temp_path, format="PNG", optimize=True)
+        enhanced_bytes = temp_path.stat().st_size
+        metadata = {
+            "enhanced_used": True,
+            "original_width": width,
+            "original_height": height,
+            "original_bytes": original_bytes,
+            "enhanced_width": sheet.width,
+            "enhanced_height": sheet.height,
+            "enhanced_bytes": enhanced_bytes,
+            "crop_strategy": "header_25+top_50+full_context_grayscale_autocontrast_contrast_upscale",
+        }
+        notes = [
+            "Enhanced supplier retry image created using crop strategy "
+            "header_25+top_50+full_context, grayscale/autocontrast/contrast, capped upscale.",
+            (
+                "Supplier retry image metadata: "
+                f"original_width={width} original_height={height} original_bytes={original_bytes} "
+                f"enhanced_width={sheet.width} enhanced_height={sheet.height} "
+                f"enhanced_bytes={enhanced_bytes}"
+            ),
+        ]
+        logger.info(
+            "Supplier header retry enhanced image created original_path=%s "
+            "original_width=%s original_height=%s original_bytes=%s enhanced_path=%s "
+            "enhanced_width=%s enhanced_height=%s enhanced_bytes=%s crop_strategy=%s "
+            "reason=supplier_header_retry",
+            path,
+            width,
+            height,
+            original_bytes,
+            temp_path,
+            sheet.width,
+            sheet.height,
+            enhanced_bytes,
+            metadata["crop_strategy"],
+        )
+        return _PreparedSupplierRetryImage(path=temp_path, notes=notes, metadata=metadata)
+    except Exception as exc:
+        logger.warning(
+            "Supplier header retry enhanced image creation failed path=%s error=%s; "
+            "falling back to original image.",
+            path,
+            exc,
+        )
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        return None
+
+
+def _supplier_retry_images_for_path(
+    storage_path: str,
+) -> tuple[list[tuple[str, str]] | None, list[str], dict[str, Any]]:
+    notes: list[str] = []
+    metadata: dict[str, Any] = {"enhanced_used": False}
+    prepared = _create_enhanced_supplier_retry_image(storage_path)
+    if prepared is not None:
+        notes.extend(prepared.notes)
+        metadata.update(prepared.metadata)
+        try:
+            enhanced_images, enhanced_notes = _vision_images_for_path(str(prepared.path))
+            notes.extend(enhanced_notes)
+            if enhanced_images is not None:
+                return enhanced_images, notes, metadata
+            notes.append(
+                "Enhanced supplier retry image could not be encoded; falling back to original image."
+            )
+            logger.warning(
+                "Supplier header retry enhanced image could not be encoded path=%s; "
+                "falling back to original image.",
+                prepared.path,
+            )
+        finally:
+            prepared.path.unlink(missing_ok=True)
+
+    original_images, original_notes = _vision_images_for_path(storage_path)
+    notes.extend(original_notes)
+    if original_images is not None:
+        notes.append("Supplier retry used original image because enhancement was unavailable.")
+    return original_images, notes, metadata
 
 
 def _read_pdf_pages_b64(
@@ -1012,10 +1183,11 @@ def vision_extract(storage_path: str) -> VisionResult | None:
       1. Call the full vision model with ``_VISION_PROMPT`` and read all
          fields (date, amount, supplier, currency, business_or_personal,
          receipt_type) from the response.
-      2. If the first-pass supplier is missing — the
-         ``UNREADABLE_MERCHANT`` sentinel, ``None``, or an empty
-         string — retry the same model with ``_VISION_PROMPT_STRICT``
-         (supplier-only) and merge only supplier.
+      2. Run supplier-only header retry for missing/unreadable suppliers,
+         and for otherwise complete image receipts with a present supplier
+         so wrong-but-confident header OCR can be corrected from an enhanced
+         top/header crop. Merge only a clear retry supplier; null/unreadable
+         retries preserve any first-pass supplier.
       3. If date is still missing, retry with ``_VISION_PROMPT_DATE_ONLY``
          and merge only date.
       4. If amount or currency is still missing, retry with
@@ -1044,41 +1216,90 @@ def vision_extract(storage_path: str) -> VisionResult | None:
     merged = dict(first_fields)
     retry_attempted = False
     retry_contributed = False
+    metadata: dict[str, Any] = {}
 
     first_supplier = merged.get("supplier")
-    if _supplier_needs_merchant_retry(first_supplier):
-        # Supplier-only ambiguity -> run stricter merchant-only retry. Date and
-        # amount from the first pass stand: a supplier-side problem must never
-        # blank fields that were already extracted cleanly.
+    supplier_needs_retry = _supplier_needs_merchant_retry(first_supplier)
+    supplier_header_retry = (
+        Path(storage_path).suffix.lower() in _IMAGE_EXTENSIONS
+        and not supplier_needs_retry
+        and not _date_missing(merged.get("date"))
+        and not _amount_missing(merged.get("amount"))
+        and not _currency_missing(merged.get("currency"))
+    )
+    if supplier_needs_retry or supplier_header_retry:
+        # Supplier-only ambiguity/header verification -> run stricter
+        # merchant-only retry. Date and amount from the first pass stand:
+        # a supplier-side problem must never blank fields that were already
+        # extracted cleanly.
         if _is_unreadable_merchant_sentinel(first_supplier):
             retry_reason = f"reported {UNREADABLE_MERCHANT_SENTINEL} for supplier"
         elif first_supplier is None:
             retry_reason = "returned null supplier"
-        else:
+        elif supplier_needs_retry:
             retry_reason = "returned empty/whitespace supplier"
+        else:
+            retry_reason = "returned a supplier; verifying against enhanced header crop"
         notes.append(
             f"First pass ({VISION_MODEL}) {retry_reason}; "
-            "retrying supplier extraction with stricter prompt (other fields preserved)."
+            "retrying supplier/header extraction with stricter prompt (other fields preserved)."
         )
         retry_attempted = True
-        retry_fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_STRICT)
+        retry_images, retry_image_notes, retry_image_metadata = (
+            _supplier_retry_images_for_path(storage_path)
+            if Path(storage_path).suffix.lower() in _IMAGE_EXTENSIONS
+            else (images, [], {"enhanced_used": False})
+        )
+        notes.extend(retry_image_notes)
+        retry_fields = (
+            _vision_call(VISION_MODEL, retry_images, _VISION_PROMPT_STRICT)
+            if retry_images is not None
+            else None
+        )
+        retry_supplier = retry_fields.get("supplier") if retry_fields is not None else None
         # ``escalated`` reflects whether the retry actually contributed to the
         # returned result. A None retry response means the retry didn't run (or
         # ran and failed to parse) — we keep the first-pass fields unchanged,
         # which is semantically the same as "no retry happened" from the
         # downstream caller's perspective.
-        if retry_fields is not None and "supplier" in retry_fields:
-            merged["supplier"] = retry_fields.get("supplier")
+        if _is_clear_supplier_retry(retry_supplier):
+            merged["supplier"] = retry_supplier.strip()
             retry_contributed = True
             notes.append(
                 f"Supplier retry ({VISION_MODEL}) returned supplier="
-                f"{retry_fields.get('supplier')!r}; first-pass date/amount/etc. preserved."
+                f"{retry_supplier!r}; first-pass date/amount/etc. preserved."
             )
         else:
+            if supplier_needs_retry:
+                merged["supplier"] = None
             notes.append(
-                "Supplier retry unavailable; keeping first-pass fields with supplier "
-                "normalized to None."
+                "Supplier retry unavailable or unreadable; keeping first-pass supplier "
+                "when present, otherwise leaving supplier missing."
             )
+        metadata["supplier_header_retry"] = {
+            **retry_image_metadata,
+            "first_pass_supplier": first_supplier,
+            "retry_supplier_raw": retry_supplier,
+            "final_supplier": merged.get("supplier"),
+            "reason": "supplier_header_retry",
+        }
+        logger.info(
+            "Supplier header retry completed first_pass_supplier=%r "
+            "retry_supplier_raw=%r final_supplier=%r enhanced_used=%s "
+            "original_width=%s original_height=%s original_bytes=%s "
+            "enhanced_width=%s enhanced_height=%s enhanced_bytes=%s "
+            "reason=supplier_header_retry",
+            first_supplier,
+            retry_supplier,
+            merged.get("supplier"),
+            retry_image_metadata.get("enhanced_used"),
+            retry_image_metadata.get("original_width"),
+            retry_image_metadata.get("original_height"),
+            retry_image_metadata.get("original_bytes"),
+            retry_image_metadata.get("enhanced_width"),
+            retry_image_metadata.get("enhanced_height"),
+            retry_image_metadata.get("enhanced_bytes"),
+        )
 
     if _date_missing(merged.get("date")):
         notes.append(
@@ -1147,7 +1368,7 @@ def vision_extract(storage_path: str) -> VisionResult | None:
 
     return VisionResult(
         fields=_normalize_unreadable_supplier(merged),
-        model=VISION_MODEL, escalated=retry_contributed, notes=notes,
+        model=VISION_MODEL, escalated=retry_contributed, notes=notes, metadata=metadata,
     )
 
 

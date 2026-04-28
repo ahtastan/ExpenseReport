@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -40,7 +41,8 @@ class _Recorder:
 
 def _fake_image(tmp_path: Path) -> Path:
     path = tmp_path / "telegram_photo_2014.png"
-    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+    image = Image.new("RGB", (222, 521), "white")
+    image.save(path, format="PNG")
     return path
 
 
@@ -221,6 +223,84 @@ def test_implausible_first_pass_date_saves_local_format_retry_date(
     assert "receipt_date" not in question_keys
 
 
+def test_implausible_first_pass_date_retry_uses_enhanced_image_path(
+    isolated_db,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    seen_paths: list[str] = []
+    real_images_for_path = model_router._vision_images_for_path
+
+    def recording_images_for_path(storage_path):
+        seen_paths.append(str(storage_path))
+        return real_images_for_path(storage_path)
+
+    monkeypatch.setattr(model_router, "_vision_images_for_path", recording_images_for_path)
+
+    receipt, question_keys, recorder = _extract_with_statement_context(
+        isolated_db,
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "date": "2014-12-15",
+                "supplier": "YENI DUNYA TUR PET VE PET UR",
+                "amount": 175,
+                "currency": "TRY",
+                "receipt_type": "payment_receipt",
+            },
+            {"date": "15-11-2025"},
+        ],
+    )
+
+    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert receipt.extracted_date == date(2025, 11, 15)
+    assert "receipt_date" not in question_keys
+    assert len(seen_paths) == 2
+    assert seen_paths[0].endswith("telegram_photo_2014.png")
+    assert seen_paths[1] != seen_paths[0]
+    assert Path(seen_paths[1]).name.startswith("dcexpense-date-retry-")
+
+
+def test_missing_first_pass_date_retry_uses_enhanced_image_path(
+    isolated_db,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    seen_paths: list[str] = []
+    real_images_for_path = model_router._vision_images_for_path
+
+    def recording_images_for_path(storage_path):
+        seen_paths.append(str(storage_path))
+        return real_images_for_path(storage_path)
+
+    monkeypatch.setattr(model_router, "_vision_images_for_path", recording_images_for_path)
+
+    receipt, question_keys, recorder = _extract_with_statement_context(
+        isolated_db,
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "date": None,
+                "supplier": "YENI DUNYA TUR PET VE PET UR",
+                "amount": 175,
+                "currency": "TRY",
+                "receipt_type": "payment_receipt",
+            },
+            {"date": "15-11-2025"},
+        ],
+    )
+
+    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert receipt.extracted_date == date(2025, 11, 15)
+    assert "receipt_date" not in question_keys
+    assert len(seen_paths) == 2
+    assert seen_paths[0].endswith("telegram_photo_2014.png")
+    assert seen_paths[1] != seen_paths[0]
+    assert Path(seen_paths[1]).name.startswith("dcexpense-date-retry-")
+
+
 def test_invalid_calendar_retry_date_is_not_saved_and_asks_for_date(
     isolated_db,
     tmp_path,
@@ -276,6 +356,38 @@ def test_implausible_retry_date_is_not_saved_and_asks_for_date(
     assert "retry_normalized_date=2014-01-15" in caplog.text
     assert "retry_sanity_accepted=False" in caplog.text
     assert "retry_sanity_reason=outside_statement_period" in caplog.text
+
+
+def test_missing_retry_date_log_is_not_marked_sanity_accepted(
+    isolated_db,
+    tmp_path,
+    monkeypatch,
+    caplog,
+) -> None:
+    caplog.set_level("WARNING", logger="app.services.receipt_extraction")
+
+    receipt, question_keys, recorder = _extract_with_statement_context(
+        isolated_db,
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "date": "2014-12-15",
+                "supplier": "YENI DUNYA TUR PET VE PET UR",
+                "amount": 175,
+                "currency": "TRY",
+            },
+            {"date": None},
+        ],
+    )
+
+    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert receipt.extracted_date is None
+    assert "receipt_date" in question_keys
+    assert "retry_raw_date=None" in caplog.text
+    assert "retry_normalized_date=None" in caplog.text
+    assert "retry_sanity_accepted=False" in caplog.text
+    assert "retry_sanity_reason=retry_missing_date" in caplog.text
 
 
 def test_date_only_retry_prompt_calls_out_turkish_pos_receipt_dates() -> None:

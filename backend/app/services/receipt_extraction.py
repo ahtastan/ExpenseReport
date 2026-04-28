@@ -345,7 +345,11 @@ def extract_receipt_fields(
                 notes.extend(retry_result.notes)
                 raw_retry_date = retry_result.fields.get("date")
                 retry_date = _coerce_vision_date(raw_retry_date)
-        retry_sanity = validate_receipt_date(retry_date, context=date_sanity_context, today=today)
+        retry_sanity = (
+            validate_receipt_date(retry_date, context=date_sanity_context, today=today)
+            if retry_date is not None
+            else DateSanityResult(False, "retry_missing_date")
+        )
         if retry_date is not None and retry_sanity.accepted:
             extracted_date = retry_date
             retry_recovered = True

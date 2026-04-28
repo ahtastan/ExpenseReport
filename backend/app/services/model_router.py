@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -162,6 +163,9 @@ _VISION_PROMPT_STRICT = (
 _VISION_PROMPT_DATE_ONLY = (
     "Look at this receipt image one more time. Date is the only missing "
     "field from the first extraction pass. Your only task is to find the "
+    "printed receipt date. The image may contain multiple zoomed crops "
+    "of the same receipt stacked vertically to aid readability; treat "
+    "them as views of the same receipt and return any clearly visible "
     "printed receipt date.\n"
     "\n"
     "DATE RULES:\n"
@@ -232,6 +236,12 @@ class VisionResult:
     fields: dict[str, Any]
     model: str  # the model that produced the fields (single-tier post-F1.3)
     escalated: bool  # true when a focused retry contributed to the result
+    notes: list[str]
+
+
+@dataclass(frozen=True)
+class _PreparedDateRetryImage:
+    path: Path
     notes: list[str]
 
 
@@ -366,6 +376,132 @@ def _read_image_b64(path: Path) -> tuple[str, str] | None:
     media = _MEDIA_TYPES.get(path.suffix.lower(), "image/jpeg")
     data = base64.standard_b64encode(path.read_bytes()).decode()
     return media, data
+
+
+def _scale_for_date_retry_crop(width: int, height: int) -> int:
+    if width <= 0 or height <= 0:
+        return 1
+    scale = max(1, min(4, (900 + width - 1) // width))
+    largest_side = max(width, height)
+    if largest_side * scale > 2400:
+        scale = max(1, 2400 // largest_side)
+    return scale
+
+
+def _create_enhanced_date_retry_image(storage_path: str) -> _PreparedDateRetryImage | None:
+    path = Path(storage_path)
+    if path.suffix.lower() not in _IMAGE_EXTENSIONS:
+        return None
+
+    temp_path: Path | None = None
+    try:
+        from PIL import Image, ImageEnhance, ImageOps  # deferred import
+
+        original_bytes = path.stat().st_size
+        with Image.open(path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return None
+
+        band_height = max(1, int(height * 0.40))
+        middle_start = max(0, min(height - band_height, int(height * 0.30)))
+        crop_specs = [
+            ("top_40", (0, 0, width, min(height, band_height))),
+            ("middle_40", (0, middle_start, width, min(height, middle_start + band_height))),
+            ("full", (0, 0, width, height)),
+        ]
+
+        enhanced_parts = []
+        for name, box in crop_specs:
+            crop = image.crop(box)
+            crop = ImageOps.grayscale(crop)
+            crop = ImageOps.autocontrast(crop)
+            crop = ImageEnhance.Contrast(crop).enhance(1.6)
+            scale = _scale_for_date_retry_crop(crop.width, crop.height)
+            if scale > 1:
+                crop = crop.resize((crop.width * scale, crop.height * scale), Image.Resampling.LANCZOS)
+            enhanced_parts.append((name, crop))
+
+        separator = 24
+        sheet_width = max(part.width for _, part in enhanced_parts)
+        sheet_height = sum(part.height for _, part in enhanced_parts) + separator * (len(enhanced_parts) - 1)
+        sheet = Image.new("L", (sheet_width, sheet_height), 255)
+        y = 0
+        for _, part in enhanced_parts:
+            x = (sheet_width - part.width) // 2
+            sheet.paste(part, (x, y))
+            y += part.height + separator
+
+        handle = tempfile.NamedTemporaryFile(
+            prefix="dcexpense-date-retry-",
+            suffix=".png",
+            delete=False,
+        )
+        temp_path = Path(handle.name)
+        handle.close()
+        sheet.save(temp_path, format="PNG", optimize=True)
+        enhanced_bytes = temp_path.stat().st_size
+        notes = [
+            "Enhanced date retry image created using crop strategy "
+            "top_40+middle_40+full, grayscale/autocontrast/contrast, capped upscale.",
+            (
+                "Date retry image metadata: "
+                f"original_width={width} original_height={height} original_bytes={original_bytes} "
+                f"enhanced_width={sheet.width} enhanced_height={sheet.height} "
+                f"enhanced_bytes={enhanced_bytes}"
+            ),
+        ]
+        logger.info(
+            "Date retry enhanced image created original_path=%s original_width=%s "
+            "original_height=%s original_bytes=%s enhanced_path=%s enhanced_width=%s "
+            "enhanced_height=%s enhanced_bytes=%s crop_strategy=%s",
+            path,
+            width,
+            height,
+            original_bytes,
+            temp_path,
+            sheet.width,
+            sheet.height,
+            enhanced_bytes,
+            "top_40+middle_40+full_grayscale_autocontrast_contrast_upscale",
+        )
+        return _PreparedDateRetryImage(path=temp_path, notes=notes)
+    except Exception as exc:
+        logger.warning(
+            "Date retry enhanced image creation failed path=%s error=%s; "
+            "falling back to original image.",
+            path,
+            exc,
+        )
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        return None
+
+
+def _date_retry_images_for_path(storage_path: str) -> tuple[list[tuple[str, str]] | None, list[str]]:
+    notes: list[str] = []
+    prepared = _create_enhanced_date_retry_image(storage_path)
+    if prepared is not None:
+        notes.extend(prepared.notes)
+        try:
+            enhanced_images, enhanced_notes = _vision_images_for_path(str(prepared.path))
+            notes.extend(enhanced_notes)
+            if enhanced_images is not None:
+                return enhanced_images, notes
+            notes.append("Enhanced date retry image could not be encoded; falling back to original image.")
+            logger.warning(
+                "Date retry enhanced image could not be encoded path=%s; falling back to original image.",
+                prepared.path,
+            )
+        finally:
+            prepared.path.unlink(missing_ok=True)
+
+    original_images, original_notes = _vision_images_for_path(storage_path)
+    notes.extend(original_notes)
+    if original_images is not None:
+        notes.append("Date retry used original image because enhancement was unavailable.")
+    return original_images, notes
 
 
 def _read_pdf_pages_b64(
@@ -949,7 +1085,13 @@ def vision_extract(storage_path: str) -> VisionResult | None:
             f"Date missing after first pass ({VISION_MODEL}); retrying date-only extraction."
         )
         retry_attempted = True
-        retry_fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_DATE_ONLY)
+        retry_images, retry_image_notes = _date_retry_images_for_path(storage_path)
+        notes.extend(retry_image_notes)
+        retry_fields = (
+            _vision_call(VISION_MODEL, retry_images, _VISION_PROMPT_DATE_ONLY)
+            if retry_images is not None
+            else None
+        )
         retry_date = retry_fields.get("date") if retry_fields is not None else None
         if not _date_missing(retry_date):
             merged["date"] = retry_date
@@ -1031,7 +1173,7 @@ def _vision_images_for_path(storage_path: str) -> tuple[list[tuple[str, str]] | 
 
 def vision_retry_date(storage_path: str) -> VisionResult | None:
     """Run only the receipt-date prompt against the configured vision model."""
-    images, notes = _vision_images_for_path(storage_path)
+    images, notes = _date_retry_images_for_path(storage_path)
     if images is None:
         return None
     fields = _vision_call(VISION_MODEL, images, _VISION_PROMPT_DATE_ONLY)

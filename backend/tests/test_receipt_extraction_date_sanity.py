@@ -7,6 +7,8 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -154,6 +156,96 @@ def test_implausible_first_pass_date_retries_and_saves_recovered_date(
     assert "receipt_date" not in question_keys
 
 
+@pytest.mark.parametrize(
+    "retry_value",
+    ["15-11-2025", "15/11/2025", "15.11.2025"],
+)
+def test_date_retry_normalizes_turkish_pos_date_formats(
+    isolated_db,
+    tmp_path,
+    monkeypatch,
+    retry_value: str,
+) -> None:
+    receipt, question_keys, recorder = _extract_with_statement_context(
+        isolated_db,
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "date": None,
+                "supplier": "YENI DUNYA TUR PET VE PET UR",
+                "amount": 175,
+                "currency": "TRY",
+                "receipt_type": "payment_receipt",
+            },
+            {"date": retry_value},
+        ],
+    )
+
+    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert receipt.extracted_date == date(2025, 11, 15)
+    assert receipt.extracted_local_amount == Decimal("175.0000")
+    assert receipt.extracted_currency == "TRY"
+    assert receipt.extracted_supplier == "YENI DUNYA TUR PET VE PET UR"
+    assert receipt.receipt_type == "payment_receipt"
+    assert "receipt_date" not in question_keys
+
+
+def test_implausible_first_pass_date_saves_local_format_retry_date(
+    isolated_db,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    receipt, question_keys, recorder = _extract_with_statement_context(
+        isolated_db,
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "date": "2014-01-15",
+                "supplier": "YENI DUNYA TUR PET VE PET UR",
+                "amount": 175,
+                "currency": "TRY",
+                "receipt_type": "payment_receipt",
+            },
+            {"date": "15-11-2025"},
+        ],
+    )
+
+    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert receipt.extracted_date == date(2025, 11, 15)
+    assert receipt.extracted_local_amount == Decimal("175.0000")
+    assert receipt.extracted_currency == "TRY"
+    assert receipt.extracted_supplier == "YENI DUNYA TUR PET VE PET UR"
+    assert receipt.receipt_type == "payment_receipt"
+    assert "receipt_date" not in question_keys
+
+
+def test_invalid_calendar_retry_date_is_not_saved_and_asks_for_date(
+    isolated_db,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    receipt, question_keys, recorder = _extract_with_statement_context(
+        isolated_db,
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "date": "2014-01-15",
+                "supplier": "YENI DUNYA TUR PET VE PET UR",
+                "amount": 175,
+                "currency": "TRY",
+            },
+            {"date": "31-02-2025"},
+        ],
+    )
+
+    assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
+    assert receipt.extracted_date is None
+    assert "receipt_date" in question_keys
+
+
 def test_implausible_retry_date_is_not_saved_and_asks_for_date(
     isolated_db,
     tmp_path,
@@ -180,4 +272,26 @@ def test_implausible_retry_date_is_not_saved_and_asks_for_date(
     assert recorder.prompts == ["<default>", model_router._VISION_PROMPT_DATE_ONLY]
     assert receipt.extracted_date is None
     assert "receipt_date" in question_keys
-    assert "retry_returned_date=2014-01-15" in caplog.text
+    assert "retry_raw_date='2014-01-15'" in caplog.text
+    assert "retry_normalized_date=2014-01-15" in caplog.text
+    assert "retry_sanity_accepted=False" in caplog.text
+    assert "retry_sanity_reason=outside_statement_period" in caplog.text
+
+
+def test_date_only_retry_prompt_calls_out_turkish_pos_receipt_dates() -> None:
+    prompt = model_router._VISION_PROMPT_DATE_ONLY
+
+    assert "Turkish POS" in prompt
+    assert "TARIH" in prompt
+    assert "TARİH" in prompt
+    assert "SAAT" in prompt
+    assert "FIS NO" in prompt
+    assert "FİŞ NO" in prompt
+    assert "DD-MM-YYYY" in prompt
+    assert "DD/MM/YYYY" in prompt
+    assert "DD.MM.YYYY" in prompt
+    assert "receipt date, not the card transaction date" in prompt
+    assert "current date" in prompt
+    assert "upload date" in prompt
+    assert "Telegram timestamp" in prompt
+    assert "impossible years" in prompt

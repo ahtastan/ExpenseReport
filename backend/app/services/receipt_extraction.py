@@ -136,6 +136,22 @@ def _parse_date(text: str) -> date | None:
     return None
 
 
+def _coerce_vision_date(value: object) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return _parse_date(text)
+
+
 def _parse_amount(text: str) -> tuple[Decimal | None, str | None]:
     candidates: list[tuple[Decimal, str | None]] = []
     for match in AMOUNT_RE.finditer(text):
@@ -254,12 +270,15 @@ def _log_date_rejection(
     context: DateSanityContext | None,
     *,
     recovered: bool,
-    retry_returned_date: date | None,
+    retry_raw_date: object | None,
+    retry_normalized_date: date | None,
+    retry_sanity: DateSanityResult,
 ) -> None:
     logger.warning(
         "Receipt OCR date sanity rejected receipt_id=%s rejected_date=%s reason=%s "
         "statement_import_id=%s statement_period=%s..%s date_retry_recovered=%s "
-        "retry_returned_date=%s",
+        "retry_raw_date=%r retry_normalized_date=%s retry_sanity_accepted=%s "
+        "retry_sanity_reason=%s",
         receipt.id,
         rejected_date,
         result.reason,
@@ -267,7 +286,10 @@ def _log_date_rejection(
         context.period_start if context else None,
         context.period_end if context else None,
         recovered,
-        retry_returned_date,
+        retry_raw_date,
+        retry_normalized_date,
+        retry_sanity.accepted,
+        retry_sanity.reason,
     )
 
 
@@ -301,12 +323,7 @@ def extract_receipt_fields(
 
     def _vision_date() -> date | None:
         raw = (vision or {}).get("date")
-        if not raw:
-            return None
-        try:
-            return date.fromisoformat(str(raw))
-        except ValueError:
-            return _parse_date(str(raw))
+        return _coerce_vision_date(raw)
 
     # Merge priority: previously-stored value > deterministic > vision.
     # Deterministic wins over vision because it reflects ground truth from the
@@ -321,16 +338,13 @@ def extract_receipt_fields(
             f"({date_sanity.reason}); retrying date-only extraction."
         )
         retry_date: date | None = None
+        raw_retry_date: object | None = None
         if receipt.storage_path:
             retry_result = model_router.vision_retry_date(receipt.storage_path)
             if retry_result is not None:
                 notes.extend(retry_result.notes)
                 raw_retry_date = retry_result.fields.get("date")
-                if raw_retry_date:
-                    try:
-                        retry_date = date.fromisoformat(str(raw_retry_date))
-                    except ValueError:
-                        retry_date = _parse_date(str(raw_retry_date))
+                retry_date = _coerce_vision_date(raw_retry_date)
         retry_sanity = validate_receipt_date(retry_date, context=date_sanity_context, today=today)
         if retry_date is not None and retry_sanity.accepted:
             extracted_date = retry_date
@@ -351,7 +365,9 @@ def extract_receipt_fields(
             result=date_sanity,
             context=date_sanity_context,
             recovered=retry_recovered,
-            retry_returned_date=retry_date,
+            retry_raw_date=raw_retry_date,
+            retry_normalized_date=retry_date,
+            retry_sanity=retry_sanity,
         )
     vision_amount_raw = (vision or {}).get("amount")
     # Vision returns numeric JSON (int/float); route through str() into Decimal

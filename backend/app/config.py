@@ -12,6 +12,7 @@ class Settings(BaseModel):
     telegram_bot_token: str | None = None
     telegram_webhook_secret: str | None = None
     allowed_telegram_user_ids: set[int] = Field(default_factory=set)
+    business_personal_clarification_telegram_ids: set[int] = Field(default_factory=set)
     report_template_path: Path | None = None
 
 
@@ -46,6 +47,9 @@ def get_settings() -> Settings:
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
         telegram_webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET"),
         allowed_telegram_user_ids=_parse_user_ids(os.getenv("ALLOWED_TELEGRAM_USER_IDS")),
+        business_personal_clarification_telegram_ids=_parse_user_ids(
+            os.getenv("BUSINESS_PERSONAL_CLARIFICATION_TELEGRAM_IDS")
+        ),
         report_template_path=Path(os.environ["EXPENSE_REPORT_TEMPLATE_PATH"])
         if os.getenv("EXPENSE_REPORT_TEMPLATE_PATH")
         else _default_report_template_path(),

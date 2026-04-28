@@ -195,15 +195,6 @@ def _parse_merchant(text: str, filename: str | None) -> str | None:
     return None
 
 
-def _parse_business_or_personal(text: str) -> str | None:
-    lowered = text.lower()
-    if "personal" in lowered:
-        return "Personal"
-    if "business" in lowered or "customer" in lowered or "client" in lowered or "project" in lowered:
-        return "Business"
-    return None
-
-
 def _source_text(receipt: ReceiptDocument) -> str:
     parts = [
         receipt.caption or "",
@@ -308,7 +299,9 @@ def extract_receipt_fields(
     det_date = _parse_date(text)
     det_amount, det_currency = _parse_amount(text)
     det_supplier = _parse_merchant(text, receipt.original_file_name)
-    det_bp = _parse_business_or_personal(text)
+    # OCR/upload text is not trusted to classify Business vs Personal.
+    # F1.8 moves that decision to explicit clarification for allowlisted
+    # users, or a policy default in clarifications for normal Telegram users.
 
     # Stage 2: run the configured vision pipeline only when critical fields
     # are still missing. Focused retries remain inside the router except for
@@ -394,8 +387,7 @@ def extract_receipt_fields(
         extracted_supplier = receipt.extracted_supplier or vision_supplier or det_supplier
     else:
         extracted_supplier = receipt.extracted_supplier or det_supplier or vision_supplier
-    vision_bp = (vision or {}).get("business_or_personal")
-    business_or_personal = receipt.business_or_personal or det_bp or vision_bp
+    business_or_personal = receipt.business_or_personal
 
     # Addition B: receipt_type follows the "stored wins" merge rule. Vision
     # only gets to assign on first classification; user/operator overrides

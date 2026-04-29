@@ -16,6 +16,9 @@ class Settings(BaseModel):
     # restarting dcexpense.service.
     business_personal_clarification_telegram_ids: set[int] = Field(default_factory=set)
     report_template_path: Path | None = None
+    ai_agent_db_write_enabled: bool = False
+    ai_store_raw_model_json: bool = False
+    ai_store_prompt_text: bool = False
 
 
 def _default_storage_root() -> Path:
@@ -39,6 +42,12 @@ def _parse_user_ids(raw: str | None) -> set[int]:
     return ids
 
 
+def _parse_bool(raw: str | None) -> bool:
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @lru_cache
 def get_settings() -> Settings:
     storage_root = Path(os.getenv("EXPENSE_STORAGE_ROOT") or _default_storage_root())
@@ -55,4 +64,7 @@ def get_settings() -> Settings:
         report_template_path=Path(os.environ["EXPENSE_REPORT_TEMPLATE_PATH"])
         if os.getenv("EXPENSE_REPORT_TEMPLATE_PATH")
         else _default_report_template_path(),
+        ai_agent_db_write_enabled=_parse_bool(os.getenv("AI_AGENT_DB_WRITE_ENABLED")),
+        ai_store_raw_model_json=_parse_bool(os.getenv("AI_STORE_RAW_MODEL_JSON")),
+        ai_store_prompt_text=_parse_bool(os.getenv("AI_STORE_PROMPT_TEXT")),
     )

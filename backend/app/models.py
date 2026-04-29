@@ -65,6 +65,86 @@ class ReceiptDocument(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class AgentReceiptReviewRun(SQLModel, table=True):
+    __tablename__ = "agent_receipt_review_run"
+
+    id: int | None = Field(default=None, primary_key=True)
+    receipt_document_id: int = Field(foreign_key="receiptdocument.id", index=True)
+    review_session_id: int | None = Field(default=None, foreign_key="reviewsession.id", index=True)
+    review_row_id: int | None = Field(default=None, foreign_key="reviewrow.id", index=True)
+    statement_transaction_id: int | None = Field(default=None, foreign_key="statementtransaction.id", index=True)
+    run_source: str = Field(default="local_cli", index=True)
+    run_kind: str = Field(default="receipt_second_read", index=True)
+    status: str = Field(index=True)
+    schema_version: str = Field(index=True)
+    prompt_version: str = Field(index=True)
+    prompt_hash: str | None = Field(default=None, index=True)
+    model_provider: str | None = Field(default=None, index=True)
+    model_name: str = Field(default="local_mock", index=True)
+    comparator_version: str = Field(index=True)
+    app_git_sha: str | None = None
+    canonical_snapshot_json: str = Field(default="{}", sa_column=Column(Text, nullable=False))
+    statement_snapshot_json: str | None = Field(default=None, sa_column=Column(Text))
+    input_hash: str | None = Field(default=None, index=True)
+    raw_model_json: str | None = Field(default=None, sa_column=Column(Text))
+    raw_model_json_redacted: bool = True
+    prompt_text: str | None = Field(default=None, sa_column=Column(Text))
+    error_code: str | None = None
+    error_message: str | None = Field(default=None, sa_column=Column(Text))
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class AgentReceiptRead(SQLModel, table=True):
+    __tablename__ = "agent_receipt_read"
+
+    id: int | None = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="agent_receipt_review_run.id", index=True)
+    receipt_document_id: int = Field(foreign_key="receiptdocument.id", index=True)
+    read_schema_version: str = Field(index=True)
+    read_json: str = Field(default="{}", sa_column=Column(Text, nullable=False))
+    extracted_date: date | None = None
+    extracted_supplier: str | None = None
+    amount_text: str | None = None
+    local_amount_decimal: str | None = None
+    local_amount_minor: int | None = None
+    amount_scale: int | None = None
+    currency: str | None = Field(default=None, index=True)
+    receipt_type: str | None = Field(default=None, index=True)
+    business_or_personal: str | None = Field(default=None, index=True)
+    business_reason: str | None = Field(default=None, sa_column=Column(Text))
+    attendees_json: str | None = Field(default=None, sa_column=Column(Text))
+    confidence_json: str | None = Field(default=None, sa_column=Column(Text))
+    evidence_json: str | None = Field(default=None, sa_column=Column(Text))
+    warnings_json: str | None = Field(default=None, sa_column=Column(Text))
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class AgentReceiptComparison(SQLModel, table=True):
+    __tablename__ = "agent_receipt_comparison"
+
+    id: int | None = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="agent_receipt_review_run.id", index=True)
+    agent_receipt_read_id: int = Field(foreign_key="agent_receipt_read.id", index=True)
+    receipt_document_id: int = Field(foreign_key="receiptdocument.id", index=True)
+    comparator_version: str = Field(index=True)
+    risk_level: str = Field(index=True)
+    recommended_action: str = Field(index=True)
+    attention_required: bool = Field(default=False, index=True)
+    amount_status: str | None = Field(default=None, index=True)
+    date_status: str | None = Field(default=None, index=True)
+    currency_status: str | None = Field(default=None, index=True)
+    supplier_status: str | None = Field(default=None, index=True)
+    business_context_status: str | None = Field(default=None, index=True)
+    differences_json: str = Field(default="[]", sa_column=Column(Text, nullable=False))
+    suggested_user_message: str | None = Field(default=None, sa_column=Column(Text))
+    ai_review_note: str | None = Field(default=None, sa_column=Column(Text))
+    canonical_snapshot_hash: str | None = Field(default=None, index=True)
+    agent_read_hash: str | None = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class ClarificationQuestion(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     receipt_document_id: int | None = Field(default=None, foreign_key="receiptdocument.id", index=True)

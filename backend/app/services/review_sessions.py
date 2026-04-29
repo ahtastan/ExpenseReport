@@ -259,6 +259,18 @@ def _row_payload(tx: StatementTransaction, receipt: ReceiptDocument, decision: M
     amount, currency = _amount_and_currency(tx)
     tx_date = tx.transaction_date or receipt.extracted_date
     safety_issues = [issue.as_dict() for issue in receipt_statement_issues(receipt, tx)]
+    match_payload: dict[str, Any] = {
+        "status": "matched",
+        "match_decision_id": decision.id,
+        "confidence": decision.confidence,
+        "match_method": decision.match_method,
+        "reason": decision.reason,
+        "approved": decision.approved,
+    }
+    # Only include receipt_statement_issues when there are real issues, so a clean
+    # match does not expose an empty list in the API response.
+    if safety_issues:
+        match_payload["receipt_statement_issues"] = safety_issues
     source = {
         "statement": {
             "transaction_id": tx.id,
@@ -279,15 +291,7 @@ def _row_payload(tx: StatementTransaction, receipt: ReceiptDocument, decision: M
             "extracted_currency": receipt.extracted_currency,
             "ocr_confidence": receipt.ocr_confidence,
         },
-        "match": {
-            "status": "matched",
-            "match_decision_id": decision.id,
-            "confidence": decision.confidence,
-            "match_method": decision.match_method,
-            "reason": decision.reason,
-            "approved": decision.approved,
-            "receipt_statement_issues": safety_issues,
-        },
+        "match": match_payload,
     }
     suggested = {
         "transaction_id": tx.id,

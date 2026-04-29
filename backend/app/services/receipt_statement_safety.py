@@ -7,7 +7,14 @@ from decimal import Decimal
 from app.models import ReceiptDocument, StatementTransaction
 
 
+# Absolute (not relative) decimal tolerance for receipt vs statement amounts.
+# Diners statements are settled in exact decimals, so a wider tolerance would
+# mask real OCR errors on small-ticket items.
 AMOUNT_TOLERANCE = Decimal("0.01")
+
+# Calendar-day window allowed between the receipt's printed date and the
+# statement's transaction/posting date. Absorbs weekend/late-night posting
+# drift without flagging genuine same-trip matches.
 DATE_TOLERANCE_DAYS = 3
 
 
@@ -29,11 +36,19 @@ def _normalize_currency(value: str | None) -> str | None:
     if not value:
         return None
     normalized = value.strip().upper()
-    if normalized in {"TL", "₺"}:
+    if not normalized:
+        return None
+    if normalized in {"TL", "TRY", "₺"}:
         return "TRY"
-    if normalized == "$":
+    if normalized in {"$", "USD"}:
         return "USD"
-    return normalized or None
+    if normalized in {"€", "EUR"}:
+        return "EUR"
+    if normalized in {"£", "GBP"}:
+        return "GBP"
+    if normalized in {"KM", "BAM"}:
+        return "BAM"
+    return normalized
 
 
 def _fmt_amount(value: Decimal | None, currency: str | None) -> str:

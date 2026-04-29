@@ -22,7 +22,10 @@ from app.services.review_sessions import (
     session_payload,
     update_review_row,
 )
-from app.services.receipt_statement_safety import receipt_statement_issues
+from app.services.receipt_statement_safety import (
+    _normalize_currency,
+    receipt_statement_issues,
+)
 from _pivot_helpers import ensure_expense_report_for_statement
 
 
@@ -323,5 +326,49 @@ def test_supplier_mismatch_alone_is_not_a_review_blocker() -> None:
 
         assert row.status == "suggested"
         assert row.attention_required is False
-        assert payload["source"]["match"]["receipt_statement_issues"] == []
+        assert "receipt_statement_issues" not in payload["source"]["match"]
         confirm_review_session(session, review.id or 0)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("TL", "TRY"),
+        ("tl", "TRY"),
+        ("₺", "TRY"),
+        ("TRY", "TRY"),
+        ("$", "USD"),
+        ("USD", "USD"),
+        ("€", "EUR"),
+        ("EUR", "EUR"),
+        (" eur ", "EUR"),
+        ("£", "GBP"),
+        ("GBP", "GBP"),
+        ("KM", "BAM"),
+        ("BAM", "BAM"),
+        ("RSD", "RSD"),
+    ],
+)
+def test_normalize_currency_handles_symbols_and_iso_codes(
+    raw: str | None, expected: str | None
+) -> None:
+    assert _normalize_currency(raw) == expected
+
+
+def test_currency_symbol_matches_iso_does_not_flag_mismatch() -> None:
+    receipt = ReceiptDocument(
+        extracted_date=date(2025, 6, 1),
+        extracted_local_amount=Decimal("100.00"),
+        extracted_currency="€",
+        extracted_supplier="EU Cafe",
+    )
+    transaction = StatementTransaction(
+        transaction_date=date(2025, 6, 1),
+        local_amount=Decimal("100.00"),
+        local_currency="EUR",
+        supplier_raw="EU Cafe",
+    )
+    assert receipt_statement_issues(receipt, transaction) == []

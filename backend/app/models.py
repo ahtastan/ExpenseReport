@@ -66,6 +66,14 @@ class ReceiptDocument(SQLModel, table=True):
 
 
 class AgentReceiptReviewRun(SQLModel, table=True):
+    """Lifecycle parent for one shadow-agent receipt review attempt.
+
+    This row is mutable only while the local/mock runner finalizes the attempt:
+    ``started`` becomes either ``completed`` or ``failed``. AgentReceiptRead and
+    AgentReceiptComparison rows are immutable append-only children; reruns create
+    new run/read/comparison rows rather than updating prior review artifacts.
+    """
+
     __tablename__ = "agent_receipt_review_run"
 
     id: int | None = Field(default=None, primary_key=True)
@@ -84,6 +92,8 @@ class AgentReceiptReviewRun(SQLModel, table=True):
     comparator_version: str = Field(index=True)
     app_git_sha: str | None = None
     canonical_snapshot_json: str = Field(default="{}", sa_column=Column(Text, nullable=False))
+    # Reserved for later Review Queue / statement-context snapshots. F-AI-0b-1
+    # only persists receipt-local canonical snapshots.
     statement_snapshot_json: str | None = Field(default=None, sa_column=Column(Text))
     input_hash: str | None = Field(default=None, index=True)
     raw_model_json: str | None = Field(default=None, sa_column=Column(Text))
@@ -112,6 +122,8 @@ class AgentReceiptRead(SQLModel, table=True):
     amount_scale: int | None = None
     currency: str | None = Field(default=None, index=True)
     receipt_type: str | None = Field(default=None, index=True)
+    # Reserved for later agent-read contracts that may independently extract
+    # business context. F-AI-0b-1 does not populate these from mock receipt reads.
     business_or_personal: str | None = Field(default=None, index=True)
     business_reason: str | None = Field(default=None, sa_column=Column(Text))
     attendees_json: str | None = Field(default=None, sa_column=Column(Text))

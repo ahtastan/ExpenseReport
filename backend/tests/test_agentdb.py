@@ -212,6 +212,52 @@ def test_agentdb_migration_creates_shadow_tables(tmp_path):
     }.issubset(tables)
 
 
+def test_agentdb_migration_dry_run_does_not_create_shadow_tables(tmp_path):
+    db_path = tmp_path / "migration_dry_run.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE receiptdocument (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewsession (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewrow (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE statementtransaction (id INTEGER PRIMARY KEY)")
+
+    migrate(str(db_path), apply=False)
+
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert "agent_receipt_review_run" not in tables
+    assert "agent_receipt_read" not in tables
+    assert "agent_receipt_comparison" not in tables
+
+
+def test_agentdb_migration_apply_is_idempotent(tmp_path):
+    db_path = tmp_path / "migration_idempotent.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE receiptdocument (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewsession (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewrow (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE statementtransaction (id INTEGER PRIMARY KEY)")
+
+    first = migrate(str(db_path), apply=True)
+    second = migrate(str(db_path), apply=True)
+
+    assert set(first.tables_created) == {
+        "agent_receipt_review_run",
+        "agent_receipt_read",
+        "agent_receipt_comparison",
+    }
+    assert second.tables_created == []
+    with sqlite3.connect(db_path) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'agent_receipt_%'"
+        ).fetchone()[0]
+    assert count == 3
+
+
 def test_successful_mock_write_db_writes_one_shadow_record_each_and_preserves_canonical_tables(
     isolated_db, tmp_path
 ):
@@ -271,6 +317,43 @@ def test_successful_mock_write_db_writes_one_shadow_record_each_and_preserves_ca
         assert session.get(MatchDecision, neighbors["match_decision_id"]).model_dump() == before_match
         assert session.get(PolicyDecision, neighbors["policy_decision_id"]).model_dump() == before_policy
         assert session.get(ReviewRow, neighbors["review_row_id"]).model_dump() == before_row
+
+
+def test_raw_model_json_and_prompt_text_flags_store_optional_payloads(isolated_db, tmp_path):
+    with Session(isolated_db) as session:
+        receipt = _create_receipt(session)
+
+    agent_payload = _agent_payload()
+    agent_path = tmp_path / "agent.json"
+    out_path = tmp_path / "result.json"
+    _write_json(agent_path, agent_payload)
+
+    _run_cli(
+        [
+            "--agent-json",
+            str(agent_path),
+            "--out",
+            str(out_path),
+            "--db",
+            _db_path(isolated_db),
+            "--receipt-id",
+            str(receipt.id),
+            "--write-db",
+            "--mock",
+        ],
+        env=_cli_env(
+            AI_AGENT_DB_WRITE_ENABLED="true",
+            AI_STORE_RAW_MODEL_JSON="true",
+            AI_STORE_PROMPT_TEXT="true",
+        ),
+    )
+
+    with Session(isolated_db) as session:
+        run = session.exec(select(AgentReceiptReviewRun)).one()
+        assert json.loads(run.raw_model_json) == agent_payload
+        assert run.raw_model_json_redacted is False
+        assert run.prompt_text is not None
+        assert "strict JSON" in run.prompt_text
 
 
 def test_failed_mock_write_db_persists_failed_run_without_read_or_comparison_or_canonical_mutation(

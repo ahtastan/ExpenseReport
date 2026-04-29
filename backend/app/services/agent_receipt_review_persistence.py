@@ -79,6 +79,14 @@ def write_mock_agent_receipt_review(
     store_prompt_text: bool = False,
     app_git_sha: str | None = None,
 ) -> AgentReceiptReviewWriteResult:
+    """Persist one local/mock shadow review without mutating canonical rows.
+
+    The run row is created as ``started`` and finalized to ``completed`` or
+    ``failed`` in the same transaction. Read/comparison rows are append-only
+    artifacts and are inserted only for valid completed runs; reruns create a
+    fresh run/read/comparison set.
+    """
+
     snapshot = build_canonical_receipt_snapshot(receipt)
     snapshot_json = _stable_json(snapshot)
     prompt_text = build_agent_receipt_review_prompt(snapshot)

@@ -107,9 +107,11 @@ class AgentReceiptReviewResult:
     canonical_fields: dict[str, Any]
     agent_read: AgentReceiptRead
     comparison: AgentReceiptComparison
+    schema_version: str = "0a"
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "canonical_fields": _jsonable(self.canonical_fields),
             "agent_read": self.agent_read.to_dict(),
             "comparison": self.comparison.to_dict(),
@@ -161,7 +163,7 @@ def build_agent_receipt_review_prompt(canonical_fields: Mapping[str, Any]) -> st
     canonical_json = json.dumps(_jsonable(dict(canonical_fields)), indent=2, sort_keys=True)
     return f"""You are a shadow AI receipt reviewer for a non-production expense reporting prototype.
 
-Read the full visible receipt independently. Extract only what is visible:
+Independently read the full visible receipt and extract the full receipt context. Return only what is visible:
 - merchant_name
 - merchant_address
 - receipt_date
@@ -176,11 +178,13 @@ Read the full visible receipt independently. Extract only what is visible:
 - confidence
 - raw_text_summary
 
-Preserve the visible raw amount text in amount_text. Do not guess, infer, or fill fields from memory.
-If a value is not visible, return null for that field. Return strict JSON only, with no markdown.
+Preserve raw visible evidence, especially the exact visible amount text in amount_text.
+Do not guess, infer, or fill fields from memory. If a value is not visible, return null for that field.
+Return strict JSON only, with no markdown.
 
-Compare carefully against these canonical OCR fields, but never claim final authority and never overwrite
-canonical database values:
+Canonical OCR fields are provided only as context for the application pipeline. The model is not final authority.
+The model must not approve, match, report, or overwrite canonical DB values.
+Deterministic app code will compare the agent read against canonical OCR fields after this extraction step:
 
 {canonical_json}
 
@@ -200,8 +204,7 @@ Strict JSON shape:
     "receipt_category": null,
     "confidence": null,
     "raw_text_summary": null
-  }},
-  "comparison_notes": []
+  }}
 }}
 """
 

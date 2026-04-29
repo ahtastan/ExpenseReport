@@ -50,6 +50,8 @@ def _agent(**overrides):
 def test_exact_amount_date_currency_supplier_passes():
     result = compare_agent_receipt_read(_canonical(), _agent())
 
+    assert result.schema_version == "0a"
+    assert result.to_dict()["schema_version"] == "0a"
     assert result.comparison.amount_match is True
     assert result.comparison.date_match is True
     assert result.comparison.currency_match is True
@@ -140,7 +142,10 @@ def test_prompt_builder_includes_strict_json_and_do_not_guess():
 
     assert "strict JSON" in prompt
     assert "Do not guess" in prompt
-    assert "never claim final authority" in prompt
+    assert "not final authority" in prompt
+    assert "must not approve, match, report, or overwrite canonical DB values" in prompt
+    assert "Deterministic app code will compare the agent read against canonical OCR fields" in prompt
+    assert "comparison_notes" not in prompt
     assert '"supplier": "Acme Cafe"' in prompt
 
 
@@ -184,6 +189,7 @@ def test_cli_writes_review_result_for_synthetic_json(tmp_path):
     assert completed.stderr == ""
     assert out_path.exists()
     payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "0a"
     assert payload["comparison"]["risk_level"] == "pass"
     assert payload["agent_read"]["total_amount"] == "42.50"
     assert Decimal(payload["agent_read"]["total_amount"]) == Decimal("42.50")

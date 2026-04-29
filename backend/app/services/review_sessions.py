@@ -15,6 +15,10 @@ from app.models import (
     ReviewSession,
     StatementTransaction,
 )
+from app.services.receipt_statement_safety import (
+    receipt_statement_issue_note,
+    receipt_statement_issues,
+)
 from app.services.merchant_buckets import suggest_bucket
 
 
@@ -82,6 +86,22 @@ def _default_meal_detail() -> dict[str, Any]:
 
 def _missing_required_fields(confirmed: dict[str, Any]) -> list[str]:
     return [field for field in REQUIRED_FIELDS if confirmed.get(field) in (None, "")]
+
+
+def _attention_note(missing: list[str], safety_issues: list[dict] | None = None) -> str | None:
+    parts = [f"missing {field}" for field in missing]
+    if safety_issues:
+        parts.append(receipt_statement_issue_note(safety_issues))
+    return "; ".join(part for part in parts if part) or None
+
+
+def _source_receipt_statement_issues(source_json: str | None) -> list[dict]:
+    try:
+        source = _loads(source_json)
+    except json.JSONDecodeError:
+        return []
+    issues = source.get("match", {}).get("receipt_statement_issues", [])
+    return issues if isinstance(issues, list) else []
 
 
 def _meal_duplicate_key(confirmed: dict[str, Any]) -> tuple[str, str] | None:
@@ -238,6 +258,7 @@ def _statement_payload(tx: StatementTransaction) -> tuple[dict[str, Any], dict[s
 def _row_payload(tx: StatementTransaction, receipt: ReceiptDocument, decision: MatchDecision) -> tuple[dict[str, Any], dict[str, Any]]:
     amount, currency = _amount_and_currency(tx)
     tx_date = tx.transaction_date or receipt.extracted_date
+    safety_issues = [issue.as_dict() for issue in receipt_statement_issues(receipt, tx)]
     source = {
         "statement": {
             "transaction_id": tx.id,
@@ -265,6 +286,7 @@ def _row_payload(tx: StatementTransaction, receipt: ReceiptDocument, decision: M
             "match_method": decision.match_method,
             "reason": decision.reason,
             "approved": decision.approved,
+            "receipt_statement_issues": safety_issues,
         },
     }
     suggested = {
@@ -379,15 +401,14 @@ def _sync_review_rows(session: Session, review: ReviewSession) -> None:
                 continue
             source, suggested = _row_payload(tx, receipt, decision)
             missing = _missing_required_fields(suggested)
+            safety_issues = _source_receipt_statement_issues(_dumps(source))
             existing_row.receipt_document_id = receipt.id
             existing_row.match_decision_id = decision.id
             existing_row.status = (
-                "needs_review" if missing or decision.confidence != "high" else "suggested"
+                "needs_review" if missing or safety_issues or decision.confidence != "high" else "suggested"
             )
-            existing_row.attention_required = bool(missing)
-            existing_row.attention_note = (
-                ", ".join(f"missing {field}" for field in missing) or None
-            )
+            existing_row.attention_required = bool(missing or safety_issues)
+            existing_row.attention_note = _attention_note(missing, safety_issues)
             existing_row.source_json = _dumps(source)
             existing_row.suggested_json = _dumps(suggested)
             existing_row.confirmed_json = _dumps(suggested)
@@ -406,14 +427,15 @@ def _sync_review_rows(session: Session, review: ReviewSession) -> None:
             decision_id = None
             match_confidence = None
         missing = _missing_required_fields(suggested)
+        safety_issues = _source_receipt_statement_issues(_dumps(source))
         row = ReviewRow(
             review_session_id=review.id or 0,
             statement_transaction_id=tx.id,
             receipt_document_id=receipt_id,
             match_decision_id=decision_id,
-            status="needs_review" if missing or match_confidence != "high" else "suggested",
-            attention_required=bool(missing) or decision is None,
-            attention_note=", ".join(f"missing {field}" for field in missing) or None,
+            status="needs_review" if missing or safety_issues or match_confidence != "high" else "suggested",
+            attention_required=bool(missing or safety_issues) or decision is None,
+            attention_note=_attention_note(missing, safety_issues),
             source_json=_dumps(source),
             suggested_json=_dumps(suggested),
             confirmed_json=_dumps(suggested),
@@ -499,9 +521,15 @@ def update_review_row(
         row.confirmed_json = _dumps(confirmed)
         row.status = "edited"
     missing = _missing_required_fields(confirmed)
+    safety_issues = _source_receipt_statement_issues(row.source_json)
+    safety_acknowledged = attention_required is False
     if missing:
         row.attention_required = True
-        row.attention_note = ", ".join(f"missing {field}" for field in missing)
+        row.attention_note = _attention_note(missing, safety_issues)
+        row.status = "needs_review"
+    elif safety_issues and not safety_acknowledged:
+        row.attention_required = True
+        row.attention_note = receipt_statement_issue_note(safety_issues)
         row.status = "needs_review"
     else:
         row.attention_required = False

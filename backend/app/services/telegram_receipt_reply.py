@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from sqlmodel import Session
 
 from app.models import ReceiptDocument
+from app.services.merchant_buckets import suggest_bucket
 from app.services import agent_receipt_live_provider
 from app.services.agent_receipt_review_persistence import (
     build_canonical_receipt_snapshot,
@@ -24,6 +25,17 @@ from app.services.agent_receipt_review_persistence import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MEAL_BUCKETS = {
+    "Meals/Snacks",
+    "Breakfast",
+    "Lunch",
+    "Dinner",
+    "Entertainment",
+    "Customer Entertainment",
+    "Meals & Entertainment",
+}
+
 
 def parse_telegram_allowlist(raw: str | None) -> set[int]:
     if not raw:
@@ -44,6 +56,12 @@ def should_send_ai_receipt_reply(settings: Any, telegram_user_id: int | None) ->
         return False
     allowlist = set(getattr(settings, "ai_telegram_reply_allowlist", set()) or set())
     return telegram_user_id in allowlist
+
+
+def should_include_receipt_business_context(receipt: ReceiptDocument) -> bool:
+    if _clean(receipt.business_or_personal).lower() != "business":
+        return False
+    return _is_meal_receipt(receipt)
 
 
 def build_telegram_receipt_reply(
@@ -157,6 +175,33 @@ def _receipt_field_lines(receipt: ReceiptDocument) -> list[str]:
     return lines
 
 
+def _is_meal_receipt(receipt: ReceiptDocument) -> bool:
+    bucket = _clean(receipt.report_bucket)
+    if bucket in _MEAL_BUCKETS:
+        return True
+
+    suggested_bucket = suggest_bucket(receipt.extracted_supplier)
+    if suggested_bucket in _MEAL_BUCKETS:
+        return True
+
+    supplier = _clean(receipt.extracted_supplier).lower()
+    meal_tokens = (
+        "doner",
+        "döner",
+        "restaurant",
+        "restoran",
+        "lokanta",
+        "cafe",
+        "kafe",
+        "cup",
+        "kebap",
+        "kebab",
+        "borek",
+        "börek",
+    )
+    return any(token in supplier for token in meal_tokens)
+
+
 def _format_amount(amount: Any, currency: str | None) -> str | None:
     if amount is None:
         return None
@@ -166,3 +211,7 @@ def _format_amount(amount: Any, currency: str | None) -> str | None:
         amount_text = str(amount)
     currency_text = (currency or "").strip()
     return f"{amount_text} {currency_text}".strip()
+
+
+def _clean(value: Any) -> str:
+    return str(value).strip() if value is not None else ""

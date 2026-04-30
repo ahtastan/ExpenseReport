@@ -22,7 +22,11 @@ from app.services.receipt_extraction import apply_receipt_extraction
 from app.services.review_sessions import get_or_create_review_session
 from app.services.storage import save_bytes
 from app.services.statement_import import import_diners_excel
-from app.services.telegram_receipt_reply import maybe_send_telegram_receipt_reply, should_send_ai_receipt_reply
+from app.services.telegram_receipt_reply import (
+    maybe_send_telegram_receipt_reply,
+    should_include_receipt_business_context,
+    should_send_ai_receipt_reply,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -220,11 +224,17 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     if text:
         if ai_receipt_reply_allowed:
             latest_receipt_id = _latest_receipt_id_for_user(session, user.id)
+            latest_receipt = session.get(ReceiptDocument, latest_receipt_id) if latest_receipt_id is not None else None
+            include_business_context = (
+                should_include_receipt_business_context(latest_receipt)
+                if latest_receipt is not None
+                else False
+            )
             open_question = next_open_question_for_receipt(
                 session,
                 user.id,
                 latest_receipt_id,
-                include_business_context=False,
+                include_business_context=include_business_context,
             )
         else:
             open_question = next_open_question_for_user(session, user.id)
@@ -239,11 +249,21 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 # user can keep progressing through the queue instead of
                 # getting stuck after a single "Got it".
                 if ai_receipt_reply_allowed:
+                    receipt = (
+                        session.get(ReceiptDocument, open_question.receipt_document_id)
+                        if open_question.receipt_document_id is not None
+                        else None
+                    )
+                    include_business_context = (
+                        should_include_receipt_business_context(receipt)
+                        if receipt is not None
+                        else False
+                    )
                     follow_up = next_open_question_for_receipt(
                         session,
                         user.id,
                         open_question.receipt_document_id,
-                        include_business_context=False,
+                        include_business_context=include_business_context,
                     )
                 else:
                     follow_up = next_open_question_for_user(session, user.id)
@@ -396,11 +416,12 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         _send_receipt_progress_ack(client, chat_id, receipt.id)
 
     extraction = apply_receipt_extraction(session, receipt)
+    include_business_context = should_include_receipt_business_context(receipt) if ai_receipt_reply_allowed else True
     questions = ensure_receipt_review_questions(
         session,
         receipt,
         user.id,
-        include_business_context=not ai_receipt_reply_allowed,
+        include_business_context=include_business_context,
     )
     ai_receipt_reply_sent = maybe_send_telegram_receipt_reply(
         session,

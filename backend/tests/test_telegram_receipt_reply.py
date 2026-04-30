@@ -97,6 +97,7 @@ def _patch_extraction(
     business_reason=None,
     attendees=None,
     supplier="Tiramisu Cup",
+    report_bucket="Meals/Snacks",
 ):
     def fake_apply_receipt_extraction(session: Session, receipt: ReceiptDocument):
         receipt.status = "extracted"
@@ -105,7 +106,7 @@ def _patch_extraction(
         receipt.extracted_local_amount = Decimal("300.0000")
         receipt.extracted_currency = "TRY"
         receipt.business_or_personal = business_or_personal
-        receipt.report_bucket = "Meals/Snacks"
+        receipt.report_bucket = report_bucket
         receipt.business_reason = business_reason
         receipt.attendees = attendees
         receipt.receipt_type = "payment_receipt"
@@ -183,14 +184,21 @@ def test_gate_on_allowlisted_sends_deterministic_receipt_summary(monkeypatch):
     assert "Amount: 300.00 TRY" in reply
 
 
-def test_missing_business_reason_reply_does_not_ask_for_business_purpose():
-    reply = telegram_receipt_reply.build_telegram_receipt_reply(_receipt(business_reason=None, attendees="Hakan"))
+def test_non_meal_missing_business_reason_reply_does_not_ask_for_business_purpose():
+    reply = telegram_receipt_reply.build_telegram_receipt_reply(
+        _receipt(
+            business_reason=None,
+            attendees="Hakan",
+            report_bucket="Auto Gasoline",
+            storage_path="/var/lib/dcexpense/private/fuel.jpg",
+        )
+    )
     assert reply is not None
     assert "business purpose" not in reply.lower()
     assert "project, customer, or trip" not in reply.lower()
 
 
-def test_missing_attendees_for_meal_reply_does_not_ask_for_attendees():
+def test_meal_reply_copy_still_does_not_inline_attendee_prompt():
     reply = telegram_receipt_reply.build_telegram_receipt_reply(
         _receipt(business_reason="Customer visit", attendees=None, report_bucket="Lunch")
     )
@@ -198,10 +206,17 @@ def test_missing_attendees_for_meal_reply_does_not_ask_for_attendees():
     assert "attendees" not in reply.lower()
 
 
-def test_ai_receipt_reply_upload_does_not_seed_business_context_questions(monkeypatch):
+def test_ai_receipt_reply_upload_does_not_seed_business_context_questions_for_non_meal(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
     fake = _install_fake_client(monkeypatch)
-    _patch_extraction(monkeypatch, business_or_personal="Business", business_reason=None, attendees=None)
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="KAPTANLAR TURIZM PAZ.",
+        report_bucket="Auto Gasoline",
+    )
 
     with Session(engine) as session:
         result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
@@ -219,6 +234,89 @@ def test_ai_receipt_reply_upload_does_not_seed_business_context_questions(monkey
     assert "attendees" not in reply.lower()
 
 
+def test_ai_receipt_reply_upload_seeds_business_context_questions_for_meal(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="BOSNAK DONER SERBAY",
+        report_bucket=None,
+    )
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+        receipt = session.get(ReceiptDocument, result["receipt_id"])
+
+    assert result["action"] == "receipt_captured"
+    assert result["ai_receipt_reply_sent"] is True
+    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert receipt is not None
+    assert receipt.needs_clarification is True
+    assert fake.messages[-2].startswith("Receipt received.")
+    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+
+
+def test_ai_receipt_reply_meal_context_flow_advances_on_latest_receipt(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(
+            business_reason=None,
+            attendees=None,
+            report_bucket=None,
+        )
+        receipt.extracted_supplier = "BOSNAK DÖNER SERBAY"
+        receipt.uploader_user_id = user.id
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=receipt.id,
+                user_id=user.id,
+                question_key="business_reason",
+                question_text="What project, customer, or trip should this receipt be attached to?",
+            )
+        )
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=receipt.id,
+                user_id=user.id,
+                question_key="attendees",
+                question_text="Who attended or benefited from this expense? If not applicable, reply 'N/A'.",
+            )
+        )
+        session.commit()
+
+    payload = {
+        "message": {
+            "message_id": 9004,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": "Lunch with MRS",
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.exec(select(ReceiptDocument)).one()
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "answered_clarification"
+    assert receipt_row.business_reason == "Lunch with MRS"
+    assert questions[0].status == "answered"
+    assert questions[1].status == "open"
+    assert fake.messages[-1] == "Who attended or benefited from this expense? If not applicable, reply 'N/A'."
+
+
 def test_ai_receipt_reply_text_ignores_stale_business_context_questions(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
     fake = _install_fake_client(monkeypatch)
@@ -229,6 +327,7 @@ def test_ai_receipt_reply_text_ignores_stale_business_context_questions(monkeypa
         session.commit()
         session.refresh(user)
         receipt = _receipt(business_reason=None, attendees=None, report_bucket="Auto Gasoline")
+        receipt.extracted_supplier = "SHELL PETROL"
         receipt.uploader_user_id = user.id
         session.add(receipt)
         session.commit()
@@ -324,7 +423,7 @@ def test_ai_receipt_reply_text_ignores_stale_ocr_question_from_older_receipt(mon
 def test_ai_receipt_reply_still_asks_critical_ocr_questions(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
     fake = _install_fake_client(monkeypatch)
-    _patch_extraction(monkeypatch, business_or_personal="Business", supplier=None)
+    _patch_extraction(monkeypatch, business_or_personal="Business", supplier=None, report_bucket=None)
 
     with Session(engine) as session:
         result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))

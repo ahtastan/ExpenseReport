@@ -183,6 +183,37 @@ class MigrationResult:
     tables_created: list[str]
 
 
+class MigrationStepError(RuntimeError):
+    """Raised when a single DDL step inside the migration transaction fails.
+
+    Carries the human-readable label (CREATE TABLE / CREATE INDEX), a short
+    SQL snippet, and the originating SQLite exception so the operator can see
+    which step failed without having to open the migration log file.
+    """
+
+    def __init__(self, label: str, snippet: str, original: BaseException) -> None:
+        self.label = label
+        self.snippet = snippet
+        self.original = original
+        super().__init__(
+            f"{label} failed: {type(original).__name__}: {original}; SQL: {snippet}"
+        )
+
+
+def _sql_snippet(sql: str, limit: int = 200) -> str:
+    flat = " ".join(sql.split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def _execute_step(conn: sqlite3.Connection, sql: str, *, label: str, logger: logging.Logger) -> None:
+    snippet = _sql_snippet(sql)
+    logger.info("%s: %s", label, snippet)
+    try:
+        conn.execute(sql)
+    except Exception as exc:
+        raise MigrationStepError(label, snippet, exc) from exc
+
+
 def migrate(db_path: str, *, apply: bool) -> MigrationResult:
     refuse_protected_path(db_path)
     check_sqlite_version()
@@ -203,11 +234,19 @@ def migrate(db_path: str, *, apply: bool) -> MigrationResult:
         backup_path = projected_backup
         log_path = projected_log
         shutil.copy2(db_path, backup_path)
-        handler: logging.Handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(file_handler)
+        # Mirror WARNING+ to stderr so the operator sees the failing SQL and
+        # underlying SQLite error without having to open the .migration.log file.
+        err_handler: logging.Handler = logging.StreamHandler(sys.stderr)
+        err_handler.setLevel(logging.WARNING)
+        err_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        logger.addHandler(err_handler)
     else:
-        handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(handler)
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(stdout_handler)
     logger.propagate = False
 
     conn = sqlite3.connect(db_path, isolation_level=None)
@@ -232,9 +271,9 @@ def migrate(db_path: str, *, apply: bool) -> MigrationResult:
         conn.execute("BEGIN")
         try:
             for sql in CREATE_TABLE_SQL:
-                conn.execute(sql)
+                _execute_step(conn, sql, label="CREATE TABLE", logger=logger)
             for sql in INDEX_SQL:
-                conn.execute(sql)
+                _execute_step(conn, sql, label="CREATE INDEX", logger=logger)
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")
@@ -248,13 +287,27 @@ def migrate(db_path: str, *, apply: bool) -> MigrationResult:
     except SystemExit:
         raise
     except Exception as exc:
-        logger.exception("migration failed: %s", exc)
+        logger.error("migration failed: %s", exc)
+        if isinstance(exc, MigrationStepError):
+            logger.error("  step: %s", exc.label)
+            logger.error("  sql: %s", exc.snippet)
+            logger.error("  caused by: %s: %s", type(exc.original).__name__, exc.original)
+        cause = getattr(exc, "__cause__", None)
+        if cause is not None and not isinstance(exc, MigrationStepError):
+            logger.error("  caused by: %s: %s", type(cause).__name__, cause)
+        if log_path:
+            logger.error("  full log: %s", log_path)
+        # Keep the historical generic stderr line so existing operator habits
+        # and any downstream automation that greps for it still work.
         print("ERROR: migration failed and was rolled back.", file=sys.stderr)
+        # Full traceback always goes to the file log in apply mode.
+        logger.debug("traceback", exc_info=True)
         raise SystemExit(3)
     finally:
         conn.close()
-        if isinstance(handler, logging.FileHandler):
-            handler.close()
+        for h in list(logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                h.close()
 
 
 def _print_summary(result: MigrationResult) -> None:

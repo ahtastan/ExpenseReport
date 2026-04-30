@@ -29,7 +29,10 @@ from app.services.agent_receipt_review_persistence import (
     canonical_receipt_snapshot_hash,
     get_latest_agent_receipt_comparison,
 )
+import pytest
+
 from migrations.f_ai_0b1_agent_receipt_review_tables import migrate
+from migrations import f_ai_0b1_agent_receipt_review_tables as agentdb_migration
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -255,6 +258,123 @@ def test_agentdb_migration_apply_is_idempotent(tmp_path):
         count = conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'agent_receipt_%'"
         ).fetchone()[0]
+    assert count == 3
+
+
+def test_agentdb_migration_apply_leaves_agent_tables_empty_and_canonical_rows_unchanged(tmp_path):
+    db_path = tmp_path / "migration_canonical.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE receiptdocument (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewsession (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewrow (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE statementtransaction (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO receiptdocument (id) VALUES (1), (2), (3)")
+        conn.execute("INSERT INTO reviewsession (id) VALUES (10), (11)")
+        conn.execute("INSERT INTO reviewrow (id) VALUES (100)")
+        conn.execute("INSERT INTO statementtransaction (id) VALUES (1000), (1001)")
+
+    pre_counts = {}
+    with sqlite3.connect(db_path) as conn:
+        for t in ("receiptdocument", "reviewsession", "reviewrow", "statementtransaction"):
+            pre_counts[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+
+    migrate(str(db_path), apply=True)
+
+    with sqlite3.connect(db_path) as conn:
+        for agent_table in (
+            "agent_receipt_review_run",
+            "agent_receipt_read",
+            "agent_receipt_comparison",
+        ):
+            count = conn.execute(f"SELECT COUNT(*) FROM {agent_table}").fetchone()[0]
+            assert count == 0
+        for t, expected in pre_counts.items():
+            actual = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            assert actual == expected
+
+
+def test_agentdb_migration_refuses_protected_production_path():
+    with pytest.raises(SystemExit) as excinfo:
+        migrate("/var/lib/dcexpense/expense_app.db", apply=True)
+    assert excinfo.value.code == 2
+
+    with pytest.raises(SystemExit) as excinfo:
+        migrate("/opt/dcexpense/app/data/expense_app.db", apply=False)
+    assert excinfo.value.code == 2
+
+
+def test_agentdb_migration_apply_failure_surfaces_failing_sql_to_stderr(
+    tmp_path, monkeypatch, capsys
+):
+    db_path = tmp_path / "migration_fail.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE receiptdocument (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewsession (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewrow (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE statementtransaction (id INTEGER PRIMARY KEY)")
+
+    bogus_sql = (
+        "CREATE INDEX ix_agent_receipt_bogus_repro_marker "
+        "ON nonexistent_table(nope)"
+    )
+    monkeypatch.setattr(
+        agentdb_migration,
+        "INDEX_SQL",
+        [bogus_sql, *agentdb_migration.INDEX_SQL],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        migrate(str(db_path), apply=True)
+    assert excinfo.value.code == 3
+
+    captured = capsys.readouterr()
+    assert "ERROR: migration failed and was rolled back." in captured.err
+    assert "CREATE INDEX" in captured.err
+    assert "nonexistent_table" in captured.err
+    assert "OperationalError" in captured.err
+
+    with sqlite3.connect(db_path) as conn:
+        agent_rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'agent_%'"
+        ).fetchall()
+    assert agent_rows == []
+    with sqlite3.connect(db_path) as conn:
+        index_rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'ix_agent_%'"
+        ).fetchall()
+    assert index_rows == []
+
+    log_files = sorted(tmp_path.glob("migration_fail.db.pre-f-ai-0b1-*.migration.log"))
+    assert log_files, "expected migration log file to be written"
+    content = log_files[-1].read_text(encoding="utf-8")
+    assert "CREATE INDEX" in content
+    assert "nonexistent_table" in content
+    assert "OperationalError" in content
+
+
+def test_agentdb_migration_apply_failure_preserves_existing_canonical_rows(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "migration_fail_preserve.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE receiptdocument (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewsession (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE reviewrow (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE statementtransaction (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO receiptdocument (id) VALUES (1), (2), (3)")
+
+    bogus_sql = "CREATE TABLE agent_receipt_review_run (id INTEGER REFERENCES nope(missing) WITHOUT ROWID)"
+    monkeypatch.setattr(
+        agentdb_migration,
+        "CREATE_TABLE_SQL",
+        [bogus_sql, *agentdb_migration.CREATE_TABLE_SQL],
+    )
+
+    with pytest.raises(SystemExit):
+        migrate(str(db_path), apply=True)
+
+    with sqlite3.connect(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM receiptdocument").fetchone()[0]
     assert count == 3
 
 

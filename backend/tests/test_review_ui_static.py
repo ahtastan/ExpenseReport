@@ -42,6 +42,43 @@ def main() -> None:
     assert "/matching/run" in html
     assert "runMatching" in html
 
+    # F-AI-0b-2 / F-AI-0b-3: AI second-read advisory display markers.
+    # Components and helpers must be present in the bundle.
+    assert "AiReviewBadge" in html
+    assert "AiReviewDifferencesPanel" in html
+    assert "AI_DIFFERENCE_LABEL" in html
+    assert "AI_BADGE_PRESENTATION" in html
+    # Status copy must be advisory; no "Report blocked by AI"-style wording.
+    assert "AI second read: pass" in html
+    assert "AI second read: warning" in html
+    assert "AI second read: block (advisory)" in html
+    assert "AI second read: stale" in html
+    assert "AI second read unavailable" in html
+    assert "Report blocked by AI" not in html
+    assert "AI rejected" not in html
+    # Filter chips wired through the same advisory state machine.
+    assert "ai_warn" in html
+    assert "ai_block" in html
+    assert "ai_stale" in html
+    assert "AI ◎ warn" in html
+    assert "AI ◉ block" in html
+    assert "AI ⌛ stale" in html
+    # Tooltip must explicitly call out advisory-only nature.
+    assert "AI second read is advisory only" in html
+    # Local row mapping copies source.ai_review into row.aiReview.
+    assert "src.ai_review" in html
+    assert "aiReview" in html
+    # Difference codes mapped to plain English, several of the common ones.
+    for code in (
+        "amount_mismatch",
+        "currency_mismatch",
+        "date_mismatch",
+        "supplier_mismatch",
+        "missing_business_reason",
+        "missing_attendees",
+    ):
+        assert code in html, f"expected difference code {code!r} in HTML"
+
     print("review_ui_static_tests=passed")
 
 

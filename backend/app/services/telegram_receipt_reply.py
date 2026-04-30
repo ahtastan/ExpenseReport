@@ -124,7 +124,7 @@ def should_include_receipt_business_context(
 
 def build_telegram_receipt_reply(
     receipt: ReceiptDocument,
-    ai_review: Mapping[str, Any] | None = None,
+    ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
 ) -> str | None:
     if receipt is None:
         return None
@@ -139,6 +139,9 @@ def build_telegram_receipt_reply(
     if ai_review is not None:
         lines.append("")
         lines.append("AI second read is advisory only.")
+        context_note = _ai_context_note(ai_review)
+        if context_note:
+            lines.append(context_note)
 
     return "\n".join(lines)
 
@@ -161,9 +164,8 @@ def maybe_send_telegram_receipt_reply(
         if ai_review is _NOT_PROVIDED
         else ai_review
     )
-    public_ai_review = _public_ai_review(ai_review_result)
 
-    text = build_telegram_receipt_reply(receipt, ai_review=public_ai_review)
+    text = build_telegram_receipt_reply(receipt, ai_review=ai_review_result)
     if not text:
         return False
 
@@ -255,6 +257,32 @@ def _public_ai_review(
     return None
 
 
+def _ai_context_note(ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None) -> str | None:
+    if ai_review is None:
+        return None
+    payload = _ai_payload(ai_review)
+    if payload is None:
+        return None
+    context_text = _ai_context_text(payload)
+    category = _clean(payload.get("business_context_category") or payload.get("receipt_category")).lower()
+
+    if category in {"fuel", "gas", "gasoline", "petrol"} or _text_suggests_hard_non_context(context_text):
+        return "AI context: This looks like a gas receipt."
+    if category in {"market", "grocery", "supermarket"} or _text_suggests_market_snacks(context_text):
+        return "AI context: This looks like market/snacks."
+    if category in _BUSINESS_CONTEXT_CATEGORIES or _text_suggests_business_context(context_text):
+        return "AI context: This looks like a food or meal receipt."
+    return None
+
+
+def _ai_payload(ai_review: TelegramReceiptAIReview | Mapping[str, Any]) -> Mapping[str, Any] | None:
+    if isinstance(ai_review, TelegramReceiptAIReview):
+        return ai_review.agent_payload
+    if "agent_read" in ai_review and isinstance(ai_review["agent_read"], Mapping):
+        return ai_review["agent_read"]
+    return ai_review
+
+
 def _receipt_field_lines(receipt: ReceiptDocument) -> list[str]:
     lines: list[str] = []
     if receipt.extracted_supplier:
@@ -285,11 +313,7 @@ def _business_context_decision_from_ai_review(
 ) -> bool | None:
     if ai_review is None:
         return None
-    payload: Mapping[str, Any] | None
-    if isinstance(ai_review, TelegramReceiptAIReview):
-        payload = ai_review.agent_payload
-    else:
-        payload = ai_review
+    payload = _ai_payload(ai_review)
     if not isinstance(payload, Mapping):
         return None
 
@@ -384,6 +408,25 @@ def _text_suggests_non_context(text: str) -> bool:
             "parking",
             "toll",
             "otoyol",
+        ),
+    )
+
+
+def _text_suggests_market_snacks(text: str) -> bool:
+    return _text_contains_any(
+        text,
+        (
+            "market",
+            "grocery",
+            "supermarket",
+            "snack",
+            "snacks",
+            "energy drink",
+            "beer",
+            "cigarette",
+            "cigarettes",
+            "marlboro",
+            "tuborg",
         ),
     )
 

@@ -628,6 +628,129 @@ def test_live_model_provider_is_mocked_and_writes_only_agentdb(monkeypatch):
         assert len(session.exec(select(AgentReceiptComparison)).all()) == 1
 
 
+def test_live_ai_second_read_controls_meal_context_when_ocr_supplier_is_ambiguous(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake = _install_fake_client(monkeypatch)
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="SERBAY",
+        report_bucket=None,
+    )
+
+    calls: list[int] = []
+
+    def fake_live(**kwargs):
+        calls.append(kwargs["receipt"].id)
+        return telegram_receipt_reply.agent_receipt_live_provider.LiveAgentReceiptReviewResult(
+            agent_payload={
+                "merchant_name": "BOSNAK DONER SERBAY",
+                "merchant_address": None,
+                "receipt_date": "2025-11-29",
+                "receipt_time": None,
+                "total_amount": "240.00",
+                "currency": "TRY",
+                "amount_text": "240.00 TRY",
+                "line_items": [],
+                "tax_amount": None,
+                "payment_method": None,
+                "receipt_category": "meal",
+                "confidence": 0.91,
+                "raw_text_summary": "Visible receipt is from a doner lunch place.",
+                "business_context_needed": True,
+                "business_context_reason": "meal receipt",
+            },
+            raw_response_json=json.dumps({"supplier": "BOSNAK DONER SERBAY"}),
+            prompt_text="hidden prompt",
+            model_name="gpt-live-test",
+        )
+
+    monkeypatch.setattr(
+        telegram_receipt_reply.agent_receipt_live_provider,
+        "call_live_agent_receipt_review",
+        fake_live,
+    )
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "receipt_captured"
+    assert result["ai_receipt_reply_sent"] is True
+    assert calls
+    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert "AI second read is advisory only." in fake.messages[-2]
+    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+
+
+def test_duplicate_live_ai_second_read_controls_meal_context_when_ocr_supplier_is_ambiguous(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake = _install_fake_client(monkeypatch)
+    file_unique_id = str(uuid4())
+    payload = _photo_payload(telegram_user_id=41001)
+    payload["message"]["photo"][0]["file_unique_id"] = file_unique_id
+
+    calls: list[int] = []
+
+    def fake_live(**kwargs):
+        calls.append(kwargs["receipt"].id)
+        return telegram_receipt_reply.agent_receipt_live_provider.LiveAgentReceiptReviewResult(
+            agent_payload={
+                "merchant_name": "BOSNAK DONER SERBAY",
+                "merchant_address": None,
+                "receipt_date": "2025-11-29",
+                "receipt_time": None,
+                "total_amount": "240.00",
+                "currency": "TRY",
+                "amount_text": "240.00 TRY",
+                "line_items": [],
+                "tax_amount": None,
+                "payment_method": None,
+                "receipt_category": "meal",
+                "confidence": 0.91,
+                "raw_text_summary": "Visible receipt is from a doner lunch place.",
+                "business_context_needed": True,
+                "business_context_reason": "meal receipt",
+            },
+            raw_response_json=json.dumps({"supplier": "BOSNAK DONER SERBAY"}),
+            prompt_text="hidden prompt",
+            model_name="gpt-live-test",
+        )
+
+    monkeypatch.setattr(
+        telegram_receipt_reply.agent_receipt_live_provider,
+        "call_live_agent_receipt_review",
+        fake_live,
+    )
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "SERBAY"
+        receipt.uploader_user_id = user.id
+        receipt.telegram_file_unique_id = file_unique_id
+        receipt.status = "extracted"
+        session.add(receipt)
+        session.commit()
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "receipt_duplicate"
+    assert result["questions_created"] == 2
+    assert calls
+    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+
+
 def test_live_model_failure_falls_back_to_deterministic_reply(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")

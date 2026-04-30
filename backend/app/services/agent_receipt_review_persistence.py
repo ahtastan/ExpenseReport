@@ -357,6 +357,13 @@ def write_mock_agent_receipt_review(
     store_raw_model_json: bool = False,
     store_prompt_text: bool = False,
     app_git_sha: str | None = None,
+    prompt_text_override: str | None = None,
+    model_provider: str | None = None,
+    model_name: str = "local_mock",
+    review_session_id: int | None = None,
+    review_row_id: int | None = None,
+    statement_transaction_id: int | None = None,
+    statement_snapshot: Mapping[str, Any] | None = None,
 ) -> AgentReceiptReviewWriteResult:
     """Persist one local/mock shadow review without mutating canonical rows.
 
@@ -368,22 +375,35 @@ def write_mock_agent_receipt_review(
 
     snapshot = build_canonical_receipt_snapshot(receipt)
     snapshot_json = _stable_json(snapshot)
-    prompt_text = build_agent_receipt_review_prompt(snapshot)
+    prompt_text = prompt_text_override or build_agent_receipt_review_prompt(snapshot)
+    statement_snapshot_json = _stable_json(statement_snapshot) if statement_snapshot is not None else None
     now = utc_now()
     run = AgentReceiptReviewRun(
         receipt_document_id=receipt.id or 0,
+        review_session_id=review_session_id,
+        review_row_id=review_row_id,
+        statement_transaction_id=statement_transaction_id,
         run_source=run_source,
         run_kind="receipt_second_read",
         status="started",
         schema_version=SCHEMA_VERSION,
         prompt_version=PROMPT_VERSION,
         prompt_hash=_sha256_text(prompt_text),
-        model_provider=None,
-        model_name="local_mock",
+        model_provider=model_provider,
+        model_name=model_name,
         comparator_version=COMPARATOR_VERSION,
         app_git_sha=app_git_sha,
         canonical_snapshot_json=snapshot_json,
-        input_hash=_sha256_text(_stable_json({"canonical": snapshot, "agent_json": agent_json_text})),
+        statement_snapshot_json=statement_snapshot_json,
+        input_hash=_sha256_text(
+            _stable_json(
+                {
+                    "canonical": snapshot,
+                    "statement": statement_snapshot,
+                    "agent_json": agent_json_text,
+                }
+            )
+        ),
         raw_model_json_redacted=not store_raw_model_json,
         raw_model_json=agent_json_text if store_raw_model_json else None,
         prompt_text=prompt_text if store_prompt_text else None,

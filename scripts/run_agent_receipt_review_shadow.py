@@ -1,9 +1,10 @@
-"""Operator-only mock shadow AI receipt review runner.
+"""Operator-only shadow AI receipt review runner.
 
-This is the F-AI-0d shadow-runner path for creating AgentDB AI second-read
-rows from an existing ``ReceiptDocument``. The only supported provider is
-``mock``. No live model modules are imported, no AI flags are required, and no
-canonical expense data is mutated.
+This is the operator path for creating AgentDB AI second-read rows from an
+existing ``ReceiptDocument`` or visible ``ReviewRow``. The ``mock`` provider is
+deterministic. The ``live`` provider performs one explicit OpenAI call only
+when the operator passes both ``--yes`` and ``--i-understand-live-model-call``.
+No AI flags are required, and no canonical expense data is mutated.
 
 Dry-run:
 
@@ -33,6 +34,33 @@ Mock controls:
       --mock-date 2025-12-27 ^
       --mock-supplier "TRANSIT CUP" ^
       --yes
+
+Live dry-run, no model call:
+
+    python scripts/run_agent_receipt_review_shadow.py ^
+      --db-path C:\\tmp\\expense_app.db ^
+      --review-row-id 139 ^
+      --provider live ^
+      --dry-run
+
+Live call and AgentDB write:
+
+    python scripts/run_agent_receipt_review_shadow.py ^
+      --db-path C:\\tmp\\expense_app.db ^
+      --review-row-id 139 ^
+      --provider live ^
+      --i-understand-live-model-call ^
+      --yes
+
+Protected production DB path requires both operator acknowledgements:
+
+    python scripts/run_agent_receipt_review_shadow.py ^
+      --db-path /var/lib/dcexpense/expense_app.db ^
+      --review-row-id 139 ^
+      --provider live ^
+      --i-understand-this-is-prod ^
+      --i-understand-live-model-call ^
+      --yes
 """
 
 from __future__ import annotations
@@ -57,7 +85,10 @@ from app.models import (  # noqa: E402
     AgentReceiptComparison,
     AgentReceiptRead as AgentReceiptReadRow,
     ReceiptDocument,
+    ReviewRow,
+    StatementTransaction,
 )
+from app.services import agent_receipt_live_provider  # noqa: E402
 from app.services.agent_receipt_review_persistence import (  # noqa: E402
     build_canonical_receipt_snapshot,
     write_mock_agent_receipt_review,
@@ -180,10 +211,63 @@ def _ids_for_run(session: Session, run_id: int | None) -> tuple[int | None, int 
     return read_row.id if read_row else None, comparison.id if comparison else None
 
 
+def _target_for_args(
+    session: Session,
+    *,
+    receipt_id: int | None,
+    review_row_id: int | None,
+) -> tuple[ReceiptDocument, dict[str, Any]]:
+    context: dict[str, Any] = {
+        "review_row_id": None,
+        "review_session_id": None,
+        "statement_transaction_id": None,
+        "statement_context": None,
+    }
+    if review_row_id is not None:
+        row = session.get(ReviewRow, review_row_id)
+        if row is None:
+            raise ValueError(f"review_row_id {review_row_id} was not found")
+        if row.receipt_document_id is None:
+            raise ValueError(f"review_row_id {review_row_id} has no matched receipt")
+        receipt = session.get(ReceiptDocument, row.receipt_document_id)
+        if receipt is None:
+            raise ValueError(f"receipt_id {row.receipt_document_id} was not found")
+        statement = session.get(StatementTransaction, row.statement_transaction_id)
+        statement_context = _statement_context(statement)
+        context.update(
+            {
+                "review_row_id": row.id,
+                "review_session_id": row.review_session_id,
+                "statement_transaction_id": row.statement_transaction_id,
+                "statement_context": statement_context,
+            }
+        )
+        return receipt, context
+
+    if receipt_id is None:
+        raise ValueError("either --receipt-id or --review-row-id is required")
+    receipt = session.get(ReceiptDocument, receipt_id)
+    if receipt is None:
+        raise ValueError(f"receipt_id {receipt_id} was not found")
+    return receipt, context
+
+
+def _statement_context(statement: StatementTransaction | None) -> dict[str, Any] | None:
+    if statement is None:
+        return None
+    return {
+        "date": statement.transaction_date.isoformat() if statement.transaction_date else None,
+        "amount": format(statement.local_amount, "f") if statement.local_amount is not None else None,
+        "currency": statement.local_currency,
+        "supplier": statement.supplier_raw,
+    }
+
+
 def run_shadow_review(
     *,
     db_path: str,
-    receipt_id: int,
+    receipt_id: int | None,
+    review_row_id: int | None,
     provider: str,
     mock_state: str,
     mock_amount: Decimal | None,
@@ -192,49 +276,130 @@ def run_shadow_review(
     mock_supplier: str | None,
     dry_run: bool,
     yes: bool,
+    understand_live_model_call: bool,
 ) -> dict[str, Any]:
-    if provider != "mock":
-        raise ValueError("only provider=mock is supported")
+    provider_mode = "live" if provider in {"live", "openai"} else provider
+    if provider_mode not in {"mock", "live"}:
+        raise ValueError("provider must be mock, live, or openai")
+    if provider_mode == "live" and yes and not dry_run and not understand_live_model_call:
+        raise ValueError("live provider writes require --i-understand-live-model-call")
 
     engine = create_engine(_sqlite_url(db_path), connect_args={"check_same_thread": False})
     with Session(engine) as session:
-        receipt = session.get(ReceiptDocument, receipt_id)
-        if receipt is None:
-            raise ValueError(f"receipt_id {receipt_id} was not found")
+        receipt, target_context = _target_for_args(
+            session,
+            receipt_id=receipt_id,
+            review_row_id=review_row_id,
+        )
+        resolved_receipt_id = receipt.id or 0
 
         canonical = build_canonical_receipt_snapshot(receipt)
-        mock_payload = build_mock_agent_payload(
-            canonical,
-            mock_state=mock_state,
-            mock_amount=mock_amount,
-            mock_currency=mock_currency,
-            mock_date=mock_date,
-            mock_supplier=mock_supplier,
-        )
-        result = compare_agent_receipt_read(canonical, AgentReceiptRead.from_dict(mock_payload))
         would_write = dry_run or not yes
         summary: dict[str, Any] = {
-            "receipt_id": receipt_id,
-            "provider": provider,
+            "receipt_id": resolved_receipt_id,
+            "review_row_id": target_context["review_row_id"],
+            "provider": provider_mode,
             "dry_run": dry_run,
             "would_write": would_write,
-            "risk_level": result.comparison.risk_level,
-            "differences": result.comparison.differences,
+            "model_call_made": False,
+            "canonical_mutation": False,
         }
         if would_write:
+            if provider_mode == "mock":
+                mock_payload = build_mock_agent_payload(
+                    canonical,
+                    mock_state=mock_state,
+                    mock_amount=mock_amount,
+                    mock_currency=mock_currency,
+                    mock_date=mock_date,
+                    mock_supplier=mock_supplier,
+                )
+                result = compare_agent_receipt_read(canonical, AgentReceiptRead.from_dict(mock_payload))
+                summary.update(
+                    {
+                        "risk_level": result.comparison.risk_level,
+                        "differences": result.comparison.differences,
+                    }
+                )
             return summary
+
+        if provider_mode == "mock":
+            mock_payload = build_mock_agent_payload(
+                canonical,
+                mock_state=mock_state,
+                mock_amount=mock_amount,
+                mock_currency=mock_currency,
+                mock_date=mock_date,
+                mock_supplier=mock_supplier,
+            )
+            agent_payload = mock_payload
+            agent_json_text = json.dumps(agent_payload, sort_keys=True)
+            prompt_text = None
+            model_provider = None
+            model_name = provider
+            raw_model_json = agent_json_text
+        else:
+            try:
+                agent_receipt_live_provider.ensure_live_provider_configured()
+                live_result = agent_receipt_live_provider.call_live_agent_receipt_review(
+                    receipt=receipt,
+                    canonical=canonical,
+                    statement_context=target_context["statement_context"],
+                )
+                summary["model_call_made"] = True
+                agent_payload = live_result.agent_payload
+                agent_json_text = json.dumps(agent_payload, sort_keys=True)
+                prompt_text = live_result.prompt_text
+                model_provider = "openai"
+                model_name = live_result.model_name
+                raw_model_json = live_result.raw_response_json
+            except agent_receipt_live_provider.LiveAgentReceiptMalformedResponse as exc:
+                summary["model_call_made"] = True
+                outcome = write_mock_agent_receipt_review(
+                    session,
+                    receipt=receipt,
+                    agent_json_text=exc.raw_response_json,
+                    run_source="operator_live_shadow_cli",
+                    store_raw_model_json=False,
+                    store_prompt_text=False,
+                    prompt_text_override=exc.prompt_text,
+                    model_provider="openai",
+                    model_name=exc.model_name,
+                    review_session_id=target_context["review_session_id"],
+                    review_row_id=target_context["review_row_id"],
+                    statement_transaction_id=target_context["statement_transaction_id"],
+                    statement_snapshot=target_context["statement_context"],
+                )
+                session.commit()
+                summary.update(
+                    {
+                        "run_id": outcome.run.id,
+                        "read_id": None,
+                        "comparison_id": None,
+                        "risk_level": "malformed",
+                        "differences": [],
+                        "error": outcome.error,
+                    }
+                )
+                return summary
 
         outcome = write_mock_agent_receipt_review(
             session,
             receipt=receipt,
-            agent_json_text=json.dumps(mock_payload, sort_keys=True),
-            run_source="operator_shadow_cli",
+            agent_json_text=agent_json_text,
+            run_source="operator_live_shadow_cli" if provider_mode == "live" else "operator_shadow_cli",
             store_raw_model_json=False,
             store_prompt_text=False,
+            prompt_text_override=prompt_text,
+            model_provider=model_provider,
+            model_name=model_name,
+            review_session_id=target_context["review_session_id"],
+            review_row_id=target_context["review_row_id"],
+            statement_transaction_id=target_context["statement_transaction_id"],
+            statement_snapshot=target_context["statement_context"],
         )
         if outcome.result is None:
             raise ValueError(outcome.error or "mock shadow review failed")
-        outcome.run.model_name = provider
         session.flush()
         read_id, comparison_id = _ids_for_run(session, outcome.run.id)
         session.commit()
@@ -247,16 +412,22 @@ def run_shadow_review(
                 "differences": outcome.result.comparison.differences,
             }
         )
+        if provider_mode == "live":
+            summary["raw_model_json_stored"] = False
+            summary["prompt_text_stored"] = False
+            summary["raw_model_json_seen"] = bool(raw_model_json)
         return summary
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run an operator-only mock shadow AI receipt review into AgentDB.",
+        description="Run an operator-only shadow AI receipt review into AgentDB.",
     )
     parser.add_argument("--db-path", required=True, help="SQLite DB path.")
-    parser.add_argument("--receipt-id", required=True, type=int, help="Existing ReceiptDocument id.")
-    parser.add_argument("--provider", required=True, choices=["mock"])
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--receipt-id", type=int, help="Existing ReceiptDocument id.")
+    target.add_argument("--review-row-id", type=int, help="Existing matched ReviewRow id.")
+    parser.add_argument("--provider", required=True, choices=["mock", "live", "openai"])
     parser.add_argument("--mock-state", choices=["pass", "warn", "block"], default="pass")
     parser.add_argument("--mock-amount", type=_parse_decimal)
     parser.add_argument("--mock-currency")
@@ -268,6 +439,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--i-understand-this-is-prod",
         action="store_true",
         help="Allow protected production DB paths. Actual protected writes still require --yes.",
+    )
+    parser.add_argument(
+        "--i-understand-live-model-call",
+        action="store_true",
+        help="Required with --provider live/openai and --yes before a live model call is made.",
     )
     return parser
 
@@ -288,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = run_shadow_review(
             db_path=args.db_path,
             receipt_id=args.receipt_id,
+            review_row_id=args.review_row_id,
             provider=args.provider,
             mock_state=args.mock_state,
             mock_amount=args.mock_amount,
@@ -296,6 +473,7 @@ def main(argv: list[str] | None = None) -> int:
             mock_supplier=args.mock_supplier,
             dry_run=args.dry_run,
             yes=args.yes,
+            understand_live_model_call=args.i_understand_live_model_call,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

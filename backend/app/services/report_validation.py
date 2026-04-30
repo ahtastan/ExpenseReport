@@ -16,6 +16,7 @@ from app.models import (
     ReviewSession,
     StatementTransaction,
 )
+from app.services.receipt_statement_safety import receipt_statement_issues
 
 
 AIRFARE_BUCKET = "Airfare/Bus/Ferry/Other"
@@ -325,6 +326,19 @@ def validate_report_readiness(
         receipt = session.get(ReceiptDocument, decision.receipt_document_id)
         if receipt:
             receipts.append(receipt)
+            transaction = transaction_by_id.get(decision.statement_transaction_id)
+            if transaction is not None:
+                for safety_issue in receipt_statement_issues(receipt, transaction):
+                    issues.append(
+                        ValidationIssue(
+                            severity="warning",
+                            code=safety_issue.code,
+                            message=safety_issue.message,
+                            receipt_id=decision.receipt_document_id,
+                            statement_transaction_id=decision.statement_transaction_id,
+                            match_decision_id=decision.id,
+                        )
+                    )
         if decision.confidence in {"medium", "low"}:
             issues.append(
                 ValidationIssue(

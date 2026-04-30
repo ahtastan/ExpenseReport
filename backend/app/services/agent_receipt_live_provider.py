@@ -137,6 +137,8 @@ Return exactly this JSON shape, with no markdown or prose outside JSON:
   "supplier": "string or null",
   "business_reason": "string or null",
   "attendees": "string or null",
+  "business_context_needed": true or false,
+  "business_context_reason": "short reason, e.g. meal/restaurant/fuel/unknown",
   "notes": "short explanation"
 }}
 """
@@ -167,6 +169,8 @@ def agent_payload_from_live_response(raw_response: str) -> dict[str, Any]:
         "receipt_category": None,
         "confidence": None,
         "raw_text_summary": _optional_string(notes_value),
+        "business_context_needed": _optional_bool(parsed.get("business_context_needed")),
+        "business_context_reason": _optional_string(parsed.get("business_context_reason")),
     }
 
 
@@ -255,3 +259,16 @@ def _optional_string(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None

@@ -23,6 +23,7 @@ from app.services.review_sessions import get_or_create_review_session
 from app.services.storage import save_bytes
 from app.services.statement_import import import_diners_excel
 from app.services.telegram_receipt_reply import (
+    maybe_create_telegram_receipt_ai_review,
     maybe_send_telegram_receipt_reply,
     should_include_receipt_business_context,
     should_send_ai_receipt_reply,
@@ -348,8 +349,14 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 f"for file_unique_id={file_unique_id}"
             )
             duplicate_questions: list[ClarificationQuestion] = []
+            ai_review = None
             if ai_receipt_reply_allowed:
-                include_business_context = should_include_receipt_business_context(existing)
+                ai_review = maybe_create_telegram_receipt_ai_review(
+                    session,
+                    settings=settings,
+                    receipt=existing,
+                )
+                include_business_context = should_include_receipt_business_context(existing, ai_review=ai_review)
                 duplicate_questions = ensure_receipt_review_questions(
                     session,
                     existing,
@@ -427,7 +434,16 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         _send_receipt_progress_ack(client, chat_id, receipt.id)
 
     extraction = apply_receipt_extraction(session, receipt)
-    include_business_context = should_include_receipt_business_context(receipt) if ai_receipt_reply_allowed else True
+    ai_review = (
+        maybe_create_telegram_receipt_ai_review(session, settings=settings, receipt=receipt)
+        if ai_receipt_reply_allowed
+        else None
+    )
+    include_business_context = (
+        should_include_receipt_business_context(receipt, ai_review=ai_review)
+        if ai_receipt_reply_allowed
+        else True
+    )
     questions = ensure_receipt_review_questions(
         session,
         receipt,
@@ -441,6 +457,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         receipt=receipt,
         telegram_user_id=user.telegram_user_id,
         chat_id=chat_id,
+        ai_review=ai_review,
     )
     if ai_receipt_reply_sent:
         if questions:

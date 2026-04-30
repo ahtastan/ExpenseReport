@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 
@@ -36,6 +37,14 @@ _MEAL_BUCKETS = {
     "Meals & Entertainment",
 }
 
+_NOT_PROVIDED = object()
+
+
+@dataclass(frozen=True)
+class TelegramReceiptAIReview:
+    public_ai_review: dict[str, Any] | None
+    agent_payload: Mapping[str, Any] | None = None
+
 
 def parse_telegram_allowlist(raw: str | None) -> set[int]:
     if not raw:
@@ -58,9 +67,15 @@ def should_send_ai_receipt_reply(settings: Any, telegram_user_id: int | None) ->
     return telegram_user_id in allowlist
 
 
-def should_include_receipt_business_context(receipt: ReceiptDocument) -> bool:
+def should_include_receipt_business_context(
+    receipt: ReceiptDocument,
+    ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
+) -> bool:
     if _clean(receipt.business_or_personal).lower() != "business":
         return False
+    ai_decision = _business_context_decision_from_ai_review(ai_review)
+    if ai_decision is not None:
+        return ai_decision
     return _is_meal_receipt(receipt)
 
 
@@ -93,15 +108,19 @@ def maybe_send_telegram_receipt_reply(
     receipt: ReceiptDocument,
     telegram_user_id: int | None,
     chat_id: int,
+    ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None | object = _NOT_PROVIDED,
 ) -> bool:
     if not should_send_ai_receipt_reply(settings, telegram_user_id):
         return False
 
-    ai_review: dict[str, Any] | None = None
-    if getattr(settings, "ai_telegram_live_model_enabled", False):
-        ai_review = _try_live_ai_second_read(session, receipt)
+    ai_review_result = (
+        maybe_create_telegram_receipt_ai_review(session, settings=settings, receipt=receipt)
+        if ai_review is _NOT_PROVIDED
+        else ai_review
+    )
+    public_ai_review = _public_ai_review(ai_review_result)
 
-    text = build_telegram_receipt_reply(receipt, ai_review=ai_review)
+    text = build_telegram_receipt_reply(receipt, ai_review=public_ai_review)
     if not text:
         return False
 
@@ -118,7 +137,24 @@ def maybe_send_telegram_receipt_reply(
     return True
 
 
-def _try_live_ai_second_read(session: Session, receipt: ReceiptDocument) -> dict[str, Any] | None:
+def maybe_create_telegram_receipt_ai_review(
+    session: Session,
+    *,
+    settings: Any,
+    receipt: ReceiptDocument,
+) -> TelegramReceiptAIReview | None:
+    if not getattr(settings, "ai_telegram_live_model_enabled", False):
+        return None
+    existing = latest_ai_review_for_receipt(session, receipt)
+    if existing and existing.get("status") in {"pass", "warn", "block"}:
+        return TelegramReceiptAIReview(
+            public_ai_review=existing,
+            agent_payload=existing.get("agent_read") if isinstance(existing.get("agent_read"), Mapping) else None,
+        )
+    return _try_live_ai_second_read(session, receipt)
+
+
+def _try_live_ai_second_read(session: Session, receipt: ReceiptDocument) -> TelegramReceiptAIReview | None:
     try:
         agent_receipt_live_provider.ensure_live_provider_configured()
         canonical = build_canonical_receipt_snapshot(receipt)
@@ -146,7 +182,10 @@ def _try_live_ai_second_read(session: Session, receipt: ReceiptDocument) -> dict
                 outcome.error,
             )
             return None
-        return latest_ai_review_for_receipt(session, receipt)
+        return TelegramReceiptAIReview(
+            public_ai_review=latest_ai_review_for_receipt(session, receipt),
+            agent_payload=live_result.agent_payload,
+        )
     except agent_receipt_live_provider.LiveAgentReceiptProviderError as exc:
         logger.warning(
             "Telegram AI receipt reply live provider unavailable for receipt_id=%s: %s",
@@ -161,6 +200,16 @@ def _try_live_ai_second_read(session: Session, receipt: ReceiptDocument) -> dict
             exc,
         )
         return None
+
+
+def _public_ai_review(
+    ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None | object,
+) -> dict[str, Any] | None:
+    if isinstance(ai_review, TelegramReceiptAIReview):
+        return ai_review.public_ai_review
+    if isinstance(ai_review, Mapping):
+        return dict(ai_review)
+    return None
 
 
 def _receipt_field_lines(receipt: ReceiptDocument) -> list[str]:
@@ -185,6 +234,46 @@ def _is_meal_receipt(receipt: ReceiptDocument) -> bool:
         return True
 
     supplier = _clean(receipt.extracted_supplier).lower()
+    return _text_suggests_meal(supplier)
+
+
+def _business_context_decision_from_ai_review(
+    ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None,
+) -> bool | None:
+    if ai_review is None:
+        return None
+    payload: Mapping[str, Any] | None
+    if isinstance(ai_review, TelegramReceiptAIReview):
+        payload = ai_review.agent_payload
+    else:
+        payload = ai_review
+    if not isinstance(payload, Mapping):
+        return None
+
+    explicit = _optional_bool(payload.get("business_context_needed"))
+    if explicit is not None:
+        return explicit
+
+    text_parts: list[str] = []
+    for key in (
+        "business_context_reason",
+        "merchant_name",
+        "supplier",
+        "receipt_category",
+        "raw_text_summary",
+        "summary",
+    ):
+        value = payload.get(key)
+        if value:
+            text_parts.append(str(value))
+    line_items = payload.get("line_items")
+    if isinstance(line_items, list):
+        for item in line_items:
+            text_parts.append(str(item))
+    return True if _text_suggests_meal(" ".join(text_parts).lower()) else None
+
+
+def _text_suggests_meal(text: str) -> bool:
     meal_tokens = (
         "doner",
         "döner",
@@ -200,8 +289,13 @@ def _is_meal_receipt(receipt: ReceiptDocument) -> bool:
         "börek",
         "bosnak",
         "boşnak",
+        "meal",
+        "lunch",
+        "dinner",
+        "breakfast",
+        "food",
     )
-    return any(token in supplier for token in meal_tokens)
+    return any(token in text for token in meal_tokens)
 
 
 def _format_amount(amount: Any, currency: str | None) -> str | None:
@@ -217,3 +311,16 @@ def _format_amount(amount: Any, currency: str | None) -> str | None:
 
 def _clean(value: Any) -> str:
     return str(value).strip() if value is not None else ""
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None

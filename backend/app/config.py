@@ -19,6 +19,9 @@ class Settings(BaseModel):
     ai_agent_db_write_enabled: bool = False
     ai_store_raw_model_json: bool = False
     ai_store_prompt_text: bool = False
+    ai_telegram_reply_enabled: bool = False
+    ai_telegram_reply_allowlist: set[int] = Field(default_factory=set)
+    ai_telegram_live_model_enabled: bool = False
 
 
 def _default_storage_root() -> Path:
@@ -34,7 +37,7 @@ def _parse_user_ids(raw: str | None) -> set[int]:
     if not raw:
         return set()
     ids: set[int] = set()
-    for item in raw.split(","):
+    for item in raw.replace(",", " ").split():
         item = item.strip()
         if not item:
             continue
@@ -67,4 +70,7 @@ def get_settings() -> Settings:
         ai_agent_db_write_enabled=_parse_bool(os.getenv("AI_AGENT_DB_WRITE_ENABLED")),
         ai_store_raw_model_json=_parse_bool(os.getenv("AI_STORE_RAW_MODEL_JSON")),
         ai_store_prompt_text=_parse_bool(os.getenv("AI_STORE_PROMPT_TEXT")),
+        ai_telegram_reply_enabled=_parse_bool(os.getenv("AI_TELEGRAM_REPLY_ENABLED")),
+        ai_telegram_reply_allowlist=_parse_user_ids(os.getenv("AI_TELEGRAM_REPLY_ALLOWLIST")),
+        ai_telegram_live_model_enabled=_parse_bool(os.getenv("AI_TELEGRAM_LIVE_MODEL_ENABLED")),
     )

@@ -456,7 +456,7 @@ def test_ai_receipt_reply_still_asks_critical_ocr_questions(monkeypatch):
     assert fake.messages[-1] == "I could not read the merchant name. Which store, restaurant, or vendor is this?"
 
 
-def test_ai_receipt_reply_duplicate_ignores_stale_business_context_questions(monkeypatch):
+def test_ai_receipt_reply_duplicate_ignores_stale_business_context_questions_for_non_meal(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
     fake = _install_fake_client(monkeypatch)
     file_unique_id = str(uuid4())
@@ -468,7 +468,8 @@ def test_ai_receipt_reply_duplicate_ignores_stale_business_context_questions(mon
         session.add(user)
         session.commit()
         session.refresh(user)
-        receipt = _receipt(business_reason=None, attendees=None)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket="Auto Gasoline")
+        receipt.extracted_supplier = "SHELL PETROL"
         receipt.uploader_user_id = user.id
         receipt.telegram_file_unique_id = file_unique_id
         receipt.status = "extracted"
@@ -498,6 +499,36 @@ def test_ai_receipt_reply_duplicate_ignores_stale_business_context_questions(mon
 
     assert result["action"] == "receipt_duplicate"
     assert fake.messages[-1] == "Receipt saved."
+
+
+def test_ai_receipt_reply_duplicate_seeds_meal_context_questions(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+    file_unique_id = str(uuid4())
+    payload = _photo_payload(telegram_user_id=41001)
+    payload["message"]["photo"][0]["file_unique_id"] = file_unique_id
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "BOSNAK ET SERBAY"
+        receipt.uploader_user_id = user.id
+        receipt.telegram_file_unique_id = file_unique_id
+        receipt.status = "extracted"
+        session.add(receipt)
+        session.commit()
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "receipt_duplicate"
+    assert result["questions_created"] == 2
+    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
 
 
 def test_ai_advisory_result_included_uses_advisory_only_copy():

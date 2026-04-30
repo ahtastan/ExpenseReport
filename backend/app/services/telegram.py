@@ -347,6 +347,17 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 f"Telegram retry dedupe: returning existing receipt {existing.id} "
                 f"for file_unique_id={file_unique_id}"
             )
+            duplicate_questions: list[ClarificationQuestion] = []
+            if ai_receipt_reply_allowed:
+                include_business_context = should_include_receipt_business_context(existing)
+                duplicate_questions = ensure_receipt_review_questions(
+                    session,
+                    existing,
+                    user.id,
+                    include_business_context=include_business_context,
+                )
+            else:
+                include_business_context = True
             open_questions = session.exec(
                 select(ClarificationQuestion)
                 .where(
@@ -354,7 +365,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                     ClarificationQuestion.status == "open",
                     *(
                         []
-                        if not ai_receipt_reply_allowed
+                        if include_business_context
                         else [~ClarificationQuestion.question_key.in_(BUSINESS_CONTEXT_QUESTION_KEYS)]
                     ),
                 )
@@ -377,7 +388,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 "action": "receipt_duplicate",
                 "receipt_id": existing.id,
                 "user_id": user.id,
-                "questions_created": 0,
+                "questions_created": len(duplicate_questions),
             }
 
     storage_path = None

@@ -25,17 +25,6 @@ from app.services.agent_receipt_review_persistence import (
 
 logger = logging.getLogger(__name__)
 
-_MEAL_BUCKETS = {
-    "Meals/Snacks",
-    "Breakfast",
-    "Lunch",
-    "Dinner",
-    "Entertainment",
-    "Customer Entertainment",
-    "Meals & Entertainment",
-}
-
-
 def parse_telegram_allowlist(raw: str | None) -> set[int]:
     if not raw:
         return set()
@@ -74,11 +63,6 @@ def build_telegram_receipt_reply(
     if ai_review is not None:
         lines.append("")
         lines.append("AI second read is advisory only.")
-
-    prompts = _clarification_prompt_lines(receipt)
-    if prompts:
-        lines.append("")
-        lines.extend(prompts)
 
     return "\n".join(lines)
 
@@ -173,15 +157,6 @@ def _receipt_field_lines(receipt: ReceiptDocument) -> list[str]:
     return lines
 
 
-def _clarification_prompt_lines(receipt: ReceiptDocument) -> list[str]:
-    prompts: list[str] = []
-    if _is_business(receipt.business_or_personal) and not _clean(receipt.business_reason):
-        prompts.append("Please reply with the business purpose for this receipt.")
-    if _is_meal_or_restaurant(receipt) and not _has_attendees(receipt.attendees):
-        prompts.append("Please reply with the attendees for this meal receipt.")
-    return prompts
-
-
 def _format_amount(amount: Any, currency: str | None) -> str | None:
     if amount is None:
         return None
@@ -191,27 +166,3 @@ def _format_amount(amount: Any, currency: str | None) -> str | None:
         amount_text = str(amount)
     currency_text = (currency or "").strip()
     return f"{amount_text} {currency_text}".strip()
-
-
-def _is_business(value: Any) -> bool:
-    return _clean(value).lower() == "business"
-
-
-def _is_meal_or_restaurant(receipt: ReceiptDocument) -> bool:
-    bucket = _clean(receipt.report_bucket)
-    if bucket in _MEAL_BUCKETS:
-        return True
-    supplier = _clean(receipt.extracted_supplier).lower()
-    return any(token in supplier for token in ("restaurant", "cafe", "cup", "lokanta", "restoran"))
-
-
-def _has_attendees(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, list):
-        return any(_clean(item) for item in value)
-    return bool(_clean(value))
-
-
-def _clean(value: Any) -> str:
-    return str(value).strip() if value is not None else ""

@@ -12,15 +12,17 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.models import AppUser, ClarificationQuestion, ReceiptDocument
 from app.services.clarifications import (
+    BUSINESS_CONTEXT_QUESTION_KEYS,
     answer_question,
     ensure_receipt_review_questions,
+    next_open_question_for_receipt,
     next_open_question_for_user,
 )
 from app.services.receipt_extraction import apply_receipt_extraction
 from app.services.review_sessions import get_or_create_review_session
 from app.services.storage import save_bytes
 from app.services.statement_import import import_diners_excel
-from app.services.telegram_receipt_reply import maybe_send_telegram_receipt_reply
+from app.services.telegram_receipt_reply import maybe_send_telegram_receipt_reply, should_send_ai_receipt_reply
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +188,14 @@ def _statement_period_text(statement) -> str:
     return ""
 
 
+def _latest_receipt_id_for_user(session: Session, user_id: int) -> int | None:
+    return session.exec(
+        select(ReceiptDocument.id)
+        .where(ReceiptDocument.uploader_user_id == user_id)
+        .order_by(ReceiptDocument.created_at.desc(), ReceiptDocument.id.desc())
+    ).first()
+
+
 def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     settings = get_settings()
     client = TelegramClient(settings.telegram_bot_token)
@@ -204,10 +214,20 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "action": "blocked", "message": "Telegram user is not allowlisted"}
 
     user = upsert_telegram_user(session, user_payload)
+    ai_receipt_reply_allowed = should_send_ai_receipt_reply(settings, user.telegram_user_id)
 
     text = (message.get("text") or "").strip()
     if text:
-        open_question = next_open_question_for_user(session, user.id)
+        if ai_receipt_reply_allowed:
+            latest_receipt_id = _latest_receipt_id_for_user(session, user.id)
+            open_question = next_open_question_for_receipt(
+                session,
+                user.id,
+                latest_receipt_id,
+                include_business_context=False,
+            )
+        else:
+            open_question = next_open_question_for_user(session, user.id)
         if open_question:
             created = answer_question(session, open_question, text)
             if created:
@@ -218,7 +238,15 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 # initial seeding). Ask the next still-open question so the
                 # user can keep progressing through the queue instead of
                 # getting stuck after a single "Got it".
-                follow_up = next_open_question_for_user(session, user.id)
+                if ai_receipt_reply_allowed:
+                    follow_up = next_open_question_for_receipt(
+                        session,
+                        user.id,
+                        open_question.receipt_document_id,
+                        include_business_context=False,
+                    )
+                else:
+                    follow_up = next_open_question_for_user(session, user.id)
                 if follow_up:
                     client.send_message(chat_id, follow_up.question_text)
                 else:
@@ -304,6 +332,11 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 .where(
                     ClarificationQuestion.receipt_document_id == existing.id,
                     ClarificationQuestion.status == "open",
+                    *(
+                        []
+                        if not ai_receipt_reply_allowed
+                        else [~ClarificationQuestion.question_key.in_(BUSINESS_CONTEXT_QUESTION_KEYS)]
+                    ),
                 )
                 .order_by(ClarificationQuestion.id)
             ).all()
@@ -363,7 +396,12 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         _send_receipt_progress_ack(client, chat_id, receipt.id)
 
     extraction = apply_receipt_extraction(session, receipt)
-    questions = ensure_receipt_review_questions(session, receipt, user.id)
+    questions = ensure_receipt_review_questions(
+        session,
+        receipt,
+        user.id,
+        include_business_context=not ai_receipt_reply_allowed,
+    )
     ai_receipt_reply_sent = maybe_send_telegram_receipt_reply(
         session,
         client,
@@ -373,7 +411,8 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         chat_id=chat_id,
     )
     if ai_receipt_reply_sent:
-        pass
+        if questions:
+            client.send_message(chat_id, questions[0].question_text)
     elif questions:
         if extraction.confidence and extraction.confidence >= 0.6:
             summary = (

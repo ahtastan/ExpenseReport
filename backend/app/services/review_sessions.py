@@ -470,13 +470,20 @@ def review_rows(session: Session, review_session_id: int) -> list[ReviewRow]:
 def session_payload(session: Session, review: ReviewSession) -> dict[str, Any]:
     rows = []
     for row in review_rows(session, review.id or 0):
+        source = _public_payload(_loads(row.source_json))
+        if row.receipt_document_id is not None and "ai_review" not in source:
+            receipt = session.get(ReceiptDocument, row.receipt_document_id)
+            if receipt is not None:
+                ai_review = latest_ai_review_for_receipt(session, receipt)
+                if ai_review is not None:
+                    source["ai_review"] = _public_payload(ai_review)
         rows.append(
             {
                 "id": row.id,
                 "status": row.status,
                 "attention_required": row.attention_required,
                 "attention_note": row.attention_note,
-                "source": _public_payload(_loads(row.source_json)),
+                "source": source,
                 "suggested": _public_payload(_loads(row.suggested_json)),
                 "confirmed": _public_payload(_loads(row.confirmed_json)),
             }

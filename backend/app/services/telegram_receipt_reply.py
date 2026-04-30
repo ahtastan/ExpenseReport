@@ -65,6 +65,21 @@ _NON_CONTEXT_CATEGORIES = {
     "travel",
     "unknown",
 }
+_STRONG_BUSINESS_CONTEXT_TOKENS = (
+    "bosnak",
+    "boşnak",
+    "doner",
+    "döner",
+    "kebap",
+    "kebab",
+    "borek",
+    "börek",
+    "restaurant",
+    "restoran",
+    "lokanta",
+    "cafe",
+    "kafe",
+)
 _NOT_PROVIDED = object()
 
 
@@ -281,6 +296,9 @@ def _business_context_decision_from_ai_review(
     explicit = _optional_bool(payload.get("business_context_needed"))
     context_text = _ai_context_text(payload)
     category = _clean(payload.get("business_context_category") or payload.get("receipt_category")).lower()
+    has_strong_context_evidence = _text_contains_any(context_text, _STRONG_BUSINESS_CONTEXT_TOKENS)
+    if has_strong_context_evidence and not _text_suggests_hard_non_context(context_text):
+        return True
     if category in _BUSINESS_CONTEXT_CATEGORIES:
         return True
     if category in _NON_CONTEXT_CATEGORIES:
@@ -366,6 +384,24 @@ def _text_suggests_non_context(text: str) -> bool:
             "parking",
             "toll",
             "otoyol",
+        ),
+    )
+
+
+def _text_suggests_hard_non_context(text: str) -> bool:
+    return _text_contains_any(
+        text,
+        (
+            "benzin",
+            "diesel",
+            "fuel",
+            "gasoline",
+            "petrol",
+            "petrol ofisi",
+            "parking",
+            "toll",
+            "otoyol",
+            "transport",
         ),
     )
 

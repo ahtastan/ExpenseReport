@@ -260,6 +260,27 @@ def test_ai_receipt_reply_upload_seeds_business_context_questions_for_meal(monke
     assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
 
 
+def test_ai_receipt_reply_treats_bosnak_et_serbay_as_meal(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="BOSNAK ET SERBAY",
+        report_bucket=None,
+    )
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["ai_receipt_reply_sent"] is True
+    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+
+
 def test_ai_receipt_reply_meal_context_flow_advances_on_latest_receipt(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
     fake = _install_fake_client(monkeypatch)

@@ -198,6 +198,8 @@ def _is_meal_receipt(receipt: ReceiptDocument) -> bool:
         "kebab",
         "borek",
         "börek",
+        "bosnak",
+        "boşnak",
     )
     return any(token in supplier for token in meal_tokens)
 

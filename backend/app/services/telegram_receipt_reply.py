@@ -37,6 +37,34 @@ _MEAL_BUCKETS = {
     "Meals & Entertainment",
 }
 
+_BUSINESS_CONTEXT_CATEGORIES = {
+    "breakfast",
+    "cafe",
+    "customer_entertainment",
+    "dinner",
+    "entertainment",
+    "lunch",
+    "meal",
+    "meals",
+    "restaurant",
+}
+_NON_CONTEXT_CATEGORIES = {
+    "auto",
+    "fuel",
+    "gas",
+    "gasoline",
+    "grocery",
+    "market",
+    "other",
+    "parking",
+    "petrol",
+    "retail",
+    "supermarket",
+    "toll",
+    "transport",
+    "travel",
+    "unknown",
+}
 _NOT_PROVIDED = object()
 
 
@@ -251,11 +279,32 @@ def _business_context_decision_from_ai_review(
         return None
 
     explicit = _optional_bool(payload.get("business_context_needed"))
-    if explicit is not None:
-        return explicit
+    context_text = _ai_context_text(payload)
+    category = _clean(payload.get("business_context_category") or payload.get("receipt_category")).lower()
+    if category in _BUSINESS_CONTEXT_CATEGORIES:
+        return True
+    if category in _NON_CONTEXT_CATEGORIES:
+        return False
 
+    has_context_evidence = _text_suggests_business_context(context_text)
+    has_non_context_evidence = _text_suggests_non_context(context_text)
+    if explicit is False:
+        return False
+    if explicit is True:
+        if has_non_context_evidence:
+            return False
+        return True if has_context_evidence else False
+    if has_non_context_evidence:
+        return False
+    if has_context_evidence:
+        return True
+    return False
+
+
+def _ai_context_text(payload: Mapping[str, Any]) -> str:
     text_parts: list[str] = []
     for key in (
+        "business_context_category",
         "business_context_reason",
         "merchant_name",
         "supplier",
@@ -270,32 +319,63 @@ def _business_context_decision_from_ai_review(
     if isinstance(line_items, list):
         for item in line_items:
             text_parts.append(str(item))
-    return True if _text_suggests_meal(" ".join(text_parts).lower()) else None
+    return " ".join(text_parts).lower()
+
+
+def _text_suggests_business_context(text: str) -> bool:
+    return _text_contains_any(
+        text,
+        (
+            "doner",
+            "döner",
+            "restaurant",
+            "restoran",
+            "lokanta",
+            "cafe",
+            "kafe",
+            "cup",
+            "kebap",
+            "kebab",
+            "borek",
+            "börek",
+            "bosnak",
+            "boşnak",
+            "meal",
+            "lunch",
+            "dinner",
+            "breakfast",
+            "customer entertainment",
+            "entertainment",
+        ),
+    )
+
+
+def _text_suggests_non_context(text: str) -> bool:
+    return _text_contains_any(
+        text,
+        (
+            "benzin",
+            "diesel",
+            "fuel",
+            "gasoline",
+            "petrol",
+            "petrol ofisi",
+            "market",
+            "grocery",
+            "supermarket",
+            "parking",
+            "toll",
+            "otoyol",
+        ),
+    )
 
 
 def _text_suggests_meal(text: str) -> bool:
-    meal_tokens = (
-        "doner",
-        "döner",
-        "restaurant",
-        "restoran",
-        "lokanta",
-        "cafe",
-        "kafe",
-        "cup",
-        "kebap",
-        "kebab",
-        "borek",
-        "börek",
-        "bosnak",
-        "boşnak",
-        "meal",
-        "lunch",
-        "dinner",
-        "breakfast",
-        "food",
-    )
-    return any(token in text for token in meal_tokens)
+    return _text_suggests_business_context(text)
+
+
+def _text_contains_any(text: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in text for token in tokens)
 
 
 def _format_amount(amount: Any, currency: str | None) -> str | None:

@@ -686,6 +686,62 @@ def test_live_ai_second_read_controls_meal_context_when_ocr_supplier_is_ambiguou
     assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
 
 
+def test_live_ai_second_read_does_not_ask_meal_context_for_fuel_even_if_business_context_true(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake = _install_fake_client(monkeypatch)
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="KAPTANLAR TURIZM PAZ.",
+        report_bucket=None,
+    )
+
+    def fake_live(**kwargs):
+        return telegram_receipt_reply.agent_receipt_live_provider.LiveAgentReceiptReviewResult(
+            agent_payload={
+                "merchant_name": "KAPTANLAR TURIZM PAZ. SAN. VE TIC.A.S.",
+                "merchant_address": None,
+                "receipt_date": "2026-04-27",
+                "receipt_time": None,
+                "total_amount": "1660.22",
+                "currency": "TRY",
+                "amount_text": "1660.22 TRY",
+                "line_items": [],
+                "tax_amount": None,
+                "payment_method": None,
+                "receipt_category": "fuel",
+                "confidence": 0.91,
+                "raw_text_summary": "Visible receipt is a Petrol Ofisi fuel receipt for benzin.",
+                "business_context_needed": True,
+                "business_context_category": "fuel",
+                "business_context_reason": "business fuel receipt, not meal or entertainment",
+            },
+            raw_response_json=json.dumps({"business_context_needed": True}),
+            prompt_text="hidden prompt",
+            model_name="gpt-live-test",
+        )
+
+    monkeypatch.setattr(
+        telegram_receipt_reply.agent_receipt_live_provider,
+        "call_live_agent_receipt_review",
+        fake_live,
+    )
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "receipt_captured"
+    assert result["ai_receipt_reply_sent"] is True
+    assert questions == []
+    assert "AI second read is advisory only." in fake.messages[-1]
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
+    assert "attended" not in fake.messages[-1].lower()
+
+
 def test_duplicate_live_ai_second_read_controls_meal_context_when_ocr_supplier_is_ambiguous(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")

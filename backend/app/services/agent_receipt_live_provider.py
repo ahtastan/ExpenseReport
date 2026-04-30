@@ -129,6 +129,14 @@ Canonical OCR context:
 Statement row context:
 {statement_json}
 
+Set business_context_needed to true only when the receipt is visibly for a
+meal, restaurant, cafe, or customer entertainment expense where project or
+attendee clarification is useful. Set it to false for fuel/gasoline/petrol,
+market/grocery/supermarket, toll, parking, transport, travel, or unknown
+receipt types. Use business_context_category as one of: meal, restaurant,
+cafe, entertainment, fuel, market, grocery, toll, parking, transport, travel,
+other, unknown.
+
 Return exactly this JSON shape, with no markdown or prose outside JSON:
 {{
   "date": "YYYY-MM-DD or null",
@@ -138,7 +146,8 @@ Return exactly this JSON shape, with no markdown or prose outside JSON:
   "business_reason": "string or null",
   "attendees": "string or null",
   "business_context_needed": true or false,
-  "business_context_reason": "short reason, e.g. meal/restaurant/fuel/unknown",
+  "business_context_category": "meal/restaurant/cafe/entertainment/fuel/market/grocery/toll/parking/transport/travel/other/unknown",
+  "business_context_reason": "short reason",
   "notes": "short explanation"
 }}
 """
@@ -170,6 +179,7 @@ def agent_payload_from_live_response(raw_response: str) -> dict[str, Any]:
         "confidence": None,
         "raw_text_summary": _optional_string(notes_value),
         "business_context_needed": _optional_bool(parsed.get("business_context_needed")),
+        "business_context_category": _optional_string(parsed.get("business_context_category")),
         "business_context_reason": _optional_string(parsed.get("business_context_reason")),
     }
 

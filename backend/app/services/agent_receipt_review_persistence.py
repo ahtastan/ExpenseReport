@@ -69,6 +69,285 @@ def get_latest_agent_receipt_comparison(
     return session.exec(statement).first()
 
 
+# F-AI-0b-2 difference -> field/severity classification. Mirrors the warn/block
+# split used by agent_receipt_reviewer's comparator.
+_AI_DIFFERENCE_FIELD_AND_SEVERITY: dict[str, tuple[str, str]] = {
+    "amount_mismatch": ("amount", "block"),
+    "missing_canonical_amount": ("amount", "block"),
+    "missing_agent_amount": ("amount", "block"),
+    "currency_mismatch": ("currency", "block"),
+    "missing_canonical_currency": ("currency", "block"),
+    "missing_agent_currency": ("currency", "block"),
+    "date_mismatch": ("date", "warn"),
+    "missing_canonical_date": ("date", "warn"),
+    "missing_agent_date": ("date", "warn"),
+    "supplier_mismatch": ("supplier", "warn"),
+    "missing_canonical_supplier": ("supplier", "warn"),
+    "missing_agent_supplier": ("supplier", "warn"),
+    "missing_business_reason": ("business_context", "warn"),
+    "missing_attendees": ("business_context", "warn"),
+}
+
+# Whitelist of recommended_action codes the public API may surface. Any
+# unrecognised value coming from the comparator is dropped to avoid leaking
+# new internal vocabulary by accident.
+_AI_PUBLIC_RECOMMENDED_ACTIONS = {
+    "accept",
+    "ask_user",
+    "manual_review",
+    "block_report",
+}
+
+# Whitelist of risk_level codes. Anything else makes the row "malformed".
+_AI_PUBLIC_RISK_LEVELS = {"pass", "warn", "block"}
+
+
+def latest_ai_review_for_receipt(
+    session: Session,
+    receipt: ReceiptDocument,
+) -> dict[str, Any] | None:
+    """Return the public AI-second-read dict for a receipt's review-row payload.
+
+    F-AI-0b-2 advisory display only. This helper:
+      * never writes to the DB,
+      * never calls models,
+      * never mutates the receipt,
+      * returns ``None`` when there is no signal worth surfacing,
+      * returns a synthetic ``status`` (pass/warn/block/stale/malformed) plus
+        the safe public projection of agent vs canonical values.
+
+    The return shape is documented in the F-AI-0b-2 design report:
+    ``status`` is always present; ``differences``/``summary`` are omitted when
+    empty/null; nothing internal (prompt_text, raw_model_json, hashes,
+    storage paths) is ever included.
+    """
+    if receipt is None or receipt.id is None:
+        return None
+
+    completed_comparison = get_latest_agent_receipt_comparison(session, receipt.id)
+
+    if completed_comparison is None:
+        # No completed comparison exists. If the latest run for this receipt
+        # is failed/incomplete, surface a quiet "malformed" status so the UI
+        # can mark it as ignored. Otherwise omit the field entirely.
+        latest_run = _latest_run_for_receipt(session, receipt.id)
+        if latest_run is None:
+            return None
+        if latest_run.status in {"completed"}:
+            # Defensive: completed run but no comparison row — broken state.
+            return _malformed_payload(latest_run)
+        if latest_run.status in {"failed", "started"}:
+            return _malformed_payload(latest_run)
+        return None
+
+    run = session.get(AgentReceiptReviewRun, completed_comparison.run_id)
+    if run is None:
+        # Comparison without parent run is broken state.
+        return _malformed_payload(None)
+
+    # Stale detection: recompute the canonical snapshot hash from the current
+    # receipt state. If it differs from the snapshot recorded with the run,
+    # the receipt was edited after the AI second-read was produced.
+    current_hash = canonical_receipt_snapshot_hash(build_canonical_receipt_snapshot(receipt))
+    if (
+        completed_comparison.canonical_snapshot_hash
+        and current_hash != completed_comparison.canonical_snapshot_hash
+    ):
+        return _stale_payload(run)
+
+    risk_level = completed_comparison.risk_level
+    if risk_level not in _AI_PUBLIC_RISK_LEVELS:
+        return _malformed_payload(run)
+
+    differences = _coerce_differences(completed_comparison.differences_json)
+
+    canonical_snapshot = _safe_load_canonical_snapshot(run.canonical_snapshot_json)
+    agent_read_row = _latest_agent_read_for_run(session, run.id)
+
+    payload: dict[str, Any] = {
+        "status": risk_level,
+        "label": "AI second read",
+        "risk_level": risk_level,
+    }
+
+    action = completed_comparison.recommended_action
+    if action in _AI_PUBLIC_RECOMMENDED_ACTIONS:
+        # Public surface uses "review" instead of internal "manual_review".
+        payload["recommended_action"] = "review" if action == "manual_review" else action
+
+    summary = (completed_comparison.suggested_user_message or "").strip()
+    if summary:
+        payload["summary"] = summary
+
+    if run.completed_at is not None:
+        payload["completed_at"] = _isoformat(run.completed_at)
+
+    rich_differences = _build_public_differences(
+        differences,
+        agent_read_row=agent_read_row,
+        canonical_snapshot=canonical_snapshot,
+    )
+    if rich_differences:
+        payload["differences"] = rich_differences
+
+    agent_view = _public_agent_read(agent_read_row)
+    if agent_view:
+        payload["agent_read"] = agent_view
+
+    canonical_view = _public_canonical_view(canonical_snapshot)
+    if canonical_view:
+        payload["canonical"] = canonical_view
+
+    return payload
+
+
+def _latest_run_for_receipt(
+    session: Session, receipt_document_id: int
+) -> AgentReceiptReviewRun | None:
+    statement = (
+        select(AgentReceiptReviewRun)
+        .where(AgentReceiptReviewRun.receipt_document_id == receipt_document_id)
+        .order_by(
+            AgentReceiptReviewRun.completed_at.desc(),
+            AgentReceiptReviewRun.id.desc(),
+        )
+    )
+    return session.exec(statement).first()
+
+
+def _latest_agent_read_for_run(
+    session: Session, run_id: int | None
+) -> AgentReceiptReadRow | None:
+    if run_id is None:
+        return None
+    statement = (
+        select(AgentReceiptReadRow)
+        .where(AgentReceiptReadRow.run_id == run_id)
+        .order_by(AgentReceiptReadRow.id.desc())
+    )
+    return session.exec(statement).first()
+
+
+def _stale_payload(run: AgentReceiptReviewRun) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "stale",
+        "label": "AI second read",
+    }
+    if run.completed_at is not None:
+        payload["completed_at"] = _isoformat(run.completed_at)
+    return payload
+
+
+def _malformed_payload(run: AgentReceiptReviewRun | None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "malformed",
+        "label": "AI second read",
+    }
+    if run is not None and run.completed_at is not None:
+        payload["completed_at"] = _isoformat(run.completed_at)
+    return payload
+
+
+def _coerce_differences(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, str)]
+
+
+def _safe_load_canonical_snapshot(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _build_public_differences(
+    codes: list[str],
+    *,
+    agent_read_row: AgentReceiptReadRow | None,
+    canonical_snapshot: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    rich: list[dict[str, Any]] = []
+    for code in codes:
+        field, severity = _AI_DIFFERENCE_FIELD_AND_SEVERITY.get(code, ("unknown", "warn"))
+        diff: dict[str, Any] = {
+            "code": code,
+            "field": field,
+            "severity": severity,
+        }
+        agent_value, canonical_value = _difference_values(field, agent_read_row, canonical_snapshot)
+        if agent_value is not None or canonical_value is not None:
+            diff["agent_value"] = agent_value
+            diff["canonical_value"] = canonical_value
+        rich.append(diff)
+    return rich
+
+
+def _difference_values(
+    field: str,
+    agent_read_row: AgentReceiptReadRow | None,
+    canonical_snapshot: Mapping[str, Any],
+) -> tuple[Any, Any]:
+    if field == "amount":
+        agent_value = agent_read_row.local_amount_decimal if agent_read_row else None
+        canonical_value = canonical_snapshot.get("amount") or None
+        return agent_value, canonical_value
+    if field == "currency":
+        agent_value = agent_read_row.currency if agent_read_row else None
+        canonical_value = canonical_snapshot.get("currency") or None
+        return agent_value, canonical_value
+    if field == "date":
+        agent_date = agent_read_row.extracted_date if agent_read_row else None
+        agent_value = agent_date.isoformat() if isinstance(agent_date, date) else agent_date
+        canonical_value = canonical_snapshot.get("date") or None
+        return agent_value, canonical_value
+    if field == "supplier":
+        agent_value = agent_read_row.extracted_supplier if agent_read_row else None
+        canonical_value = canonical_snapshot.get("supplier") or None
+        return agent_value, canonical_value
+    return None, None
+
+
+def _public_agent_read(agent_read_row: AgentReceiptReadRow | None) -> dict[str, Any]:
+    if agent_read_row is None:
+        return {}
+    view: dict[str, Any] = {}
+    if agent_read_row.extracted_date is not None:
+        view["date"] = agent_read_row.extracted_date.isoformat()
+    if agent_read_row.local_amount_decimal:
+        view["amount"] = agent_read_row.local_amount_decimal
+    if agent_read_row.currency:
+        view["currency"] = agent_read_row.currency
+    if agent_read_row.extracted_supplier:
+        view["supplier"] = agent_read_row.extracted_supplier
+    return view
+
+
+def _public_canonical_view(canonical_snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    view: dict[str, Any] = {}
+    for key in ("date", "amount", "currency", "supplier"):
+        value = canonical_snapshot.get(key)
+        if value:
+            view[key] = value
+    return view
+
+
+def _isoformat(value: Any) -> str | None:
+    if value is None:
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
 def write_mock_agent_receipt_review(
     session: Session,
     *,

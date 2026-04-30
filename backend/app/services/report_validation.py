@@ -18,6 +18,10 @@ from app.models import (
 )
 from app.services.receipt_statement_safety import receipt_statement_issues
 
+# F-AI-0b-2: AI second-read context is advisory-only. It is surfaced via
+# source.ai_review on review-row payloads but must NEVER add entries to the
+# ValidationIssue list emitted by validate_report_readiness. Only deterministic
+# safety/match/business-rule checks may emit readiness issues here.
 
 AIRFARE_BUCKET = "Airfare/Bus/Ferry/Other"
 AIR_TRAVEL_DETAIL_ROWS_BY_SHEET = {

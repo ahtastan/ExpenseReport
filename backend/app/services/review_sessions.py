@@ -15,6 +15,7 @@ from app.models import (
     ReviewSession,
     StatementTransaction,
 )
+from app.services.agent_receipt_review_persistence import latest_ai_review_for_receipt
 from app.services.receipt_statement_safety import (
     receipt_statement_issue_note,
     receipt_statement_issues,
@@ -255,7 +256,12 @@ def _statement_payload(tx: StatementTransaction) -> tuple[dict[str, Any], dict[s
     return source, suggested
 
 
-def _row_payload(tx: StatementTransaction, receipt: ReceiptDocument, decision: MatchDecision) -> tuple[dict[str, Any], dict[str, Any]]:
+def _row_payload(
+    session: Session,
+    tx: StatementTransaction,
+    receipt: ReceiptDocument,
+    decision: MatchDecision,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     amount, currency = _amount_and_currency(tx)
     tx_date = tx.transaction_date or receipt.extracted_date
     safety_issues = [issue.as_dict() for issue in receipt_statement_issues(receipt, tx)]
@@ -293,6 +299,13 @@ def _row_payload(tx: StatementTransaction, receipt: ReceiptDocument, decision: M
         },
         "match": match_payload,
     }
+    # F-AI-0b-2: surface advisory AI second-read context only when an
+    # AgentDB review exists for this receipt. Never present on
+    # statement-only/unmatched rows. Never affects attention_required,
+    # confirm_review_session, or report_validation.
+    ai_review = latest_ai_review_for_receipt(session, receipt)
+    if ai_review is not None:
+        source["ai_review"] = ai_review
     suggested = {
         "transaction_id": tx.id,
         "receipt_id": receipt.id,
@@ -403,7 +416,7 @@ def _sync_review_rows(session: Session, review: ReviewSession) -> None:
             )
             if not upgradable:
                 continue
-            source, suggested = _row_payload(tx, receipt, decision)
+            source, suggested = _row_payload(session, tx, receipt, decision)
             missing = _missing_required_fields(suggested)
             safety_issues = _source_receipt_statement_issues(_dumps(source))
             existing_row.receipt_document_id = receipt.id
@@ -421,7 +434,7 @@ def _sync_review_rows(session: Session, review: ReviewSession) -> None:
             continue
 
         if has_full_match:
-            source, suggested = _row_payload(tx, receipt, decision)
+            source, suggested = _row_payload(session, tx, receipt, decision)
             receipt_id = receipt.id
             decision_id = decision.id
             match_confidence = decision.confidence

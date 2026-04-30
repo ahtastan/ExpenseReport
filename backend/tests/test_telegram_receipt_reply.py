@@ -738,6 +738,67 @@ def test_live_ai_second_read_does_not_ask_meal_context_for_fuel_even_if_business
     assert result["ai_receipt_reply_sent"] is True
     assert questions == []
     assert "AI second read is advisory only." in fake.messages[-1]
+    assert "AI context: This looks like a gas receipt." in fake.messages[-1]
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
+    assert "attended" not in fake.messages[-1].lower()
+
+
+def test_live_ai_second_read_reply_labels_market_snacks_without_business_context_questions(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake = _install_fake_client(monkeypatch)
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="Serbest Market",
+        report_bucket=None,
+    )
+
+    def fake_live(**kwargs):
+        return telegram_receipt_reply.agent_receipt_live_provider.LiveAgentReceiptReviewResult(
+            agent_payload={
+                "merchant_name": "Serbest Market",
+                "merchant_address": None,
+                "receipt_date": "2025-12-17",
+                "receipt_time": None,
+                "total_amount": "691.00",
+                "currency": "TRY",
+                "amount_text": "691.00 TRY",
+                "line_items": [
+                    {"description": "Monster Ultra Energy"},
+                    {"description": "Tuborg Special"},
+                    {"description": "Marlboro"},
+                ],
+                "tax_amount": None,
+                "payment_method": None,
+                "receipt_category": "market",
+                "confidence": 0.91,
+                "raw_text_summary": "Visible receipt shows market shopping including energy drink, beer, and cigarettes.",
+                "business_context_needed": False,
+                "business_context_category": "market",
+                "business_context_reason": "market/snacks purchase",
+            },
+            raw_response_json=json.dumps({"business_context_category": "market"}),
+            prompt_text="hidden prompt",
+            model_name="gpt-live-test",
+        )
+
+    monkeypatch.setattr(
+        telegram_receipt_reply.agent_receipt_live_provider,
+        "call_live_agent_receipt_review",
+        fake_live,
+    )
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "receipt_captured"
+    assert result["ai_receipt_reply_sent"] is True
+    assert questions == []
+    assert "AI context: This looks like market/snacks." in fake.messages[-1]
     assert "project, customer, or trip" not in fake.messages[-1].lower()
     assert "attended" not in fake.messages[-1].lower()
 

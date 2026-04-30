@@ -138,17 +138,127 @@ const apiForm = async (path, body) => {
    toNum() coerces for display math. Server retains exact Decimal arithmetic. */
 const toNum = (v) => v == null ? null : (typeof v === 'string' ? Number(v) : v);
 
+// ─── F-AI-0b-2: AI second-read display helpers ────────────────────────────────
+// Map raw difference codes from source.ai_review.differences to short
+// plain-English labels. Codes that aren't recognised render verbatim so a
+// future comparator addition surfaces visibly instead of silently disappearing.
+const AI_DIFFERENCE_LABEL = {
+  amount_mismatch:               'Receipt amount differs from canonical',
+  missing_canonical_amount:      'Canonical amount is missing',
+  missing_agent_amount:          'AI could not read the receipt amount',
+  currency_mismatch:             'Receipt currency differs from canonical',
+  missing_canonical_currency:    'Canonical currency is missing',
+  missing_agent_currency:        'AI could not read the receipt currency',
+  date_mismatch:                 'Receipt date differs from canonical',
+  missing_canonical_date:        'Canonical date is missing',
+  missing_agent_date:            'AI could not read the receipt date',
+  supplier_mismatch:             'Receipt supplier differs from canonical',
+  missing_canonical_supplier:    'Canonical supplier is missing',
+  missing_agent_supplier:        'AI could not read the receipt supplier',
+  missing_business_reason:       'Business reason is missing',
+  missing_attendees:             'Attendee list is missing',
+};
+
+const AI_BADGE_PRESENTATION = {
+  pass:       { glyph:'✓', color:'var(--success)',  bg:'var(--success-subtle)',  copy:'AI second read: pass' },
+  warn:       { glyph:'◎', color:'var(--warning)',  bg:'var(--warning-subtle)',  copy:'AI second read: warning' },
+  block:      { glyph:'◉', color:'var(--danger)',   bg:'var(--danger-subtle)',   copy:'AI second read: block (advisory)' },
+  stale:      { glyph:'⌛', color:'var(--text-3)',   bg:'var(--surface-2)',       copy:'AI second read: stale' },
+  malformed:  { glyph:'⚠', color:'var(--text-3)',   bg:'var(--surface-2)',       copy:'AI second read unavailable' },
+};
+
+function aiBadgeTooltip(ai) {
+  if (!ai) return null;
+  const presentation = AI_BADGE_PRESENTATION[ai.status];
+  if (!presentation) return null;
+  const lines = [presentation.copy];
+  if (ai.summary) lines.push(ai.summary);
+  if (ai.differences && ai.differences.length) {
+    for (const diff of ai.differences) {
+      const label = AI_DIFFERENCE_LABEL[diff.code] || diff.code;
+      lines.push('• ' + label);
+    }
+  }
+  return lines.join('\n');
+}
+
+function AiReviewBadge({ ai }) {
+  if (!ai) return null;
+  const presentation = AI_BADGE_PRESENTATION[ai.status];
+  if (!presentation) return null;
+  const tooltip = aiBadgeTooltip(ai);
+  return (
+    <span title={tooltip}
+      style={{
+        display:'inline-flex', alignItems:'center', justifyContent:'center',
+        marginLeft:4,
+        width:14, height:14, borderRadius:7,
+        fontSize:10, fontWeight:600, lineHeight:1,
+        background:presentation.bg, color:presentation.color,
+        cursor:'help',
+      }}>
+      {presentation.glyph}
+    </span>
+  );
+}
+
+function AiReviewDifferencesPanel({ ai }) {
+  if (!ai) return null;
+  if (ai.status === 'pass' || ai.status === 'malformed') return null;
+  const differences = ai.differences || [];
+  if (ai.status !== 'stale' && differences.length === 0 && !ai.summary) return null;
+  const presentation = AI_BADGE_PRESENTATION[ai.status] || {};
+  return (
+    <div style={{
+      margin:'4px 12px 8px 12px', padding:'8px 10px',
+      borderRadius:6, border:'1px solid var(--border)',
+      background:presentation.bg || 'var(--surface-2)',
+      fontSize:12, color:'var(--text-2)',
+    }}>
+      <div style={{ fontWeight:600, color:presentation.color || 'var(--text-2)', marginBottom:4 }}>
+        {presentation.copy || ('AI second read: ' + ai.status)}
+      </div>
+      {ai.summary
+        ? <div style={{ marginBottom:differences.length?6:0 }}>{ai.summary}</div>
+        : null}
+      {differences.length
+        ? <ul style={{ margin:0, paddingLeft:16 }}>
+            {differences.map((diff, idx) => (
+              <li key={idx}>
+                <span style={{ fontWeight:500 }}>{AI_DIFFERENCE_LABEL[diff.code] || diff.code}</span>
+                {diff.agent_value || diff.canonical_value
+                  ? <span style={{ color:'var(--text-3)' }}>
+                      {' — AI: '}{diff.agent_value == null ? '—' : String(diff.agent_value)}
+                      {' / canonical: '}{diff.canonical_value == null ? '—' : String(diff.canonical_value)}
+                    </span>
+                  : null}
+              </li>
+            ))}
+          </ul>
+        : null}
+      {ai.completed_at
+        ? <div style={{ marginTop:6, fontSize:11, color:'var(--text-3)' }}>
+            Compared at {ai.completed_at}
+          </div>
+        : null}
+    </div>
+  );
+}
+
 // ─── Row adapters ─────────────────────────────────────────────────────────────
 function apiRowToLocal(apiRow) {
   const c = apiRow.confirmed || {};
   const src = apiRow.source || {};
   const match = src.match || {};
   const stmt = src.statement || {};
+  // F-AI-0b-2: optional advisory AI block. Always null on statement-only rows.
+  const aiReview = src.ai_review || null;
   return {
     id:          apiRow.id,
     status:      apiRow.status,
     attention:   apiRow.attention_required,
     attnNote:    apiRow.attention_note,
+    aiReview:    aiReview,
     // statement amounts (raw, for display); toNum unwraps decimal-string responses
     localAmount: toNum(stmt.local_amount),
     localCurrency: stmt.local_currency || 'TRY',
@@ -1002,10 +1112,14 @@ function ReviewRowItem({ row, categoryMap, onToggleFlag, onSave, onLocalUpdate, 
       <div onClick={()=>setExpanded(e=>!e)} style={{ display:'grid', gridTemplateColumns:GRID,
         alignItems:'center', padding:'0 10px', minHeight:42, cursor:'pointer',
         background:rowBg, transition:'background 0.1s' }}>
-        {/* Flag */}
-        <div onClick={e=>{e.stopPropagation();onToggleFlag(row.id);}} style={{ display:'flex', justifyContent:'center' }}>
-          <span title={row.attention?(row.attnNote||'Flagged'):'Flag'}
+        {/* Flag + AI second-read badge */}
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'center' }}>
+          <span onClick={e=>{e.stopPropagation();onToggleFlag(row.id);}}
+            title={row.attention?(row.attnNote||'Flagged'):'Flag'}
             style={{ fontSize:12, color:row.attention?'var(--danger)':'var(--border)', cursor:'pointer' }}>⚑</span>
+          {row.hasReceipt && row.aiReview
+            ? <AiReviewBadge ai={row.aiReview}/>
+            : null}
         </div>
         {/* Date */}
         <div style={{ paddingLeft:2 }}><InlineDate value={row.date} onChange={handleDate}/></div>
@@ -1056,6 +1170,9 @@ function ReviewRowItem({ row, categoryMap, onToggleFlag, onSave, onLocalUpdate, 
         </div>
       </div>
       {expanded && <ExpandedRow row={row} onSave={onSave}/>}
+      {expanded && row.hasReceipt && row.aiReview
+        ? <AiReviewDifferencesPanel ai={row.aiReview}/>
+        : null}
     </div>
   );
 }
@@ -1154,13 +1271,20 @@ function ReviewQueue({ session, statement, localRows, categoryMap, onSave, onLoc
     review:    localRows.filter(r=>r.status==='needs_review').length,
     low:       localRows.filter(r=>r.confidence==='low'||!r.hasReceipt).length,
     confirmed: localRows.filter(r=>r.status==='confirmed').length,
+    // F-AI-0b-2 advisory counts. Always advisory: never affects gating.
+    ai_warn:   localRows.filter(r=>r.aiReview && r.aiReview.status==='warn').length,
+    ai_block:  localRows.filter(r=>r.aiReview && r.aiReview.status==='block').length,
+    ai_stale:  localRows.filter(r=>r.aiReview && r.aiReview.status==='stale').length,
   };
 
   const filtered = localRows.filter(r => {
-    if (filter==='attention') return r.attention;
-    if (filter==='review')    return r.status==='needs_review';
-    if (filter==='low')       return r.confidence==='low'||!r.hasReceipt;
-    if (filter==='confirmed') return r.status==='confirmed';
+    if (filter==='attention')  return r.attention;
+    if (filter==='review')     return r.status==='needs_review';
+    if (filter==='low')        return r.confidence==='low'||!r.hasReceipt;
+    if (filter==='confirmed')  return r.status==='confirmed';
+    if (filter==='ai_warn')    return r.aiReview && r.aiReview.status==='warn';
+    if (filter==='ai_block')   return r.aiReview && r.aiReview.status==='block';
+    if (filter==='ai_stale')   return r.aiReview && r.aiReview.status==='stale';
     return true;
   });
 
@@ -1252,13 +1376,33 @@ function ReviewQueue({ session, statement, localRows, categoryMap, onSave, onLoc
           </button>
         </div>
         <div style={{ display:'flex', gap:3, background:'var(--surface-2)', padding:3, borderRadius:7 }}>
-          {[{key:'all',label:'All'},{key:'attention',label:'⚑ Attention'},{key:'review',label:'Needs review'},{key:'low',label:'Low / missing'},{key:'confirmed',label:'Confirmed'}].map(({key,label})=>(
+          {[
+            {key:'all',label:'All'},
+            {key:'attention',label:'⚑ Attention'},
+            {key:'review',label:'Needs review'},
+            {key:'low',label:'Low / missing'},
+            {key:'confirmed',label:'Confirmed'},
+          ].map(({key,label})=>(
             <button key={key} onClick={()=>setFilter(key)} style={tabStyle(filter===key)}>
               {label}
               <span style={countPill(filter===key,counts[key])}>{counts[key]}</span>
             </button>
           ))}
         </div>
+        {(counts.ai_warn || counts.ai_block || counts.ai_stale)
+          ? <div style={{ display:'flex', gap:3, background:'var(--surface-2)', padding:3, borderRadius:7 }}>
+              {[
+                {key:'ai_warn',  label:'AI ◎ warn',  visible:counts.ai_warn>0},
+                {key:'ai_block', label:'AI ◉ block', visible:counts.ai_block>0},
+                {key:'ai_stale', label:'AI ⌛ stale', visible:counts.ai_stale>0},
+              ].filter(({visible})=>visible).map(({key,label})=>(
+                <button key={key} onClick={()=>setFilter(key)} style={tabStyle(filter===key)} title="AI second read is advisory only — does not block report">
+                  {label}
+                  <span style={countPill(filter===key,counts[key])}>{counts[key]}</span>
+                </button>
+              ))}
+            </div>
+          : null}
       </div>
       {/* Bulk classify */}
       <div style={{ padding:'8px 14px', borderBottom:'1px solid var(--border)', background:'var(--surface)',

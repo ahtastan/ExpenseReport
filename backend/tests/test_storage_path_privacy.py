@@ -60,6 +60,22 @@ FORBIDDEN_PATH_KEYS = {
     "output_workbook_path",
     "output_pdf_path",
     "storage_root",
+    # F-AI-0b-2: AI second-read internal fields. None of these may surface in
+    # any API response. They live only on AgentDB rows for audit/debug.
+    "prompt_text",
+    "raw_model_json",
+    "receipt_snapshot_json",
+    "statement_snapshot_json",
+    "canonical_receipt_snapshot_hash",
+    "canonical_snapshot_hash",
+    "agent_read_hash",
+    "prompt_hash",
+    "input_hash",
+    "model_response_json",
+    "model_debug_json",
+    "evidence_json",
+    "warnings_json",
+    "confidence_json",
 }
 
 

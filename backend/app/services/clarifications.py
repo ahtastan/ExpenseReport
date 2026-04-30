@@ -9,6 +9,7 @@ from app.models import AppUser, ClarificationQuestion, ReceiptDocument
 
 _AMOUNT_QUANT = Decimal("0.0001")
 logger = logging.getLogger(__name__)
+BUSINESS_CONTEXT_QUESTION_KEYS = ("business_reason", "attendees")
 
 
 def _question_exists(session: Session, receipt_id: int | None, key: str) -> bool:
@@ -154,6 +155,8 @@ def ensure_receipt_review_questions(
     session: Session,
     receipt: ReceiptDocument,
     user_id: int | None,
+    *,
+    include_business_context: bool = True,
 ) -> list[ClarificationQuestion]:
     questions: list[ClarificationQuestion] = []
     default_business, allowlisted, telegram_user_id = _should_default_business_for_telegram_receipt(
@@ -194,17 +197,22 @@ def ensure_receipt_review_questions(
             "business_or_personal",
             "Is this Business or Personal? Reply with Business, Personal, or add context like 'Business - Kartonsan dinner'.",
         ),
-        (
-            receipt.business_or_personal == "Business" and not receipt.business_reason,
-            "business_reason",
-            "What project, customer, or trip should this receipt be attached to?",
-        ),
-        (
-            receipt.business_or_personal == "Business" and not receipt.attendees,
-            "attendees",
-            "Who attended or benefited from this expense? If not applicable, reply 'N/A'.",
-        ),
     ]
+    if include_business_context:
+        specs.extend(
+            [
+                (
+                    receipt.business_or_personal == "Business" and not receipt.business_reason,
+                    "business_reason",
+                    "What project, customer, or trip should this receipt be attached to?",
+                ),
+                (
+                    receipt.business_or_personal == "Business" and not receipt.attendees,
+                    "attendees",
+                    "Who attended or benefited from this expense? If not applicable, reply 'N/A'.",
+                ),
+            ]
+        )
     for should_ask, key, text in specs:
         if should_ask and not _question_exists(session, receipt.id, key):
             questions.append(
@@ -217,7 +225,7 @@ def ensure_receipt_review_questions(
             )
     for question in questions:
         session.add(question)
-    receipt.needs_clarification = bool(questions) or receipt.needs_clarification
+    receipt.needs_clarification = bool(questions) or _receipt_has_open_questions(session, receipt.id)
     receipt.updated_at = datetime.now(timezone.utc)
     session.add(receipt)
     session.commit()
@@ -226,7 +234,35 @@ def ensure_receipt_review_questions(
     return questions
 
 
-def next_open_question_for_user(session: Session, user_id: int) -> ClarificationQuestion | None:
+def _receipt_has_open_questions(session: Session, receipt_id: int | None) -> bool:
+    if receipt_id is None:
+        return False
+    return bool(
+        session.exec(
+            select(ClarificationQuestion).where(
+                ClarificationQuestion.receipt_document_id == receipt_id,
+                ClarificationQuestion.status == "open",
+            )
+        ).first()
+    )
+
+
+def _open_question_filters(user_id: int, *, include_business_context: bool) -> list:
+    filters = [
+        ClarificationQuestion.user_id == user_id,
+        ClarificationQuestion.status == "open",
+    ]
+    if not include_business_context:
+        filters.append(~ClarificationQuestion.question_key.in_(BUSINESS_CONTEXT_QUESTION_KEYS))
+    return filters
+
+
+def next_open_question_for_user(
+    session: Session,
+    user_id: int,
+    *,
+    include_business_context: bool = True,
+) -> ClarificationQuestion | None:
     """Return the next clarification question to dispatch for ``user_id``.
 
     Scoped to the receipt with the *most recently created* open question
@@ -257,10 +293,7 @@ def next_open_question_for_user(session: Session, user_id: int) -> Clarification
     """
     most_recent = session.exec(
         select(ClarificationQuestion)
-        .where(
-            ClarificationQuestion.user_id == user_id,
-            ClarificationQuestion.status == "open",
-        )
+        .where(*_open_question_filters(user_id, include_business_context=include_business_context))
         .order_by(
             ClarificationQuestion.created_at.desc(),
             ClarificationQuestion.id.desc(),
@@ -271,11 +304,27 @@ def next_open_question_for_user(session: Session, user_id: int) -> Clarification
     receipt_id = most_recent.receipt_document_id
     if receipt_id is None:
         return most_recent
+    return next_open_question_for_receipt(
+        session,
+        user_id,
+        receipt_id,
+        include_business_context=include_business_context,
+    )
+
+
+def next_open_question_for_receipt(
+    session: Session,
+    user_id: int,
+    receipt_id: int | None,
+    *,
+    include_business_context: bool = True,
+) -> ClarificationQuestion | None:
+    if receipt_id is None:
+        return None
     return session.exec(
         select(ClarificationQuestion)
         .where(
-            ClarificationQuestion.user_id == user_id,
-            ClarificationQuestion.status == "open",
+            *_open_question_filters(user_id, include_business_context=include_business_context),
             ClarificationQuestion.receipt_document_id == receipt_id,
         )
         .order_by(

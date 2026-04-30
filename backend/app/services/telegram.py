@@ -20,6 +20,7 @@ from app.services.receipt_extraction import apply_receipt_extraction
 from app.services.review_sessions import get_or_create_review_session
 from app.services.storage import save_bytes
 from app.services.statement_import import import_diners_excel
+from app.services.telegram_receipt_reply import maybe_send_telegram_receipt_reply
 
 logger = logging.getLogger(__name__)
 
@@ -363,7 +364,17 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
 
     extraction = apply_receipt_extraction(session, receipt)
     questions = ensure_receipt_review_questions(session, receipt, user.id)
-    if questions:
+    ai_receipt_reply_sent = maybe_send_telegram_receipt_reply(
+        session,
+        client,
+        settings=settings,
+        receipt=receipt,
+        telegram_user_id=user.telegram_user_id,
+        chat_id=chat_id,
+    )
+    if ai_receipt_reply_sent:
+        pass
+    elif questions:
         if extraction.confidence and extraction.confidence >= 0.6:
             summary = (
                 f"I read: {receipt.extracted_date or '?'} | "
@@ -382,4 +393,5 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         "receipt_id": receipt.id,
         "user_id": user.id,
         "questions_created": len(questions),
+        "ai_receipt_reply_sent": ai_receipt_reply_sent,
     }

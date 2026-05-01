@@ -245,43 +245,6 @@ function AiReviewDifferencesPanel({ ai }) {
   );
 }
 
-// ─── F-AI-TG-2: Telegram draft preview (display only, never sent) ─────────────
-const TELEGRAM_DRAFT_SEVERITY_PRESENTATION = {
-  info:    { color:'var(--text-2)', bg:'var(--surface-2)' },
-  warning: { color:'var(--warning)', bg:'var(--warning-subtle)' },
-  blocker: { color:'var(--danger)',  bg:'var(--danger-subtle)' },
-};
-
-function TelegramDraftPreview({ draft }) {
-  if (!draft) return null;
-  if (draft.send_allowed) return null;  // hard guard: anything claiming send_allowed=true is rejected
-  const presentation = TELEGRAM_DRAFT_SEVERITY_PRESENTATION[draft.severity]
-    || TELEGRAM_DRAFT_SEVERITY_PRESENTATION.info;
-  return (
-    <div style={{
-      margin:'4px 12px 8px 12px', padding:'8px 10px',
-      borderRadius:6, border:'1px dashed var(--border)',
-      background:presentation.bg, color:'var(--text-2)', fontSize:12,
-    }}>
-      <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:4 }}>
-        <span style={{ fontWeight:600, color:presentation.color }}>
-          Telegram draft preview
-        </span>
-        <span style={{
-          padding:'1px 6px', borderRadius:9, fontSize:10, fontWeight:600,
-          background:'var(--surface-2)', color:'var(--text-3)',
-        }}>
-          Not sent
-        </span>
-        <span style={{ fontSize:11, color:'var(--text-3)' }}>
-          {draft.kind} · {draft.severity}
-        </span>
-      </div>
-      <div style={{ whiteSpace:'pre-wrap' }}>{draft.text}</div>
-    </div>
-  );
-}
-
 // ─── Row adapters ─────────────────────────────────────────────────────────────
 function apiRowToLocal(apiRow) {
   const c = apiRow.confirmed || {};
@@ -290,16 +253,12 @@ function apiRowToLocal(apiRow) {
   const stmt = src.statement || {};
   // F-AI-0b-2: optional advisory AI block. Always null on statement-only rows.
   const aiReview = src.ai_review || null;
-  // F-AI-TG-2: optional Telegram draft preview. Display-only; the engine
-  // only emits it when a draft is warranted, so absence == nothing to show.
-  const telegramDraft = src.telegram_draft || null;
   return {
     id:          apiRow.id,
     status:      apiRow.status,
     attention:   apiRow.attention_required,
     attnNote:    apiRow.attention_note,
     aiReview:    aiReview,
-    telegramDraft: telegramDraft,
     // statement amounts (raw, for display); toNum unwraps decimal-string responses
     localAmount: toNum(stmt.local_amount),
     localCurrency: stmt.local_currency || 'TRY',
@@ -1213,9 +1172,6 @@ function ReviewRowItem({ row, categoryMap, onToggleFlag, onSave, onLocalUpdate, 
       {expanded && <ExpandedRow row={row} onSave={onSave}/>}
       {expanded && row.hasReceipt && row.aiReview
         ? <AiReviewDifferencesPanel ai={row.aiReview}/>
-        : null}
-      {expanded && row.hasReceipt && row.telegramDraft
-        ? <TelegramDraftPreview draft={row.telegramDraft}/>
         : null}
     </div>
   );

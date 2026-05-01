@@ -2,6 +2,7 @@ import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
+from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from app.config import get_settings
@@ -9,7 +10,30 @@ from app.models import AppUser, ClarificationQuestion, ReceiptDocument
 
 _AMOUNT_QUANT = Decimal("0.0001")
 logger = logging.getLogger(__name__)
-BUSINESS_CONTEXT_QUESTION_KEYS = ("business_reason", "attendees")
+TELEGRAM_MEAL_CONTEXT_QUESTION_KEY = "telegram_meal_context"
+TELEGRAM_MARKET_CONTEXT_QUESTION_KEY = "telegram_market_context"
+DEFAULT_BUSINESS_CONTEXT_QUESTION_KEYS = ("business_reason", "attendees")
+BUSINESS_CONTEXT_QUESTION_KEYS = (
+    *DEFAULT_BUSINESS_CONTEXT_QUESTION_KEYS,
+    TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
+    TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+)
+MEAL_ATTENDEES_QUESTION_TEXT = (
+    "Please reply with who was included in the meal. "
+    "Example: Hakan only, or Hakan + customer: Ahmet Yilmaz."
+)
+TELEGRAM_MEAL_CONTEXT_QUESTION_TEXT = (
+    "Was this business or personal spending?\n"
+    "If business, please reply with who was included.\n"
+    "Example: business, Hakan only or business, Hakan + customer: Ahmet Yılmaz.\n"
+    "If personal, reply personal."
+)
+TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT = (
+    "Was this business or personal spending?\n"
+    "If business, please reply with who it was for.\n"
+    "Example: business, EDT team or business, customer meeting with Ahmet + Hakan.\n"
+    "If personal, reply personal."
+)
 
 
 def _question_exists(session: Session, receipt_id: int | None, key: str) -> bool:
@@ -157,6 +181,8 @@ def ensure_receipt_review_questions(
     user_id: int | None,
     *,
     include_business_context: bool = True,
+    business_context_question_keys: tuple[str, ...] | None = None,
+    include_business_personal: bool = True,
 ) -> list[ClarificationQuestion]:
     questions: list[ClarificationQuestion] = []
     default_business, allowlisted, telegram_user_id = _should_default_business_for_telegram_receipt(
@@ -193,23 +219,51 @@ def ensure_receipt_review_questions(
             "I could not read the merchant name. Which store, restaurant, or vendor is this?",
         ),
         (
-            receipt.business_or_personal is None,
+            include_business_personal and receipt.business_or_personal is None,
             "business_or_personal",
             "Is this Business or Personal? Reply with Business, Personal, or add context like 'Business - Kartonsan dinner'.",
         ),
     ]
-    if include_business_context:
+    context_keys = (
+        DEFAULT_BUSINESS_CONTEXT_QUESTION_KEYS
+        if business_context_question_keys is None
+        else tuple(key for key in business_context_question_keys if key in BUSINESS_CONTEXT_QUESTION_KEYS)
+    )
+    if include_business_context and context_keys:
+        attendees_question_text = (
+            MEAL_ATTENDEES_QUESTION_TEXT
+            if "attendees" in context_keys and "business_reason" not in context_keys
+            else "Who attended or benefited from this expense? If not applicable, reply 'N/A'."
+        )
         specs.extend(
             [
                 (
-                    receipt.business_or_personal == "Business" and not receipt.business_reason,
+                    "business_reason" in context_keys
+                    and receipt.business_or_personal == "Business"
+                    and not receipt.business_reason,
                     "business_reason",
                     "What project, customer, or trip should this receipt be attached to?",
                 ),
                 (
-                    receipt.business_or_personal == "Business" and not receipt.attendees,
+                    "attendees" in context_keys
+                    and receipt.business_or_personal == "Business"
+                    and not receipt.attendees,
                     "attendees",
-                    "Who attended or benefited from this expense? If not applicable, reply 'N/A'.",
+                    attendees_question_text,
+                ),
+                (
+                    TELEGRAM_MEAL_CONTEXT_QUESTION_KEY in context_keys
+                    and receipt.business_or_personal != "Personal"
+                    and not receipt.attendees,
+                    TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
+                    TELEGRAM_MEAL_CONTEXT_QUESTION_TEXT,
+                ),
+                (
+                    TELEGRAM_MARKET_CONTEXT_QUESTION_KEY in context_keys
+                    and receipt.business_or_personal != "Personal"
+                    and not receipt.business_reason,
+                    TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+                    TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT,
                 ),
             ]
         )
@@ -247,13 +301,29 @@ def _receipt_has_open_questions(session: Session, receipt_id: int | None) -> boo
     )
 
 
-def _open_question_filters(user_id: int, *, include_business_context: bool) -> list:
+def _open_question_filters(
+    user_id: int,
+    *,
+    include_business_context: bool,
+    business_context_question_keys: tuple[str, ...] | None = None,
+) -> list:
     filters = [
         ClarificationQuestion.user_id == user_id,
         ClarificationQuestion.status == "open",
     ]
     if not include_business_context:
         filters.append(~ClarificationQuestion.question_key.in_(BUSINESS_CONTEXT_QUESTION_KEYS))
+    elif business_context_question_keys is not None:
+        context_keys = tuple(key for key in business_context_question_keys if key in BUSINESS_CONTEXT_QUESTION_KEYS)
+        if not context_keys:
+            filters.append(~ClarificationQuestion.question_key.in_(BUSINESS_CONTEXT_QUESTION_KEYS))
+        elif set(context_keys) != set(BUSINESS_CONTEXT_QUESTION_KEYS):
+            filters.append(
+                or_(
+                    ~ClarificationQuestion.question_key.in_(BUSINESS_CONTEXT_QUESTION_KEYS),
+                    ClarificationQuestion.question_key.in_(context_keys),
+                )
+            )
     return filters
 
 
@@ -262,6 +332,7 @@ def next_open_question_for_user(
     user_id: int,
     *,
     include_business_context: bool = True,
+    business_context_question_keys: tuple[str, ...] | None = None,
 ) -> ClarificationQuestion | None:
     """Return the next clarification question to dispatch for ``user_id``.
 
@@ -293,7 +364,13 @@ def next_open_question_for_user(
     """
     most_recent = session.exec(
         select(ClarificationQuestion)
-        .where(*_open_question_filters(user_id, include_business_context=include_business_context))
+        .where(
+            *_open_question_filters(
+                user_id,
+                include_business_context=include_business_context,
+                business_context_question_keys=business_context_question_keys,
+            )
+        )
         .order_by(
             ClarificationQuestion.created_at.desc(),
             ClarificationQuestion.id.desc(),
@@ -309,6 +386,7 @@ def next_open_question_for_user(
         user_id,
         receipt_id,
         include_business_context=include_business_context,
+        business_context_question_keys=business_context_question_keys,
     )
 
 
@@ -318,13 +396,18 @@ def next_open_question_for_receipt(
     receipt_id: int | None,
     *,
     include_business_context: bool = True,
+    business_context_question_keys: tuple[str, ...] | None = None,
 ) -> ClarificationQuestion | None:
     if receipt_id is None:
         return None
     return session.exec(
         select(ClarificationQuestion)
         .where(
-            *_open_question_filters(user_id, include_business_context=include_business_context),
+            *_open_question_filters(
+                user_id,
+                include_business_context=include_business_context,
+                business_context_question_keys=business_context_question_keys,
+            ),
             ClarificationQuestion.receipt_document_id == receipt_id,
         )
         .order_by(
@@ -395,6 +478,57 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
                     user_id=question.user_id,
                     question_key="business_or_personal_retry",
                     question_text="I could not tell if that means Business or Personal. Which one should I use?",
+                )
+            )
+        receipt.updated_at = datetime.now(timezone.utc)
+        session.add(receipt)
+
+    elif receipt and question.question_key in {
+        TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
+        TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+        f"{TELEGRAM_MEAL_CONTEXT_QUESTION_KEY}_retry",
+        f"{TELEGRAM_MARKET_CONTEXT_QUESTION_KEY}_retry",
+    }:
+        base_question_key = question.question_key.removesuffix("_retry")
+        lowered = answer.lower()
+        if "personal" in lowered and "business" not in lowered:
+            receipt.business_or_personal = "Personal"
+            receipt.needs_clarification = False
+        elif "business" in lowered:
+            receipt.business_or_personal = "Business"
+            context = _strip_business_context_prefix(answer_text)
+            if context:
+                if base_question_key == TELEGRAM_MEAL_CONTEXT_QUESTION_KEY:
+                    receipt.attendees = context
+                else:
+                    receipt.business_reason = context
+                receipt.needs_clarification = False
+            else:
+                receipt.needs_clarification = True
+                new_questions.append(
+                    ClarificationQuestion(
+                        receipt_document_id=receipt.id,
+                        user_id=question.user_id,
+                        question_key=f"{base_question_key}_retry",
+                        question_text=(
+                            TELEGRAM_MEAL_CONTEXT_QUESTION_TEXT
+                            if base_question_key == TELEGRAM_MEAL_CONTEXT_QUESTION_KEY
+                            else TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT
+                        ),
+                    )
+                )
+        else:
+            receipt.needs_clarification = True
+            new_questions.append(
+                ClarificationQuestion(
+                    receipt_document_id=receipt.id,
+                    user_id=question.user_id,
+                    question_key=f"{base_question_key}_retry",
+                    question_text=(
+                        TELEGRAM_MEAL_CONTEXT_QUESTION_TEXT
+                        if base_question_key == TELEGRAM_MEAL_CONTEXT_QUESTION_KEY
+                        else TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT
+                    ),
                 )
             )
         receipt.updated_at = datetime.now(timezone.utc)
@@ -501,7 +635,18 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
 
     if receipt:
         still_missing = not receipt.extracted_date or receipt.extracted_local_amount is None or not receipt.extracted_supplier or not receipt.business_or_personal
-        needs_business_context = receipt.business_or_personal == "Business" and (not receipt.business_reason or not receipt.attendees)
+        if question.question_key in {
+            TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
+            f"{TELEGRAM_MEAL_CONTEXT_QUESTION_KEY}_retry",
+        }:
+            needs_business_context = receipt.business_or_personal == "Business" and not receipt.attendees
+        elif question.question_key in {
+            TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+            f"{TELEGRAM_MARKET_CONTEXT_QUESTION_KEY}_retry",
+        }:
+            needs_business_context = receipt.business_or_personal == "Business" and not receipt.business_reason
+        else:
+            needs_business_context = receipt.business_or_personal == "Business" and (not receipt.business_reason or not receipt.attendees)
         receipt.needs_clarification = still_missing or needs_business_context or bool(new_questions)
         receipt.updated_at = datetime.now(timezone.utc)
         session.add(receipt)
@@ -510,3 +655,12 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
     for new_question in new_questions:
         session.refresh(new_question)
     return new_questions
+
+
+def _strip_business_context_prefix(answer_text: str) -> str:
+    text = answer_text.strip()
+    lowered = text.lower()
+    if "business" not in lowered:
+        return text
+    start = lowered.find("business") + len("business")
+    return text[start:].lstrip(" :-,;").strip()

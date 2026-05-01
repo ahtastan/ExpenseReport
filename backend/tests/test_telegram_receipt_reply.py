@@ -155,17 +155,31 @@ def test_gate_off_sends_no_ai_assisted_reply(monkeypatch):
     assert fake.messages[-1] == "Receipt saved."
 
 
-def test_user_not_allowlisted_sends_no_ai_assisted_reply(monkeypatch):
+def test_user_not_allowlisted_receives_summary_but_no_followup_questions(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="99999")
     fake = _install_fake_client(monkeypatch)
-    _patch_extraction(monkeypatch, business_or_personal="Personal")
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="BOSNAK DONER SERBAY",
+        report_bucket=None,
+    )
 
     with Session(engine) as session:
         result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
 
     assert result["action"] == "receipt_captured"
-    assert "Receipt received." not in "\n".join(fake.messages)
-    assert fake.messages[-1] == "Receipt saved."
+    assert result["ai_receipt_reply_sent"] is True
+    assert questions == []
+    reply = fake.messages[-1]
+    assert reply.startswith("Receipt received.")
+    assert "Supplier: BOSNAK DONER SERBAY" in reply
+    assert "This looks like a food or meal receipt." in reply
+    assert "business or personal" not in reply.lower()
+    assert "who was included" not in reply.lower()
 
 
 def test_gate_on_allowlisted_sends_deterministic_receipt_summary(monkeypatch):
@@ -230,8 +244,10 @@ def test_ai_receipt_reply_upload_does_not_seed_business_context_questions_for_no
     assert receipt.needs_clarification is False
     reply = fake.messages[-1]
     assert "Receipt received." in reply
+    assert "This looks like a gas receipt." in reply
     assert "business purpose" not in reply.lower()
     assert "attendees" not in reply.lower()
+    assert "business or personal" not in reply.lower()
 
 
 def test_ai_receipt_reply_upload_seeds_business_context_questions_for_meal(monkeypatch):
@@ -253,11 +269,17 @@ def test_ai_receipt_reply_upload_seeds_business_context_questions_for_meal(monke
 
     assert result["action"] == "receipt_captured"
     assert result["ai_receipt_reply_sent"] is True
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert [question.question_key for question in questions] == ["telegram_meal_context"]
     assert receipt is not None
     assert receipt.needs_clarification is True
     assert fake.messages[-2].startswith("Receipt received.")
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert fake.messages[-1] == (
+        "Was this business or personal spending?\n"
+        "If business, please reply with who was included.\n"
+        "Example: business, Hakan only or business, Hakan + customer: Ahmet Yılmaz.\n"
+        "If personal, reply personal."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_ai_receipt_reply_treats_bosnak_et_serbay_as_meal(monkeypatch):
@@ -277,8 +299,14 @@ def test_ai_receipt_reply_treats_bosnak_et_serbay_as_meal(monkeypatch):
         questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
 
     assert result["ai_receipt_reply_sent"] is True
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert [question.question_key for question in questions] == ["telegram_meal_context"]
+    assert fake.messages[-1] == (
+        "Was this business or personal spending?\n"
+        "If business, please reply with who was included.\n"
+        "Example: business, Hakan only or business, Hakan + customer: Ahmet Yılmaz.\n"
+        "If personal, reply personal."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_ai_receipt_reply_meal_context_flow_advances_on_latest_receipt(monkeypatch):
@@ -304,16 +332,8 @@ def test_ai_receipt_reply_meal_context_flow_advances_on_latest_receipt(monkeypat
             ClarificationQuestion(
                 receipt_document_id=receipt.id,
                 user_id=user.id,
-                question_key="business_reason",
-                question_text="What project, customer, or trip should this receipt be attached to?",
-            )
-        )
-        session.add(
-            ClarificationQuestion(
-                receipt_document_id=receipt.id,
-                user_id=user.id,
-                question_key="attendees",
-                question_text="Who attended or benefited from this expense? If not applicable, reply 'N/A'.",
+                question_key="telegram_meal_context",
+                question_text="Was this business or personal spending?",
             )
         )
         session.commit()
@@ -323,7 +343,7 @@ def test_ai_receipt_reply_meal_context_flow_advances_on_latest_receipt(monkeypat
             "message_id": 9004,
             "from": {"id": 41001, "first_name": "Op"},
             "chat": {"id": 51001},
-            "text": "Lunch with MRS",
+            "text": "business, Hakan only",
         }
     }
     with Session(engine) as session:
@@ -332,10 +352,152 @@ def test_ai_receipt_reply_meal_context_flow_advances_on_latest_receipt(monkeypat
         questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
 
     assert result["action"] == "answered_clarification"
-    assert receipt_row.business_reason == "Lunch with MRS"
-    assert questions[0].status == "answered"
-    assert questions[1].status == "open"
-    assert fake.messages[-1] == "Who attended or benefited from this expense? If not applicable, reply 'N/A'."
+    assert receipt_row.business_or_personal == "Business"
+    assert receipt_row.attendees == "Hakan only"
+    assert [question.status for question in questions] == ["answered"]
+    assert fake.messages[-1] == "Got it. I saved that clarification."
+
+
+def test_telegram_meal_context_personal_answer_closes_without_attendees(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "BOSNAK DONER SERBAY"
+        receipt.business_or_personal = None
+        receipt.uploader_user_id = user.id
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=receipt.id,
+                user_id=user.id,
+                question_key="telegram_meal_context",
+                question_text="Was this business or personal spending?",
+            )
+        )
+        session.commit()
+
+    payload = {
+        "message": {
+            "message_id": 9005,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": "personal",
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.exec(select(ReceiptDocument)).first()
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "answered_clarification"
+    assert receipt_row.business_or_personal == "Personal"
+    assert receipt_row.attendees is None
+    assert receipt_row.needs_clarification is False
+    assert [question.status for question in questions] == ["answered"]
+    assert fake.messages[-1] == "Got it. I saved that clarification."
+
+
+def test_telegram_meal_context_business_answer_stores_attendees(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "BOSNAK DONER SERBAY"
+        receipt.business_or_personal = None
+        receipt.uploader_user_id = user.id
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=receipt.id,
+                user_id=user.id,
+                question_key="telegram_meal_context",
+                question_text="Was this business or personal spending?",
+            )
+        )
+        session.commit()
+
+    payload = {
+        "message": {
+            "message_id": 9006,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": "business, Hakan + customer: Ahmet Yilmaz",
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.exec(select(ReceiptDocument)).first()
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "answered_clarification"
+    assert receipt_row.business_or_personal == "Business"
+    assert receipt_row.attendees == "Hakan + customer: Ahmet Yilmaz"
+    assert receipt_row.needs_clarification is False
+    assert [question.status for question in questions] == ["answered"]
+    assert fake.messages[-1] == "Got it. I saved that clarification."
+
+
+def test_telegram_market_context_business_answer_stores_who_it_was_for(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "Serbest Market"
+        receipt.business_or_personal = None
+        receipt.uploader_user_id = user.id
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=receipt.id,
+                user_id=user.id,
+                question_key="telegram_market_context",
+                question_text="Was this business or personal spending?",
+            )
+        )
+        session.commit()
+
+    payload = {
+        "message": {
+            "message_id": 9007,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": "business, EDT team",
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.exec(select(ReceiptDocument)).first()
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "answered_clarification"
+    assert receipt_row.business_or_personal == "Business"
+    assert receipt_row.business_reason == "EDT team"
+    assert receipt_row.attendees is None
+    assert receipt_row.needs_clarification is False
+    assert [question.status for question in questions] == ["answered"]
+    assert fake.messages[-1] == "Got it. I saved that clarification."
 
 
 def test_ai_receipt_reply_text_ignores_stale_business_context_questions(monkeypatch):
@@ -529,9 +691,15 @@ def test_ai_receipt_reply_duplicate_seeds_meal_context_questions(monkeypatch):
         questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
 
     assert result["action"] == "receipt_duplicate"
-    assert result["questions_created"] == 2
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert result["questions_created"] == 1
+    assert [question.question_key for question in questions] == ["telegram_meal_context"]
+    assert fake.messages[-1] == (
+        "Was this business or personal spending?\n"
+        "If business, please reply with who was included.\n"
+        "Example: business, Hakan only or business, Hakan + customer: Ahmet Yılmaz.\n"
+        "If personal, reply personal."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_ai_advisory_result_included_uses_advisory_only_copy():
@@ -708,9 +876,70 @@ def test_live_ai_second_read_controls_meal_context_when_ocr_supplier_is_ambiguou
     assert result["action"] == "receipt_captured"
     assert result["ai_receipt_reply_sent"] is True
     assert calls
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert [question.question_key for question in questions] == ["telegram_meal_context"]
     assert "AI second read is advisory only." in fake.messages[-2]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert fake.messages[-1] == (
+        "Was this business or personal spending?\n"
+        "If business, please reply with who was included.\n"
+        "Example: business, Hakan only or business, Hakan + customer: Ahmet Yılmaz.\n"
+        "If personal, reply personal."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
+
+
+def test_live_ai_second_read_large_meal_still_asks_attendees_only(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake = _install_fake_client(monkeypatch)
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="SERBAY",
+        report_bucket=None,
+    )
+
+    def fake_live(**kwargs):
+        return telegram_receipt_reply.agent_receipt_live_provider.LiveAgentReceiptReviewResult(
+            agent_payload={
+                "merchant_name": "BOSNAK DONER SERBAY",
+                "merchant_address": None,
+                "receipt_date": "2025-11-29",
+                "receipt_time": None,
+                "total_amount": "2400.00",
+                "currency": "TRY",
+                "amount_text": "2400.00 TRY",
+                "line_items": [],
+                "tax_amount": None,
+                "payment_method": None,
+                "receipt_category": "meal",
+                "confidence": 0.91,
+                "raw_text_summary": "Visible receipt is from a doner lunch place.",
+                "business_context_needed": True,
+                "business_context_reason": "meal receipt with high amount",
+            },
+            raw_response_json=json.dumps({"supplier": "BOSNAK DONER SERBAY"}),
+            prompt_text="hidden prompt",
+            model_name="gpt-live-test",
+        )
+
+    monkeypatch.setattr(
+        telegram_receipt_reply.agent_receipt_live_provider,
+        "call_live_agent_receipt_review",
+        fake_live,
+    )
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "receipt_captured"
+    assert result["ai_receipt_reply_sent"] is True
+    assert [question.question_key for question in questions] == ["telegram_meal_context"]
+    assert "who was included" in fake.messages[-1].lower()
+    assert "business or personal spending" in fake.messages[-1].lower()
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_live_ai_second_read_does_not_ask_meal_context_for_fuel_even_if_business_context_true(monkeypatch):
@@ -768,9 +997,10 @@ def test_live_ai_second_read_does_not_ask_meal_context_for_fuel_even_if_business
     assert "AI context: This looks like a gas receipt." in fake.messages[-1]
     assert "project, customer, or trip" not in fake.messages[-1].lower()
     assert "attended" not in fake.messages[-1].lower()
+    assert "business or personal" not in fake.messages[-1].lower()
 
 
-def test_live_ai_second_read_reply_labels_market_snacks_without_business_context_questions(monkeypatch):
+def test_live_ai_second_read_market_snacks_asks_allowlisted_business_personal_context(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     fake = _install_fake_client(monkeypatch)
@@ -824,8 +1054,10 @@ def test_live_ai_second_read_reply_labels_market_snacks_without_business_context
 
     assert result["action"] == "receipt_captured"
     assert result["ai_receipt_reply_sent"] is True
-    assert questions == []
-    assert "AI context: This looks like market/snacks." in fake.messages[-1]
+    assert [question.question_key for question in questions] == ["telegram_market_context"]
+    assert "AI context: This looks like market/snacks." in fake.messages[-2]
+    assert "business or personal spending" in fake.messages[-1].lower()
+    assert "who it was for" in fake.messages[-1].lower()
     assert "project, customer, or trip" not in fake.messages[-1].lower()
     assert "attended" not in fake.messages[-1].lower()
 
@@ -880,9 +1112,15 @@ def test_live_ai_second_read_asks_context_for_bosnak_even_if_model_calls_it_meat
 
     assert result["action"] == "receipt_captured"
     assert result["ai_receipt_reply_sent"] is True
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert [question.question_key for question in questions] == ["telegram_meal_context"]
     assert "AI second read is advisory only." in fake.messages[-2]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert fake.messages[-1] == (
+        "Was this business or personal spending?\n"
+        "If business, please reply with who was included.\n"
+        "Example: business, Hakan only or business, Hakan + customer: Ahmet Yılmaz.\n"
+        "If personal, reply personal."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_duplicate_live_ai_second_read_controls_meal_context_when_ocr_supplier_is_ambiguous(monkeypatch):
@@ -944,10 +1182,16 @@ def test_duplicate_live_ai_second_read_controls_meal_context_when_ocr_supplier_i
         questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
 
     assert result["action"] == "receipt_duplicate"
-    assert result["questions_created"] == 2
+    assert result["questions_created"] == 1
     assert calls
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert [question.question_key for question in questions] == ["telegram_meal_context"]
+    assert fake.messages[-1] == (
+        "Was this business or personal spending?\n"
+        "If business, please reply with who was included.\n"
+        "Example: business, Hakan only or business, Hakan + customer: Ahmet Yılmaz.\n"
+        "If personal, reply personal."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_duplicate_live_ai_sends_ai_reply_when_no_questions(monkeypatch):
@@ -1007,12 +1251,14 @@ def test_duplicate_live_ai_sends_ai_reply_when_no_questions(monkeypatch):
         questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
 
     assert result["action"] == "receipt_duplicate"
-    assert result["questions_created"] == 0
-    assert questions == []
-    assert fake.messages[-1].startswith("Receipt received.")
-    assert "Supplier: Serbest Market" in fake.messages[-1]
-    assert "AI context: This looks like market/snacks." in fake.messages[-1]
-    assert fake.messages[-1] != "Receipt saved."
+    assert result["questions_created"] == 1
+    assert [question.question_key for question in questions] == ["telegram_market_context"]
+    assert fake.messages[-2].startswith("Receipt received.")
+    assert "Supplier: Serbest Market" in fake.messages[-2]
+    assert "AI context: This looks like market/snacks." in fake.messages[-2]
+    assert "business or personal spending" in fake.messages[-1].lower()
+    assert "who it was for" in fake.messages[-1].lower()
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_live_model_failure_falls_back_to_deterministic_reply(monkeypatch):

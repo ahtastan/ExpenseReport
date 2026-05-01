@@ -119,6 +119,28 @@ Build the private-server backend for an OpenClaw/Telegram expense bot where cowo
 - Addition B annotated receipt PDF adjustment committed in two checkpoints: `4b5aa22` (`Fix receipt PDF review-row grouping`) and `45ca67b` (`Improve multi-date receipt subtotal labels`). `ReceiptAnnotationLine` and `ReportLine` now carry `review_row_id`; receipt color assignment keys by `review_row_id` instead of `transaction_id`; report lines sort by `transaction_date` and `review_row_id`. Receipt evidence pages use date-ordered packing with the existing 9-receipt cap, low-volume receipts from different dates may share a page, and same-day groups above 9 receipts split across pages. Multi-date receipt evidence pages now add a compact `Date subtotals:` header line while retaining the existing date range and combined total. Full suite: `python -m pytest tests/ -x --tb=short` -> 87 passed, 1 skipped.
 - Addition B PDF visual verification generated `backend/.verify_data/pdf_visual_sample/receipt_evidence_multidate_subtotals.pdf`, plus rendered checks `receipt_evidence_page.png` and `receipt_legend_page.png`. Confirmed: 4 receipts packed onto one evidence page; receipt dates are in order (`2026-04-01`, `2026-04-01`, `2026-04-05`, `2026-04-06`); page header shows the date range; combined total is visible; `Date subtotals:` is visible/readable; first two receipts share the same border color because they share `review_row_id`; no layout/readability issue was found in the sample. `.claude/` and `cleanup_receipts.sql` remain untracked and unrelated.
 
+## Shadow AI / AgentDB state (verified 2026-05-01)
+
+Live in prod for allowlisted user only.
+
+Flags on VPS `/etc/dcexpense/env`:
+- `AI_TELEGRAM_REPLY_ENABLED=true`
+- `AI_TELEGRAM_REPLY_ALLOWLIST=8038997793` (Hakan only)
+- `AI_TELEGRAM_LIVE_MODEL_ENABLED=true`
+- `AI_AGENT_DB_WRITE_ENABLED` — unset, but does not gate the Telegram path
+  (only gates `scripts/run_agent_receipt_review.py --write-db`).
+  Tracked as backlog issue #85.
+
+Behavior:
+- Live OpenAI second-read runs on every receipt upload by allowlisted user.
+- AgentDB rows written from `telegram_receipt_reply.py:281`.
+- AgentDB is strictly advisory display — no canonical write-back path.
+  Verified by parallel CC + Codex audits, 2026-05-01.
+- Cost ~$0.04/receipt steady-state, baked into existing OCR cost.
+
+Future work tracked in docs/F-AI-Stage1-Telegram-Inline-Keyboard.md
+(in design as of 2026-05-01).
+
 ## Not Implemented Yet
 - Personal expense report categories, including Personal Car mileage reimbursement, are intentionally out of scope for now.
 - Live Telegram webhook registration against the real Bot API.

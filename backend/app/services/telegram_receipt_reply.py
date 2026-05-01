@@ -114,12 +114,21 @@ def should_include_receipt_business_context(
     receipt: ReceiptDocument,
     ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
 ) -> bool:
+    return bool(receipt_business_context_question_keys(receipt, ai_review=ai_review))
+
+
+def receipt_business_context_question_keys(
+    receipt: ReceiptDocument,
+    ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
     if _clean(receipt.business_or_personal).lower() != "business":
-        return False
+        return ()
     ai_decision = _business_context_decision_from_ai_review(ai_review)
-    if ai_decision is not None:
-        return ai_decision
-    return _is_meal_receipt(receipt)
+    if ai_decision is False:
+        return ()
+    if ai_decision is True or _is_meal_receipt(receipt):
+        return ("attendees",)
+    return ()
 
 
 def build_telegram_receipt_reply(

@@ -253,11 +253,15 @@ def test_ai_receipt_reply_upload_seeds_business_context_questions_for_meal(monke
 
     assert result["action"] == "receipt_captured"
     assert result["ai_receipt_reply_sent"] is True
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert [question.question_key for question in questions] == ["attendees"]
     assert receipt is not None
     assert receipt.needs_clarification is True
     assert fake.messages[-2].startswith("Receipt received.")
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert fake.messages[-1] == (
+        "Please reply with who was included in the meal. "
+        "Example: Hakan only, or Hakan + customer: Ahmet Yilmaz."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_ai_receipt_reply_treats_bosnak_et_serbay_as_meal(monkeypatch):
@@ -277,8 +281,12 @@ def test_ai_receipt_reply_treats_bosnak_et_serbay_as_meal(monkeypatch):
         questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
 
     assert result["ai_receipt_reply_sent"] is True
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert [question.question_key for question in questions] == ["attendees"]
+    assert fake.messages[-1] == (
+        "Please reply with who was included in the meal. "
+        "Example: Hakan only, or Hakan + customer: Ahmet Yilmaz."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_ai_receipt_reply_meal_context_flow_advances_on_latest_receipt(monkeypatch):
@@ -529,9 +537,13 @@ def test_ai_receipt_reply_duplicate_seeds_meal_context_questions(monkeypatch):
         questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
 
     assert result["action"] == "receipt_duplicate"
-    assert result["questions_created"] == 2
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert result["questions_created"] == 1
+    assert [question.question_key for question in questions] == ["attendees"]
+    assert fake.messages[-1] == (
+        "Please reply with who was included in the meal. "
+        "Example: Hakan only, or Hakan + customer: Ahmet Yilmaz."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_ai_advisory_result_included_uses_advisory_only_copy():
@@ -708,9 +720,67 @@ def test_live_ai_second_read_controls_meal_context_when_ocr_supplier_is_ambiguou
     assert result["action"] == "receipt_captured"
     assert result["ai_receipt_reply_sent"] is True
     assert calls
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert [question.question_key for question in questions] == ["attendees"]
     assert "AI second read is advisory only." in fake.messages[-2]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert fake.messages[-1] == (
+        "Please reply with who was included in the meal. "
+        "Example: Hakan only, or Hakan + customer: Ahmet Yilmaz."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
+
+
+def test_live_ai_second_read_large_meal_still_asks_attendees_only(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake = _install_fake_client(monkeypatch)
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="SERBAY",
+        report_bucket=None,
+    )
+
+    def fake_live(**kwargs):
+        return telegram_receipt_reply.agent_receipt_live_provider.LiveAgentReceiptReviewResult(
+            agent_payload={
+                "merchant_name": "BOSNAK DONER SERBAY",
+                "merchant_address": None,
+                "receipt_date": "2025-11-29",
+                "receipt_time": None,
+                "total_amount": "2400.00",
+                "currency": "TRY",
+                "amount_text": "2400.00 TRY",
+                "line_items": [],
+                "tax_amount": None,
+                "payment_method": None,
+                "receipt_category": "meal",
+                "confidence": 0.91,
+                "raw_text_summary": "Visible receipt is from a doner lunch place.",
+                "business_context_needed": True,
+                "business_context_reason": "meal receipt with high amount",
+            },
+            raw_response_json=json.dumps({"supplier": "BOSNAK DONER SERBAY"}),
+            prompt_text="hidden prompt",
+            model_name="gpt-live-test",
+        )
+
+    monkeypatch.setattr(
+        telegram_receipt_reply.agent_receipt_live_provider,
+        "call_live_agent_receipt_review",
+        fake_live,
+    )
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "receipt_captured"
+    assert result["ai_receipt_reply_sent"] is True
+    assert [question.question_key for question in questions] == ["attendees"]
+    assert "who was included in the meal" in fake.messages[-1].lower()
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_live_ai_second_read_does_not_ask_meal_context_for_fuel_even_if_business_context_true(monkeypatch):
@@ -880,9 +950,13 @@ def test_live_ai_second_read_asks_context_for_bosnak_even_if_model_calls_it_meat
 
     assert result["action"] == "receipt_captured"
     assert result["ai_receipt_reply_sent"] is True
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
+    assert [question.question_key for question in questions] == ["attendees"]
     assert "AI second read is advisory only." in fake.messages[-2]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert fake.messages[-1] == (
+        "Please reply with who was included in the meal. "
+        "Example: Hakan only, or Hakan + customer: Ahmet Yilmaz."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_duplicate_live_ai_second_read_controls_meal_context_when_ocr_supplier_is_ambiguous(monkeypatch):
@@ -944,10 +1018,14 @@ def test_duplicate_live_ai_second_read_controls_meal_context_when_ocr_supplier_i
         questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
 
     assert result["action"] == "receipt_duplicate"
-    assert result["questions_created"] == 2
+    assert result["questions_created"] == 1
     assert calls
-    assert [question.question_key for question in questions] == ["business_reason", "attendees"]
-    assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+    assert [question.question_key for question in questions] == ["attendees"]
+    assert fake.messages[-1] == (
+        "Please reply with who was included in the meal. "
+        "Example: Hakan only, or Hakan + customer: Ahmet Yilmaz."
+    )
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_duplicate_live_ai_sends_ai_reply_when_no_questions(monkeypatch):

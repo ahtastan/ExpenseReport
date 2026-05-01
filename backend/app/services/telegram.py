@@ -25,6 +25,7 @@ from app.services.statement_import import import_diners_excel
 from app.services.telegram_receipt_reply import (
     maybe_create_telegram_receipt_ai_review,
     maybe_send_telegram_receipt_reply,
+    receipt_business_context_question_keys,
     should_include_receipt_business_context,
     should_send_ai_receipt_reply,
 )
@@ -260,11 +261,17 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                         if receipt is not None
                         else False
                     )
+                    business_context_question_keys = (
+                        receipt_business_context_question_keys(receipt)
+                        if receipt is not None
+                        else ()
+                    )
                     follow_up = next_open_question_for_receipt(
                         session,
                         user.id,
                         open_question.receipt_document_id,
                         include_business_context=include_business_context,
+                        business_context_question_keys=business_context_question_keys,
                     )
                 else:
                     follow_up = next_open_question_for_user(session, user.id)
@@ -356,28 +363,26 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                     settings=settings,
                     receipt=existing,
                 )
-                include_business_context = should_include_receipt_business_context(existing, ai_review=ai_review)
+                business_context_question_keys = receipt_business_context_question_keys(existing, ai_review=ai_review)
+                include_business_context = bool(business_context_question_keys)
                 duplicate_questions = ensure_receipt_review_questions(
                     session,
                     existing,
                     user.id,
                     include_business_context=include_business_context,
+                    business_context_question_keys=business_context_question_keys,
                 )
             else:
                 include_business_context = True
-            open_questions = session.exec(
-                select(ClarificationQuestion)
-                .where(
-                    ClarificationQuestion.receipt_document_id == existing.id,
-                    ClarificationQuestion.status == "open",
-                    *(
-                        []
-                        if include_business_context
-                        else [~ClarificationQuestion.question_key.in_(BUSINESS_CONTEXT_QUESTION_KEYS)]
-                    ),
-                )
-                .order_by(ClarificationQuestion.id)
-            ).all()
+                business_context_question_keys = BUSINESS_CONTEXT_QUESTION_KEYS
+            next_question = next_open_question_for_receipt(
+                session,
+                user.id,
+                existing.id,
+                include_business_context=include_business_context,
+                business_context_question_keys=business_context_question_keys,
+            )
+            open_questions = [next_question] if next_question is not None else []
             ai_receipt_reply_sent = False
             if ai_receipt_reply_allowed:
                 ai_receipt_reply_sent = maybe_send_telegram_receipt_reply(
@@ -458,11 +463,17 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         if ai_receipt_reply_allowed
         else True
     )
+    business_context_question_keys = (
+        receipt_business_context_question_keys(receipt, ai_review=ai_review)
+        if ai_receipt_reply_allowed
+        else BUSINESS_CONTEXT_QUESTION_KEYS
+    )
     questions = ensure_receipt_review_questions(
         session,
         receipt,
         user.id,
         include_business_context=include_business_context,
+        business_context_question_keys=business_context_question_keys,
     )
     ai_receipt_reply_sent = maybe_send_telegram_receipt_reply(
         session,

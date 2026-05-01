@@ -19,6 +19,10 @@ from sqlmodel import Session
 from app.models import ReceiptDocument
 from app.services.merchant_buckets import suggest_bucket
 from app.services import agent_receipt_live_provider
+from app.services.clarifications import (
+    TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+    TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
+)
 from app.services.agent_receipt_review_persistence import (
     build_canonical_receipt_snapshot,
     latest_ai_review_for_receipt,
@@ -106,6 +110,12 @@ def should_send_ai_receipt_reply(settings: Any, telegram_user_id: int | None) ->
         return False
     if telegram_user_id is None:
         return False
+    return True
+
+
+def should_send_telegram_receipt_followups(settings: Any, telegram_user_id: int | None) -> bool:
+    if telegram_user_id is None:
+        return False
     allowlist = set(getattr(settings, "ai_telegram_reply_allowlist", set()) or set())
     return telegram_user_id in allowlist
 
@@ -121,13 +131,13 @@ def receipt_business_context_question_keys(
     receipt: ReceiptDocument,
     ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
 ) -> tuple[str, ...]:
-    if _clean(receipt.business_or_personal).lower() != "business":
+    if _clean(receipt.business_or_personal).lower() == "personal":
         return ()
-    ai_decision = _business_context_decision_from_ai_review(ai_review)
-    if ai_decision is False:
-        return ()
-    if ai_decision is True or _is_meal_receipt(receipt):
-        return ("attendees",)
+    context_kind = _receipt_context_kind(receipt, ai_review=ai_review)
+    if context_kind == "meal":
+        return (TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,)
+    if context_kind == "market":
+        return (TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,)
     return ()
 
 
@@ -145,12 +155,15 @@ def build_telegram_receipt_reply(
         lines.append("I read:")
         lines.extend(field_lines)
 
+    context_note = _receipt_context_note(receipt, ai_review=ai_review)
+
     if ai_review is not None:
         lines.append("")
         lines.append("AI second read is advisory only.")
-        context_note = _ai_context_note(ai_review)
-        if context_note:
-            lines.append(context_note)
+    if context_note:
+        if ai_review is None:
+            lines.append("")
+        lines.append(context_note)
 
     return "\n".join(lines)
 
@@ -281,6 +294,55 @@ def _ai_context_note(ai_review: TelegramReceiptAIReview | Mapping[str, Any] | No
         return "AI context: This looks like market/snacks."
     if category in _BUSINESS_CONTEXT_CATEGORIES or _text_suggests_business_context(context_text):
         return "AI context: This looks like a food or meal receipt."
+    return None
+
+
+def _receipt_context_note(
+    receipt: ReceiptDocument,
+    ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
+) -> str | None:
+    if ai_review is not None:
+        return _ai_context_note(ai_review)
+    context_kind = _receipt_context_kind(receipt, ai_review=None)
+    if context_kind == "fuel":
+        return "Context: This looks like a gas receipt."
+    if context_kind == "market":
+        return "Context: This looks like market/snacks."
+    if context_kind == "meal":
+        return "Context: This looks like a food or meal receipt."
+    return None
+
+
+def _receipt_context_kind(
+    receipt: ReceiptDocument,
+    ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
+) -> str | None:
+    payload = _ai_payload(ai_review) if ai_review is not None else None
+    if isinstance(payload, Mapping):
+        context_text = _ai_context_text(payload)
+        category = _clean(payload.get("business_context_category") or payload.get("receipt_category")).lower()
+        if category in {"fuel", "gas", "gasoline", "petrol"} or _text_suggests_hard_non_context(context_text):
+            return "fuel"
+        if category in {"market", "grocery", "supermarket"} or _text_suggests_market_snacks(context_text):
+            return "market"
+        if category in _BUSINESS_CONTEXT_CATEGORIES or _text_suggests_business_context(context_text):
+            return "meal"
+
+    receipt_text = " ".join(
+        part
+        for part in (
+            _clean(receipt.extracted_supplier),
+            _clean(receipt.report_bucket),
+            _clean(receipt.receipt_type),
+        )
+        if part
+    ).lower()
+    if _text_suggests_hard_non_context(receipt_text):
+        return "fuel"
+    if _text_suggests_market_snacks(receipt_text):
+        return "market"
+    if _is_meal_receipt(receipt):
+        return "meal"
     return None
 
 

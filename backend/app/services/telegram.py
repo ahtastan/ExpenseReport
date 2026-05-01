@@ -12,7 +12,6 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.models import AppUser, ClarificationQuestion, ReceiptDocument
 from app.services.clarifications import (
-    BUSINESS_CONTEXT_QUESTION_KEYS,
     answer_question,
     ensure_receipt_review_questions,
     next_open_question_for_receipt,
@@ -28,6 +27,7 @@ from app.services.telegram_receipt_reply import (
     receipt_business_context_question_keys,
     should_include_receipt_business_context,
     should_send_ai_receipt_reply,
+    should_send_telegram_receipt_followups,
 )
 
 logger = logging.getLogger(__name__)
@@ -221,10 +221,11 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
 
     user = upsert_telegram_user(session, user_payload)
     ai_receipt_reply_allowed = should_send_ai_receipt_reply(settings, user.telegram_user_id)
+    ai_receipt_followups_allowed = should_send_telegram_receipt_followups(settings, user.telegram_user_id)
 
     text = (message.get("text") or "").strip()
     if text:
-        if ai_receipt_reply_allowed:
+        if ai_receipt_reply_allowed and ai_receipt_followups_allowed:
             latest_receipt_id = _latest_receipt_id_for_user(session, user.id)
             latest_receipt = session.get(ReceiptDocument, latest_receipt_id) if latest_receipt_id is not None else None
             include_business_context = (
@@ -237,7 +238,14 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 user.id,
                 latest_receipt_id,
                 include_business_context=include_business_context,
+                business_context_question_keys=(
+                    receipt_business_context_question_keys(latest_receipt)
+                    if latest_receipt is not None
+                    else ()
+                ),
             )
+        elif ai_receipt_reply_allowed:
+            open_question = next_open_question_for_user(session, user.id, include_business_context=False)
         else:
             open_question = next_open_question_for_user(session, user.id)
         if open_question:
@@ -250,7 +258,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 # initial seeding). Ask the next still-open question so the
                 # user can keep progressing through the queue instead of
                 # getting stuck after a single "Got it".
-                if ai_receipt_reply_allowed:
+                if ai_receipt_reply_allowed and ai_receipt_followups_allowed:
                     receipt = (
                         session.get(ReceiptDocument, open_question.receipt_document_id)
                         if open_question.receipt_document_id is not None
@@ -273,6 +281,8 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                         include_business_context=include_business_context,
                         business_context_question_keys=business_context_question_keys,
                     )
+                elif ai_receipt_reply_allowed:
+                    follow_up = next_open_question_for_user(session, user.id, include_business_context=False)
                 else:
                     follow_up = next_open_question_for_user(session, user.id)
                 if follow_up:
@@ -363,6 +373,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                     settings=settings,
                     receipt=existing,
                 )
+            if ai_receipt_reply_allowed and ai_receipt_followups_allowed:
                 business_context_question_keys = receipt_business_context_question_keys(existing, ai_review=ai_review)
                 include_business_context = bool(business_context_question_keys)
                 duplicate_questions = ensure_receipt_review_questions(
@@ -371,10 +382,14 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                     user.id,
                     include_business_context=include_business_context,
                     business_context_question_keys=business_context_question_keys,
+                    include_business_personal=False,
                 )
+            elif ai_receipt_reply_allowed:
+                include_business_context = False
+                business_context_question_keys = ()
             else:
                 include_business_context = True
-                business_context_question_keys = BUSINESS_CONTEXT_QUESTION_KEYS
+                business_context_question_keys = None
             next_question = next_open_question_for_receipt(
                 session,
                 user.id,
@@ -458,23 +473,23 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         if ai_receipt_reply_allowed
         else None
     )
-    include_business_context = (
-        should_include_receipt_business_context(receipt, ai_review=ai_review)
-        if ai_receipt_reply_allowed
-        else True
-    )
-    business_context_question_keys = (
-        receipt_business_context_question_keys(receipt, ai_review=ai_review)
-        if ai_receipt_reply_allowed
-        else BUSINESS_CONTEXT_QUESTION_KEYS
-    )
-    questions = ensure_receipt_review_questions(
-        session,
-        receipt,
-        user.id,
-        include_business_context=include_business_context,
-        business_context_question_keys=business_context_question_keys,
-    )
+    if ai_receipt_reply_allowed:
+        business_context_question_keys = (
+            receipt_business_context_question_keys(receipt, ai_review=ai_review)
+            if ai_receipt_followups_allowed
+            else ()
+        )
+        include_business_context = bool(business_context_question_keys) if ai_receipt_followups_allowed else False
+        questions = ensure_receipt_review_questions(
+            session,
+            receipt,
+            user.id,
+            include_business_context=include_business_context,
+            business_context_question_keys=business_context_question_keys,
+            include_business_personal=False,
+        )
+    else:
+        questions = ensure_receipt_review_questions(session, receipt, user.id)
     ai_receipt_reply_sent = maybe_send_telegram_receipt_reply(
         session,
         client,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 from datetime import datetime
 
+from sqlalchemy import create_engine, inspect, text
 from sqlmodel import Session, select
 
 from app.db import engine
@@ -219,3 +220,151 @@ def test_backfill_source_tags_legacy_unknown() -> None:
         assert receipt.bucket_source == "legacy_unknown"
         assert receipt.business_reason_source == "legacy_unknown"
         assert receipt.attendees_source == "legacy_unknown"
+
+
+def _old_schema_column_names(target_engine, table_name: str) -> set[str]:
+    with target_engine.connect() as conn:
+        rows = conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+    return {row[1] for row in rows}
+
+
+def _create_old_stage1_schema(target_engine) -> None:
+    with target_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE receiptdocument (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    source VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    content_type VARCHAR NOT NULL,
+                    extracted_supplier VARCHAR,
+                    business_reason VARCHAR,
+                    attendees VARCHAR
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE agent_receipt_review_run (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    receipt_document_id INTEGER NOT NULL,
+                    run_source VARCHAR NOT NULL DEFAULT 'local_cli',
+                    run_kind VARCHAR NOT NULL DEFAULT 'receipt_second_read',
+                    status VARCHAR NOT NULL,
+                    schema_version VARCHAR NOT NULL,
+                    prompt_version VARCHAR NOT NULL,
+                    model_name VARCHAR NOT NULL DEFAULT 'local_mock',
+                    comparator_version VARCHAR NOT NULL,
+                    canonical_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    statement_snapshot_json TEXT,
+                    raw_model_json_redacted BOOLEAN NOT NULL DEFAULT 1
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE agent_receipt_read (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    run_id INTEGER NOT NULL,
+                    receipt_document_id INTEGER NOT NULL,
+                    read_schema_version VARCHAR NOT NULL,
+                    read_json TEXT NOT NULL DEFAULT '{}',
+                    currency VARCHAR,
+                    receipt_type VARCHAR,
+                    business_or_personal VARCHAR,
+                    business_reason TEXT,
+                    attendees_json TEXT,
+                    confidence_json TEXT,
+                    evidence_json TEXT,
+                    warnings_json TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO receiptdocument (
+                    id, source, status, content_type, extracted_supplier,
+                    business_reason, attendees
+                )
+                VALUES (
+                    1, 'telegram', 'extracted', 'photo', 'Legacy Cafe',
+                    'Existing customer meeting', 'Hakan'
+                )
+                """
+            )
+        )
+
+
+def test_migration_upgrades_existing_schema() -> None:
+    upgrade_engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    _create_old_stage1_schema(upgrade_engine)
+
+    expected_columns = {
+        "receiptdocument": {
+            "category_source",
+            "bucket_source",
+            "business_reason_source",
+            "attendees_source",
+        },
+        "agent_receipt_read": {
+            "suggested_business_or_personal",
+            "suggested_report_bucket",
+            "suggested_attendees_json",
+            "suggested_customer",
+            "suggested_business_reason",
+            "suggested_confidence_overall",
+        },
+        "agent_receipt_review_run": {
+            "context_window_json",
+        },
+    }
+
+    source_tag_backfill.create_new_tables(upgrade_engine)
+    first_added = source_tag_backfill.add_columns_if_missing(upgrade_engine)
+    source_tag_backfill.create_new_tables(upgrade_engine)
+    second_added = source_tag_backfill.add_columns_if_missing(upgrade_engine)
+
+    inspector = inspect(upgrade_engine)
+    assert "agent_receipt_user_response" in inspector.get_table_names()
+
+    for table_name, column_names in expected_columns.items():
+        actual_columns = _old_schema_column_names(upgrade_engine, table_name)
+        assert column_names.issubset(actual_columns)
+        assert len(actual_columns) == len(set(actual_columns))
+
+    with upgrade_engine.connect() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT id, source, status, content_type, extracted_supplier,
+                       business_reason, attendees
+                FROM receiptdocument
+                WHERE id = 1
+                """
+            )
+        ).mappings().one()
+
+    assert set(first_added) == {
+        f"{table}.{column}"
+        for table, columns in expected_columns.items()
+        for column in columns
+    }
+    assert second_added == []
+    assert dict(row) == {
+        "id": 1,
+        "source": "telegram",
+        "status": "extracted",
+        "content_type": "photo",
+        "extracted_supplier": "Legacy Cafe",
+        "business_reason": "Existing customer meeting",
+        "attendees": "Hakan",
+    }

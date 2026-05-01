@@ -11,6 +11,12 @@ from typing import Any, Literal, Mapping
 RiskLevel = Literal["pass", "warn", "block"]
 RecommendedAction = Literal["accept", "ask_user", "manual_review", "block_report"]
 
+# F-AI-Stage1 sub-PR 2: prompt/parser for the inline-keyboard run_kind.
+# Existing receipt-second-read constants stay unchanged; the new run_kind
+# uses a separate prompt version so persisted runs can be filtered.
+INLINE_KEYBOARD_PROMPT_VERSION = "agent_receipt_inline_keyboard_prompt_stage1_v1"
+INLINE_KEYBOARD_SCHEMA_VERSION = "stage1"
+
 _AMOUNT_TOLERANCE = Decimal("0.01")
 _LEGAL_SUPPLIER_SUFFIXES = {
     "as",
@@ -426,3 +432,201 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, list):
         return [_jsonable(item) for item in value]
     return value
+
+
+# ─── F-AI-Stage1 sub-PR 2: inline-keyboard run_kind ─────────────────────────
+#
+# A second prompt-builder + parser, parallel to the receipt-second-read
+# pipeline above. The inline-keyboard run_kind asks the model to propose a
+# complete classification (business/personal + bucket + attendees + customer
+# + business reason + a confidence score) given a per-user context window.
+# It does NOT extract OCR fields — those still come from the deterministic
+# pipeline plus the existing receipt-second-read run_kind.
+#
+# The model output is parsed into ``InlineKeyboardSuggestion`` and persisted
+# into the new ``suggested_*`` columns on ``agent_receipt_read``.
+
+
+@dataclass(frozen=True)
+class InlineKeyboardSuggestion:
+    """Parsed proposal from the inline-keyboard agent.
+
+    All fields default to None so a partial response (per spec — model may
+    omit ``customer`` for example) still produces a valid object. Unknown
+    keys in the raw response are dropped silently.
+    """
+
+    business_or_personal: str | None = None
+    report_bucket: str | None = None
+    attendees: list[str] | None = None
+    customer: str | None = None
+    business_reason: str | None = None
+    confidence_overall: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "business_or_personal": self.business_or_personal,
+            "report_bucket": self.report_bucket,
+            "attendees": list(self.attendees) if self.attendees is not None else None,
+            "customer": self.customer,
+            "business_reason": self.business_reason,
+            "confidence_overall": self.confidence_overall,
+        }
+
+
+def inline_keyboard_bucket_vocabulary() -> list[str]:
+    """Return the report_bucket values the suggester is allowed to propose.
+
+    Pulled from ``merchant_buckets._RULES`` so the AI's vocabulary stays
+    in sync with the deterministic suggester. The frontend's
+    ``REPORT_BUCKETS`` list is broader (covers all template rows including
+    ones the deterministic suggester never produces); the inline-keyboard
+    AI is constrained to the deterministic vocabulary here on purpose, so
+    operator review can rely on the same labels everywhere.
+    """
+    from app.services.merchant_buckets import _RULES  # local import: avoid load-order cycle
+
+    return sorted({rule.bucket for rule in _RULES})
+
+
+def build_inline_keyboard_review_prompt(
+    canonical: Mapping[str, Any],
+    context_window: Mapping[str, Any] | None,
+    *,
+    statement_context: Mapping[str, Any] | None = None,
+) -> str:
+    """Build the AI prompt for ``run_kind='receipt_inline_keyboard'``.
+
+    Asks the model to propose a complete classification (B/P, bucket,
+    attendees, customer, business_reason, confidence_overall) using the
+    receipt image plus the per-user context window.
+    """
+    canonical_json = json.dumps(_jsonable(dict(canonical)), indent=2, sort_keys=True)
+    context_json = json.dumps(
+        _jsonable(dict(context_window or {})),
+        indent=2,
+        sort_keys=True,
+    )
+    statement_json = json.dumps(
+        _jsonable(dict(statement_context or {})),
+        indent=2,
+        sort_keys=True,
+    )
+    bucket_vocab_json = json.dumps(inline_keyboard_bucket_vocabulary())
+    return f"""You are a shadow AI receipt classifier for a private, non-production expense reporting prototype.
+
+Read the attached receipt image. Propose a complete classification using the
+per-user context window below to ground your answer (employees the user works
+with, the user's recent classified receipts, and recent attendees on those
+receipts).
+
+Do not approve, match, report, or overwrite application data. Output is
+advisory; deterministic application code decides what to persist.
+
+If a classification is genuinely ambiguous, you may return null for the
+optional ``customer`` field; ``business_or_personal``, ``report_bucket``,
+``attendees``, ``business_reason``, and ``confidence_overall`` should
+always be populated.
+
+Allowed values:
+- ``business_or_personal``: "Business" or "Personal"
+- ``report_bucket``: one of {bucket_vocab_json}
+- ``attendees``: list of strings (use [] for solo / not-applicable)
+- ``customer``: string or null
+- ``business_reason``: short string
+- ``confidence_overall``: float in [0, 1]
+
+CONTEXT (last N days, this user only):
+{context_json}
+
+CANONICAL OCR fields (context only — the pipeline already has these):
+{canonical_json}
+
+STATEMENT row context (context only):
+{statement_json}
+
+Propose a complete classification. Output JSON with keys: business_or_personal,
+report_bucket, attendees (list of strings), customer (string or null),
+business_reason (string), confidence_overall (float 0–1).
+
+Strict JSON shape, no markdown or prose outside JSON:
+{{
+  "business_or_personal": null,
+  "report_bucket": null,
+  "attendees": [],
+  "customer": null,
+  "business_reason": null,
+  "confidence_overall": null
+}}
+"""
+
+
+def parse_inline_keyboard_response(raw_text: str) -> InlineKeyboardSuggestion | None:
+    """Parse a raw model response into an ``InlineKeyboardSuggestion``.
+
+    Returns ``None`` for malformed input (invalid JSON, non-object, empty
+    text, etc.). Partial responses are accepted: any of the six fields
+    may be missing → that field stays ``None``. Unknown keys in the raw
+    response are silently ignored.
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(parsed, dict):
+        return None
+    return InlineKeyboardSuggestion(
+        business_or_personal=_clean_optional_string(parsed.get("business_or_personal")),
+        report_bucket=_clean_optional_string(parsed.get("report_bucket")),
+        attendees=_coerce_attendee_list(parsed.get("attendees")),
+        customer=_clean_optional_string(parsed.get("customer")),
+        business_reason=_clean_optional_string(parsed.get("business_reason")),
+        confidence_overall=_coerce_unit_float(parsed.get("confidence_overall")),
+    )
+
+
+def _coerce_attendee_list(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        # Tolerate "Hakan, Burak" — split on the same separators the
+        # context builder uses, so test fixtures and model output align.
+        cleaned = [part.strip() for part in re.split(r"[,;+]", value)]
+        return [item for item in cleaned if item] or []
+    if isinstance(value, list):
+        return [
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        ]
+    return None
+
+
+def _coerce_unit_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    # Per spec: confidence_overall is in [0, 1]. Out-of-range values are
+    # clamped rather than dropped — the model occasionally returns 0–100.
+    if result > 1.0 and result <= 100.0:
+        result = result / 100.0
+    if result < 0.0:
+        return 0.0
+    if result > 1.0:
+        return 1.0
+    return result

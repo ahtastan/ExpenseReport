@@ -447,6 +447,29 @@ def open_telegram_context_question_keys_for_receipt(
     return tuple(dict.fromkeys(str(key) for key in keys))
 
 
+def next_open_telegram_context_question_for_user(
+    session: Session,
+    user_id: int,
+) -> ClarificationQuestion | None:
+    return session.exec(
+        select(ClarificationQuestion)
+        .where(
+            ClarificationQuestion.user_id == user_id,
+            ClarificationQuestion.status == "open",
+            ClarificationQuestion.question_key.in_(TELEGRAM_CONTEXT_QUESTION_KEYS),
+        )
+        .order_by(
+            ClarificationQuestion.created_at.desc(),
+            ClarificationQuestion.id.desc(),
+        )
+    ).first()
+
+
+def looks_like_telegram_context_answer(answer_text: str) -> bool:
+    text = answer_text.strip().lower()
+    return "business" in text or "personal" in text
+
+
 def answer_question(session: Session, question: ClarificationQuestion, answer: str) -> list[ClarificationQuestion]:
     answer_text = answer.strip()
     if question.question_key in {"receipt_date", "receipt_date_retry"} and _looks_like_non_answer(answer_text):

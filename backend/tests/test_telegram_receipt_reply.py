@@ -612,6 +612,104 @@ def test_telegram_market_context_personal_answer_variants_close_without_followup
     assert "Send me a receipt photo/PDF" not in fake.messages[-1]
 
 
+def test_telegram_personal_care_context_business_answer_stores_reason(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "Rossmann"
+        receipt.business_or_personal = None
+        receipt.uploader_user_id = user.id
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=receipt.id,
+                user_id=user.id,
+                question_key="telegram_personal_care_context",
+                question_text="If this was business spending, reply with the reason. If personal, reply personal.",
+            )
+        )
+        session.commit()
+
+    payload = {
+        "message": {
+            "message_id": 9015,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": "business, office hygiene supplies",
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.exec(select(ReceiptDocument)).one()
+        question = session.exec(select(ClarificationQuestion)).one()
+
+    assert result["action"] == "answered_clarification"
+    assert receipt_row.business_or_personal == "Business"
+    assert receipt_row.business_reason == "office hygiene supplies"
+    assert receipt_row.attendees is None
+    assert receipt_row.needs_clarification is False
+    assert question.status == "answered"
+    assert fake.messages[-1] == "Got it. I saved that clarification."
+    assert "Send me a receipt photo/PDF" not in fake.messages[-1]
+
+
+def test_telegram_personal_care_context_personal_answer_closes_without_reason(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "Rossmann"
+        receipt.business_or_personal = None
+        receipt.uploader_user_id = user.id
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=receipt.id,
+                user_id=user.id,
+                question_key="telegram_personal_care_context",
+                question_text="If this was business spending, reply with the reason. If personal, reply personal.",
+            )
+        )
+        session.commit()
+
+    payload = {
+        "message": {
+            "message_id": 9016,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": "personal",
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.exec(select(ReceiptDocument)).one()
+        question = session.exec(select(ClarificationQuestion)).one()
+
+    assert result["action"] == "answered_clarification"
+    assert receipt_row.business_or_personal == "Personal"
+    assert receipt_row.business_reason is None
+    assert receipt_row.attendees is None
+    assert receipt_row.needs_clarification is False
+    assert question.status == "answered"
+    assert fake.messages[-1] == "Got it. I saved that clarification."
+    assert "Send me a receipt photo/PDF" not in fake.messages[-1]
+
+
 def test_ai_receipt_reply_text_ignores_stale_business_context_questions(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
     fake = _install_fake_client(monkeypatch)
@@ -1369,6 +1467,72 @@ def test_live_ai_second_read_market_snacks_asks_allowlisted_business_personal_co
     assert "who it was for" in fake.messages[-1].lower()
     assert "project, customer, or trip" not in fake.messages[-1].lower()
     assert "attended" not in fake.messages[-1].lower()
+
+
+def test_live_ai_second_read_drugstore_personal_care_asks_reason_only(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake = _install_fake_client(monkeypatch)
+    _patch_extraction(
+        monkeypatch,
+        business_or_personal="Business",
+        business_reason=None,
+        attendees=None,
+        supplier="Rossmann",
+        report_bucket=None,
+    )
+
+    def fake_live(**kwargs):
+        return telegram_receipt_reply.agent_receipt_live_provider.LiveAgentReceiptReviewResult(
+            agent_payload={
+                "merchant_name": "Rossmann",
+                "merchant_address": None,
+                "receipt_date": "2026-05-01",
+                "receipt_time": None,
+                "total_amount": "423.50",
+                "currency": "TRY",
+                "amount_text": "423.50 TRY",
+                "line_items": [
+                    {"description": "facial tissue"},
+                    {"description": "hygiene personal care product"},
+                    {"description": "hair brush"},
+                ],
+                "tax_amount": None,
+                "payment_method": None,
+                "receipt_category": "market",
+                "confidence": 0.91,
+                "raw_text_summary": "Rossmann receipt with facial tissue, hygiene product, and hair brush.",
+                "business_context_needed": False,
+                "business_context_category": "market",
+                "business_context_reason": "drugstore and personal care items, not snacks",
+            },
+            raw_response_json=json.dumps({"business_context_category": "market"}),
+            prompt_text="hidden prompt",
+            model_name="gpt-live-test",
+        )
+
+    monkeypatch.setattr(
+        telegram_receipt_reply.agent_receipt_live_provider,
+        "call_live_agent_receipt_review",
+        fake_live,
+    )
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, _photo_payload(telegram_user_id=41001))
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "receipt_captured"
+    assert result["ai_receipt_reply_sent"] is True
+    assert [question.question_key for question in questions] == ["telegram_personal_care_context"]
+    assert "AI context: This looks like personal care / drugstore items." in fake.messages[-2]
+    assert "market/snacks" not in fake.messages[-2]
+    assert fake.messages[-1] == (
+        "If this was business spending, reply with the reason. If personal, reply personal."
+    )
+    assert "who was included" not in fake.messages[-1].lower()
+    assert "who it was for" not in fake.messages[-1].lower()
+    assert "attended" not in fake.messages[-1].lower()
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
 
 
 def test_live_ai_second_read_asks_context_for_bosnak_even_if_model_calls_it_meat_retail(monkeypatch):

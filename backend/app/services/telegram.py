@@ -14,6 +14,8 @@ from app.models import AppUser, ClarificationQuestion, ReceiptDocument
 from app.services.clarifications import (
     answer_question,
     ensure_receipt_review_questions,
+    looks_like_telegram_context_answer,
+    next_open_telegram_context_question_for_user,
     next_open_question_for_receipt,
     next_open_question_for_user,
     open_telegram_context_question_keys_for_receipt,
@@ -251,6 +253,8 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 include_business_context=include_business_context,
                 business_context_question_keys=business_context_question_keys,
             )
+            if open_question is None and looks_like_telegram_context_answer(text):
+                open_question = next_open_telegram_context_question_for_user(session, user.id)
         elif ai_receipt_reply_allowed:
             open_question = next_open_question_for_user(session, user.id, include_business_context=False)
         else:

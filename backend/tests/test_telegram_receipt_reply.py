@@ -714,6 +714,124 @@ def test_ai_receipt_reply_text_ignores_stale_ocr_question_from_older_receipt(mon
     assert old_receipt_row.extracted_supplier is None
 
 
+def test_ai_receipt_reply_routes_business_answer_to_recent_open_context_question(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+        pending_receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        pending_receipt.extracted_supplier = "CARREFOURSA"
+        pending_receipt.uploader_user_id = user.id
+        session.add(pending_receipt)
+        session.commit()
+        session.refresh(pending_receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=pending_receipt.id,
+                user_id=user.id,
+                question_key="telegram_market_context",
+                question_text="Was this business or personal spending?",
+            )
+        )
+
+        latest_receipt = _receipt(business_reason="Hakan", attendees=None, report_bucket=None)
+        latest_receipt.extracted_supplier = "Serbest Market"
+        latest_receipt.uploader_user_id = user.id
+        latest_receipt.needs_clarification = False
+        session.add(latest_receipt)
+        session.commit()
+        session.refresh(pending_receipt)
+        pending_receipt_id = pending_receipt.id
+
+    payload = {
+        "message": {
+            "message_id": 9013,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": "Business, Ahmet",
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.get(ReceiptDocument, pending_receipt_id)
+        question = session.exec(
+            select(ClarificationQuestion)
+            .where(ClarificationQuestion.receipt_document_id == pending_receipt_id)
+        ).one()
+
+    assert result["action"] == "answered_clarification"
+    assert receipt_row is not None
+    assert receipt_row.business_or_personal == "Business"
+    assert receipt_row.business_reason == "Ahmet"
+    assert receipt_row.needs_clarification is False
+    assert question.status == "answered"
+    assert fake.messages[-1] == "Got it. I saved that clarification."
+    assert "Send me a receipt photo/PDF" not in fake.messages[-1]
+
+
+def test_ai_receipt_reply_does_not_route_non_context_text_to_older_context_question(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+        pending_receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        pending_receipt.extracted_supplier = "CARREFOURSA"
+        pending_receipt.uploader_user_id = user.id
+        session.add(pending_receipt)
+        session.commit()
+        session.refresh(pending_receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=pending_receipt.id,
+                user_id=user.id,
+                question_key="telegram_market_context",
+                question_text="Was this business or personal spending?",
+            )
+        )
+
+        latest_receipt = _receipt(business_reason="Hakan", attendees=None, report_bucket=None)
+        latest_receipt.extracted_supplier = "Serbest Market"
+        latest_receipt.uploader_user_id = user.id
+        latest_receipt.needs_clarification = False
+        session.add(latest_receipt)
+        session.commit()
+        session.refresh(pending_receipt)
+        pending_receipt_id = pending_receipt.id
+
+    payload = {
+        "message": {
+            "message_id": 9014,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": "MRS",
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.get(ReceiptDocument, pending_receipt_id)
+        question = session.exec(
+            select(ClarificationQuestion)
+            .where(ClarificationQuestion.receipt_document_id == pending_receipt_id)
+        ).one()
+
+    assert result["action"] == "text_acknowledged"
+    assert receipt_row is not None
+    assert receipt_row.business_reason is None
+    assert question.status == "open"
+    assert question.answer_text is None
+    assert fake.messages[-1] == "Send me a receipt photo/PDF or a Diners statement, and I will file it for review."
+
+
 def test_ai_receipt_reply_still_asks_critical_ocr_questions(monkeypatch):
     _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
     fake = _install_fake_client(monkeypatch)

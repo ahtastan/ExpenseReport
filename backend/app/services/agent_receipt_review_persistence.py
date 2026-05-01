@@ -20,6 +20,8 @@ from app.models import (
 from app.services.agent_receipt_reviewer import (
     AgentReceiptRead as AgentReceiptReadPayload,
     AgentReceiptReviewResult,
+    INLINE_KEYBOARD_PROMPT_VERSION,
+    INLINE_KEYBOARD_SCHEMA_VERSION,
     build_agent_receipt_review_prompt,
     compare_agent_receipt_read,
 )
@@ -409,6 +411,7 @@ def write_mock_agent_receipt_review(
     receipt: ReceiptDocument,
     agent_json_text: str,
     run_source: str = "local_cli",
+    run_kind: str = "receipt_second_read",
     store_raw_model_json: bool = False,
     store_prompt_text: bool = False,
     app_git_sha: str | None = None,
@@ -419,6 +422,16 @@ def write_mock_agent_receipt_review(
     review_row_id: int | None = None,
     statement_transaction_id: int | None = None,
     statement_snapshot: Mapping[str, Any] | None = None,
+    # F-AI-Stage1 sub-PR 2: inline-keyboard suggestion fields. All
+    # default to None for backwards compatibility — every existing call
+    # site keeps working without modification.
+    suggested_business_or_personal: str | None = None,
+    suggested_report_bucket: str | None = None,
+    suggested_attendees: list[str] | None = None,
+    suggested_customer: str | None = None,
+    suggested_business_reason: str | None = None,
+    suggested_confidence_overall: float | None = None,
+    context_window: Mapping[str, Any] | None = None,
 ) -> AgentReceiptReviewWriteResult:
     """Persist one local/mock shadow review without mutating canonical rows.
 
@@ -426,12 +439,22 @@ def write_mock_agent_receipt_review(
     ``failed`` in the same transaction. Read/comparison rows are append-only
     artifacts and are inserted only for valid completed runs; reruns create a
     fresh run/read/comparison set.
+
+    For ``run_kind='receipt_inline_keyboard'`` (sub-PR 2): persists the run
+    with ``context_window_json`` and a read row whose ``suggested_*`` columns
+    are populated. No comparison row is written — the inline-keyboard run
+    proposes a classification, not an OCR re-extraction, so there is nothing
+    to compare against canonical OCR fields.
     """
 
     snapshot = build_canonical_receipt_snapshot(receipt)
     snapshot_json = _stable_json(snapshot)
     prompt_text = prompt_text_override or build_agent_receipt_review_prompt(snapshot)
     statement_snapshot_json = _stable_json(statement_snapshot) if statement_snapshot is not None else None
+    context_window_json = _stable_json(context_window) if context_window is not None else None
+    is_inline_keyboard = run_kind == "receipt_inline_keyboard"
+    schema_version_value = INLINE_KEYBOARD_SCHEMA_VERSION if is_inline_keyboard else SCHEMA_VERSION
+    prompt_version_value = INLINE_KEYBOARD_PROMPT_VERSION if is_inline_keyboard else PROMPT_VERSION
     now = utc_now()
     run = AgentReceiptReviewRun(
         receipt_document_id=receipt.id or 0,
@@ -439,10 +462,10 @@ def write_mock_agent_receipt_review(
         review_row_id=review_row_id,
         statement_transaction_id=statement_transaction_id,
         run_source=run_source,
-        run_kind="receipt_second_read",
+        run_kind=run_kind,
         status="started",
-        schema_version=SCHEMA_VERSION,
-        prompt_version=PROMPT_VERSION,
+        schema_version=schema_version_value,
+        prompt_version=prompt_version_value,
         prompt_hash=_sha256_text(prompt_text),
         model_provider=model_provider,
         model_name=model_name,
@@ -450,12 +473,14 @@ def write_mock_agent_receipt_review(
         app_git_sha=app_git_sha,
         canonical_snapshot_json=snapshot_json,
         statement_snapshot_json=statement_snapshot_json,
+        context_window_json=context_window_json,
         input_hash=_sha256_text(
             _stable_json(
                 {
                     "canonical": snapshot,
                     "statement": statement_snapshot,
                     "agent_json": agent_json_text,
+                    "context_window": dict(context_window) if context_window is not None else None,
                 }
             )
         ),
@@ -466,6 +491,21 @@ def write_mock_agent_receipt_review(
     )
     session.add(run)
     session.flush()
+
+    if is_inline_keyboard:
+        return _persist_inline_keyboard_run(
+            session,
+            run=run,
+            receipt=receipt,
+            agent_json_text=agent_json_text,
+            schema_version=schema_version_value,
+            suggested_business_or_personal=suggested_business_or_personal,
+            suggested_report_bucket=suggested_report_bucket,
+            suggested_attendees=suggested_attendees,
+            suggested_customer=suggested_customer,
+            suggested_business_reason=suggested_business_reason,
+            suggested_confidence_overall=suggested_confidence_overall,
+        )
 
     try:
         agent_payload = json.loads(agent_json_text)
@@ -483,6 +523,91 @@ def write_mock_agent_receipt_review(
         run.completed_at = utc_now()
         session.flush()
         return AgentReceiptReviewWriteResult(run=run, result=review_result)
+    except Exception as exc:
+        run.status = "failed"
+        run.error_code = "agent_review_failed"
+        run.error_message = _redacted_error_message(exc)
+        run.completed_at = utc_now()
+        session.flush()
+        return AgentReceiptReviewWriteResult(run=run, result=None, error=run.error_message)
+
+
+def _persist_inline_keyboard_run(
+    session: Session,
+    *,
+    run: AgentReceiptReviewRun,
+    receipt: ReceiptDocument,
+    agent_json_text: str,
+    schema_version: str,
+    suggested_business_or_personal: str | None,
+    suggested_report_bucket: str | None,
+    suggested_attendees: list[str] | None,
+    suggested_customer: str | None,
+    suggested_business_reason: str | None,
+    suggested_confidence_overall: float | None,
+) -> AgentReceiptReviewWriteResult:
+    """Finalize an inline-keyboard run after its parent ``run`` row is flushed.
+
+    Writes a single ``agent_receipt_read`` row with the ``suggested_*``
+    columns populated. No comparison row is written. On any error: marks
+    the run ``failed`` and surfaces a redacted error message.
+    """
+    try:
+        if suggested_attendees is not None:
+            attendees_payload = [
+                item.strip()
+                for item in suggested_attendees
+                if isinstance(item, str) and item.strip()
+            ]
+            attendees_json: str | None = dumps(attendees_payload, sort_keys=True)
+        else:
+            attendees_payload = None
+            attendees_json = None
+
+        # ``read_json`` is NOT NULL on the schema. Persist the raw model
+        # response (or a normalized fallback shape) so the row is
+        # well-formed. No OCR-shape fields are extracted — that is the
+        # receipt-second-read run_kind's job.
+        try:
+            read_json_value: str = dumps(json.loads(agent_json_text), sort_keys=True)
+        except (json.JSONDecodeError, TypeError):
+            read_json_value = "{}"
+
+        read_row = AgentReceiptReadRow(
+            run_id=run.id or 0,
+            receipt_document_id=receipt.id or 0,
+            read_schema_version=schema_version,
+            read_json=read_json_value,
+            extracted_date=None,
+            extracted_supplier=None,
+            amount_text=None,
+            local_amount_decimal=None,
+            local_amount_minor=None,
+            amount_scale=None,
+            currency=None,
+            receipt_type=None,
+            business_or_personal=None,
+            business_reason=None,
+            attendees_json=None,
+            confidence_json=dumps(
+                {"confidence_overall": suggested_confidence_overall},
+                sort_keys=True,
+            ),
+            evidence_json=None,
+            warnings_json="[]",
+            suggested_business_or_personal=suggested_business_or_personal,
+            suggested_report_bucket=suggested_report_bucket,
+            suggested_attendees_json=attendees_json,
+            suggested_customer=suggested_customer,
+            suggested_business_reason=suggested_business_reason,
+            suggested_confidence_overall=suggested_confidence_overall,
+        )
+        session.add(read_row)
+        session.flush()
+        run.status = "completed"
+        run.completed_at = utc_now()
+        session.flush()
+        return AgentReceiptReviewWriteResult(run=run, result=None)
     except Exception as exc:
         run.status = "failed"
         run.error_code = "agent_review_failed"

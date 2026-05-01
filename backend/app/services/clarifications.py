@@ -12,17 +12,21 @@ _AMOUNT_QUANT = Decimal("0.0001")
 logger = logging.getLogger(__name__)
 TELEGRAM_MEAL_CONTEXT_QUESTION_KEY = "telegram_meal_context"
 TELEGRAM_MARKET_CONTEXT_QUESTION_KEY = "telegram_market_context"
+TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY = "telegram_telecom_context"
 TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY = "telegram_personal_care_context"
 TELEGRAM_MEAL_CONTEXT_RETRY_QUESTION_KEY = f"{TELEGRAM_MEAL_CONTEXT_QUESTION_KEY}_retry"
 TELEGRAM_MARKET_CONTEXT_RETRY_QUESTION_KEY = f"{TELEGRAM_MARKET_CONTEXT_QUESTION_KEY}_retry"
+TELEGRAM_TELECOM_CONTEXT_RETRY_QUESTION_KEY = f"{TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY}_retry"
 TELEGRAM_PERSONAL_CARE_CONTEXT_RETRY_QUESTION_KEY = f"{TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY}_retry"
 DEFAULT_BUSINESS_CONTEXT_QUESTION_KEYS = ("business_reason", "attendees")
 TELEGRAM_CONTEXT_QUESTION_KEYS = (
     TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
     TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+    TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY,
     TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,
     TELEGRAM_MEAL_CONTEXT_RETRY_QUESTION_KEY,
     TELEGRAM_MARKET_CONTEXT_RETRY_QUESTION_KEY,
+    TELEGRAM_TELECOM_CONTEXT_RETRY_QUESTION_KEY,
     TELEGRAM_PERSONAL_CARE_CONTEXT_RETRY_QUESTION_KEY,
 )
 BUSINESS_CONTEXT_QUESTION_KEYS = (
@@ -43,6 +47,11 @@ TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT = (
     "Was this business or personal spending?\n"
     "If business, please reply with who it was for.\n"
     "Example: business, EDT team or business, customer meeting with Ahmet + Hakan.\n"
+    "If personal, reply personal."
+)
+TELEGRAM_TELECOM_CONTEXT_QUESTION_TEXT = (
+    "Was this a business phone/internet expense or personal spending?\n"
+    "If business, reply with the business reason.\n"
     "If personal, reply personal."
 )
 TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_TEXT = (
@@ -158,6 +167,16 @@ def _keep_open_with_helper(
     session.commit()
     session.refresh(helper)
     return [helper]
+
+
+def _telegram_context_question_text(base_question_key: str) -> str:
+    if base_question_key == TELEGRAM_MEAL_CONTEXT_QUESTION_KEY:
+        return TELEGRAM_MEAL_CONTEXT_QUESTION_TEXT
+    if base_question_key == TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY:
+        return TELEGRAM_TELECOM_CONTEXT_QUESTION_TEXT
+    if base_question_key == TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY:
+        return TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_TEXT
+    return TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT
 
 
 def ensure_initial_receipt_question(
@@ -278,6 +297,13 @@ def ensure_receipt_review_questions(
                     and not receipt.business_reason,
                     TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
                     TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT,
+                ),
+                (
+                    TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY in context_keys
+                    and receipt.business_or_personal != "Personal"
+                    and not receipt.business_reason,
+                    TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY,
+                    TELEGRAM_TELECOM_CONTEXT_QUESTION_TEXT,
                 ),
                 (
                     TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY in context_keys
@@ -553,9 +579,11 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
     elif receipt and question.question_key in {
         TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
         TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+        TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY,
         TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,
         TELEGRAM_MEAL_CONTEXT_RETRY_QUESTION_KEY,
         TELEGRAM_MARKET_CONTEXT_RETRY_QUESTION_KEY,
+        TELEGRAM_TELECOM_CONTEXT_RETRY_QUESTION_KEY,
         TELEGRAM_PERSONAL_CARE_CONTEXT_RETRY_QUESTION_KEY,
     }:
         base_question_key = question.question_key.removesuffix("_retry")
@@ -704,6 +732,8 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
         elif question.question_key in {
             TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
             f"{TELEGRAM_MARKET_CONTEXT_QUESTION_KEY}_retry",
+            TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY,
+            f"{TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY}_retry",
             TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,
             f"{TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY}_retry",
         }:
@@ -727,11 +757,3 @@ def _strip_business_context_prefix(answer_text: str) -> str:
         return text
     start = lowered.find("business") + len("business")
     return text[start:].lstrip(" :-,;").strip()
-
-
-def _telegram_context_question_text(base_question_key: str) -> str:
-    if base_question_key == TELEGRAM_MEAL_CONTEXT_QUESTION_KEY:
-        return TELEGRAM_MEAL_CONTEXT_QUESTION_TEXT
-    if base_question_key == TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY:
-        return TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_TEXT
-    return TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
@@ -22,6 +23,7 @@ from app.services import agent_receipt_live_provider
 from app.services.clarifications import (
     TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
     TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
+    TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY,
     TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,
 )
 from app.services.agent_receipt_review_persistence import (
@@ -69,11 +71,47 @@ _NON_CONTEXT_CATEGORIES = {
     "pharmacy",
     "retail",
     "supermarket",
+    "telecom",
+    "telecom_bill",
     "toll",
     "transport",
     "travel",
     "unknown",
+    "phone_bill",
+    "utility_payment",
 }
+_TELECOM_CATEGORIES = {
+    "communication",
+    "communications",
+    "gsm",
+    "internet",
+    "phone",
+    "phone_bill",
+    "telecom",
+    "telecom_bill",
+    "telephone",
+    "utility",
+    "utility_payment",
+}
+_TELECOM_TOKENS = (
+    "abonelik",
+    "fatura tahsilatı",
+    "fatura tahsilati",
+    "gsm",
+    "iletişim",
+    "iletisim",
+    "internet",
+    "phone bill",
+    "superonline",
+    "telefon",
+    "turk telekom",
+    "turkcell",
+    "turknet",
+    "turk.net",
+    "türk telekom",
+    "türknet",
+    "vodafone",
+)
 _STRONG_BUSINESS_CONTEXT_TOKENS = (
     "bosnak",
     "boşnak",
@@ -143,6 +181,8 @@ def receipt_business_context_question_keys(
         return (TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,)
     if context_kind == "market":
         return (TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,)
+    if context_kind == "telecom":
+        return (TELEGRAM_TELECOM_CONTEXT_QUESTION_KEY,)
     if context_kind == "personal_care_drugstore":
         return (TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,)
     return ()
@@ -298,6 +338,8 @@ def _ai_context_note(ai_review: TelegramReceiptAIReview | Mapping[str, Any] | No
 
     if category in {"fuel", "gas", "gasoline", "petrol"} or _text_suggests_hard_non_context(context_text):
         return "AI context: This looks like a gas receipt."
+    if category in _TELECOM_CATEGORIES or _text_suggests_telecom_bill(context_text):
+        return "AI context: This looks like a phone/telecom bill payment."
     if _category_is_personal_care_drugstore(category) or _text_suggests_personal_care_drugstore(context_text):
         return "AI context: This looks like personal care / drugstore items."
     if category in {"market", "grocery", "supermarket"} or _text_suggests_market_snacks(context_text):
@@ -311,17 +353,18 @@ def _receipt_context_note(
     receipt: ReceiptDocument,
     ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
 ) -> str | None:
-    if ai_review is not None:
-        return _ai_context_note(ai_review)
-    context_kind = _receipt_context_kind(receipt, ai_review=None)
+    context_kind = _receipt_context_kind(receipt, ai_review=ai_review)
+    prefix = "AI context" if ai_review is not None else "Context"
     if context_kind == "fuel":
-        return "Context: This looks like a gas receipt."
+        return f"{prefix}: This looks like a gas receipt."
+    if context_kind == "telecom":
+        return f"{prefix}: This looks like a phone/telecom bill payment."
     if context_kind == "personal_care_drugstore":
-        return "Context: This looks like personal care / drugstore items."
+        return f"{prefix}: This looks like personal care / drugstore items."
     if context_kind == "market":
-        return "Context: This looks like market/snacks."
+        return f"{prefix}: This looks like market/snacks."
     if context_kind == "meal":
-        return "Context: This looks like a food or meal receipt."
+        return f"{prefix}: This looks like a food or meal receipt."
     return None
 
 
@@ -329,19 +372,6 @@ def _receipt_context_kind(
     receipt: ReceiptDocument,
     ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
 ) -> str | None:
-    payload = _ai_payload(ai_review) if ai_review is not None else None
-    if isinstance(payload, Mapping):
-        context_text = _ai_context_text(payload)
-        category = _clean(payload.get("business_context_category") or payload.get("receipt_category")).lower()
-        if category in {"fuel", "gas", "gasoline", "petrol"} or _text_suggests_hard_non_context(context_text):
-            return "fuel"
-        if _category_is_personal_care_drugstore(category) or _text_suggests_personal_care_drugstore(context_text):
-            return "personal_care_drugstore"
-        if category in {"market", "grocery", "supermarket"} or _text_suggests_market_snacks(context_text):
-            return "market"
-        if category in _BUSINESS_CONTEXT_CATEGORIES or _text_suggests_business_context(context_text):
-            return "meal"
-
     receipt_text = " ".join(
         part
         for part in (
@@ -353,8 +383,26 @@ def _receipt_context_kind(
     ).lower()
     if _text_suggests_hard_non_context(receipt_text):
         return "fuel"
+    if _text_suggests_telecom_bill(receipt_text):
+        return "telecom"
     if _text_suggests_personal_care_drugstore(receipt_text):
         return "personal_care_drugstore"
+
+    payload = _ai_payload(ai_review) if ai_review is not None else None
+    if isinstance(payload, Mapping):
+        context_text = _ai_context_text(payload)
+        category = _clean(payload.get("business_context_category") or payload.get("receipt_category")).lower()
+        if category in {"fuel", "gas", "gasoline", "petrol"} or _text_suggests_hard_non_context(context_text):
+            return "fuel"
+        if category in _TELECOM_CATEGORIES or _text_suggests_telecom_bill(context_text):
+            return "telecom"
+        if _category_is_personal_care_drugstore(category) or _text_suggests_personal_care_drugstore(context_text):
+            return "personal_care_drugstore"
+        if category in {"market", "grocery", "supermarket"} or _text_suggests_market_snacks(context_text):
+            return "market"
+        if category in _BUSINESS_CONTEXT_CATEGORIES or _text_suggests_business_context(context_text):
+            return "meal"
+
     if _text_suggests_market_snacks(receipt_text):
         return "market"
     if _is_meal_receipt(receipt):
@@ -549,6 +597,10 @@ def _text_suggests_market_snacks(text: str) -> bool:
     )
 
 
+def _text_suggests_telecom_bill(text: str) -> bool:
+    return _text_contains_any(text, _TELECOM_TOKENS)
+
+
 def _category_is_personal_care_drugstore(category: str) -> bool:
     return category in {
         "drugstore",
@@ -611,7 +663,16 @@ def _text_suggests_meal(text: str) -> bool:
 
 
 def _text_contains_any(text: str, tokens: tuple[str, ...]) -> bool:
-    return any(token in text for token in tokens)
+    folded_text = _fold_text(text)
+    return any(token in text or _fold_text(token) in folded_text for token in tokens)
+
+
+def _fold_text(value: str) -> str:
+    return "".join(
+        char
+        for char in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(char)
+    )
 
 
 def _format_amount(amount: Any, currency: str | None) -> str | None:

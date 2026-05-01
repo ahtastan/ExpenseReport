@@ -73,6 +73,66 @@ HOTEL_CHAIN_KEYWORDS = (
     "wingate",
 )
 
+BUSINESS_OR_PERSONAL_QUESTION_KEYS = {
+    "business_or_personal",
+    "business_or_personal_retry",
+}
+BUSINESS_REASON_QUESTION_KEYS = {
+    "business_reason",
+    "telegram_market_context",
+    "telegram_market_context_retry",
+    "telegram_telecom_context",
+    "telegram_telecom_context_retry",
+    "telegram_personal_care_context",
+    "telegram_personal_care_context_retry",
+}
+ATTENDEE_QUESTION_KEYS = {
+    "attendees",
+    "telegram_meal_context",
+    "telegram_meal_context_retry",
+}
+TELEGRAM_CONTEXT_QUESTION_KEYS = BUSINESS_REASON_QUESTION_KEYS | ATTENDEE_QUESTION_KEYS
+TELECOM_BUCKET_TOKENS = {
+    "communication",
+    "communications",
+    "gsm",
+    "internet",
+    "phone",
+    "phone bill",
+    "telephone",
+    "telephone/internet",
+    "telecom",
+    "telecom bill",
+    "utility payment",
+}
+TELECOM_TEXT_TOKENS = (
+    "abonelik",
+    "fatura tahsilatı",
+    "fatura tahsilati",
+    "gsm",
+    "iletişim",
+    "iletisim",
+    "internet",
+    "phone bill",
+    "superonline",
+    "telefon",
+    "turk telekom",
+    "turkcell",
+    "turknet",
+    "turk.net",
+    "türk telekom",
+    "türknet",
+    "vodafone",
+)
+
+
+def _clean_string(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _lower_string(value: object) -> str:
+    return _clean_string(value).lower()
+
 
 def _supplier_is_hotel(supplier: object) -> bool:
     if not isinstance(supplier, str):
@@ -97,6 +157,108 @@ def _has_coo_preapproval_reference(business_reason: object) -> bool:
     return "coo" in text or "approved by" in text
 
 
+def _amount_to_context(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _is_telecom_row(confirmed: dict | None, receipt: ReceiptDocument | None) -> bool:
+    confirmed = confirmed or {}
+    bucket = _lower_string(confirmed.get("report_bucket") or (receipt.report_bucket if receipt else None))
+    if bucket in TELECOM_BUCKET_TOKENS:
+        return True
+    text = " ".join(
+        part
+        for part in (
+            _lower_string(confirmed.get("supplier")),
+            _lower_string(confirmed.get("category")),
+            _lower_string(confirmed.get("report_bucket")),
+            _lower_string(receipt.extracted_supplier if receipt else None),
+            _lower_string(receipt.original_file_name if receipt else None),
+        )
+        if part
+    )
+    return any(token in text for token in TELECOM_TEXT_TOKENS)
+
+
+def _is_meal_bucket(bucket_value: object) -> bool:
+    return _clean_string(bucket_value) in MEAL_BUCKETS_REQUIRING_ATTENDEES
+
+
+def _has_value(value: object) -> bool:
+    return bool(_clean_string(value)) if isinstance(value, str) else value not in (None, "")
+
+
+def _issue_context_from_confirmed(
+    confirmed: dict | None,
+    *,
+    receipt_id: int | None,
+    review_row_id: int | None,
+    match_decision_id: int | None = None,
+) -> dict:
+    confirmed = confirmed or {}
+    return {
+        "receipt_id": receipt_id,
+        "review_row_id": review_row_id,
+        "statement_transaction_id": confirmed.get("transaction_id"),
+        "match_decision_id": match_decision_id,
+        "supplier": _clean_string(confirmed.get("supplier")) or None,
+        "transaction_date": confirmed.get("transaction_date")
+        if isinstance(confirmed.get("transaction_date"), str)
+        else None,
+        "report_bucket": _clean_string(confirmed.get("report_bucket")) or None,
+        "amount": _amount_to_context(confirmed.get("amount")),
+        "currency": _clean_string(confirmed.get("currency")) or None,
+    }
+
+
+def _open_question_still_blocks_report(
+    question: ClarificationQuestion,
+    *,
+    confirmed: dict | None,
+    receipt: ReceiptDocument | None,
+) -> bool:
+    """Return whether an open clarification is still relevant to report readiness.
+
+    Telegram AI follow-up policy has changed several times during testing, so
+    stale open questions can remain even after the current review row is already
+    answered or reclassified. Report validation should be governed by the current
+    confirmed ReviewRow state, not by obsolete helper questions.
+    """
+    if question.answer_text:
+        return False
+    key = question.question_key
+    confirmed = confirmed or {}
+    bp = _lower_string(confirmed.get("business_or_personal"))
+    bucket = confirmed.get("report_bucket")
+    if bp == "personal":
+        return False
+    if key in BUSINESS_OR_PERSONAL_QUESTION_KEYS:
+        return bp not in {"business", "personal", "unclear"}
+    if key in BUSINESS_REASON_QUESTION_KEYS:
+        if bp != "business":
+            return False
+        if _is_telecom_row(confirmed, receipt):
+            return False
+        return not _has_value(confirmed.get("business_reason"))
+    if key in ATTENDEE_QUESTION_KEYS:
+        if bp != "business":
+            return False
+        if _is_telecom_row(confirmed, receipt):
+            return False
+        if not _is_meal_bucket(bucket):
+            return False
+        return not _split_attendees(confirmed.get("attendees"))
+    if key in {"receipt_date", "receipt_date_retry"}:
+        return not (_has_value(confirmed.get("transaction_date")) or (receipt and receipt.extracted_date))
+    if key in {"local_amount", "local_amount_retry"}:
+        return not (_has_value(confirmed.get("amount")) or (receipt and receipt.extracted_local_amount is not None))
+    if key == "supplier":
+        return not (_has_value(confirmed.get("supplier")) or (receipt and _has_value(receipt.extracted_supplier)))
+    return True
+
+
 @dataclass(frozen=True)
 class ValidationIssue:
     severity: str
@@ -108,6 +270,8 @@ class ValidationIssue:
     review_row_id: int | None = None
     supplier: str | None = None
     transaction_date: str | None = None
+    amount: str | None = None
+    currency: str | None = None
     report_bucket: str | None = None
     air_travel_date: str | None = None
     air_travel_return_date: str | None = None
@@ -168,6 +332,8 @@ def _snapshot_issue_context(row: dict) -> dict:
         "review_row_id": row.get("review_row_id"),
         "supplier": row.get("supplier"),
         "transaction_date": row.get("transaction_date"),
+        "amount": _amount_to_context(row.get("amount")),
+        "currency": row.get("currency"),
         "report_bucket": row.get("report_bucket"),
         "statement_transaction_id": row.get("transaction_id"),
     }
@@ -355,24 +521,6 @@ def validate_report_readiness(
                 )
             )
 
-    open_question_receipt_ids = {
-        question.receipt_document_id
-        for question in session.exec(
-            select(ClarificationQuestion).where(ClarificationQuestion.status == "open")
-        ).all()
-        if question.receipt_document_id is not None
-    }
-    approved_receipt_ids = {receipt.id for receipt in receipts if receipt.id is not None}
-    for receipt_id in sorted(open_question_receipt_ids & approved_receipt_ids):
-        issues.append(
-            ValidationIssue(
-                severity="error",
-                code="open_clarification",
-                message="An approved receipt still has an open clarification question.",
-                receipt_id=receipt_id,
-            )
-        )
-
     # B5: ReviewRow.confirmed_json is the canonical source for report_bucket and
     # business_or_personal. Build a {receipt_id -> confirmed dict} lookup from the
     # latest review session. Any approved receipt without a confirmed review row
@@ -392,6 +540,41 @@ def validate_report_readiness(
                 confirmed_by_receipt_id[row.receipt_document_id] = {}
             if row.id is not None:
                 row_id_by_receipt_id[row.receipt_document_id] = row.id
+
+    receipt_by_id = {receipt.id: receipt for receipt in receipts if receipt.id is not None}
+    decision_by_receipt_id = {decision.receipt_document_id: decision for decision in decisions}
+    approved_receipt_ids = set(receipt_by_id)
+    open_questions = [
+        question
+        for question in session.exec(
+            select(ClarificationQuestion).where(ClarificationQuestion.status == "open")
+        ).all()
+        if question.receipt_document_id in approved_receipt_ids
+    ]
+    for question in open_questions:
+        receipt_id = question.receipt_document_id
+        confirmed = confirmed_by_receipt_id.get(receipt_id)
+        receipt = receipt_by_id.get(receipt_id)
+        if not _open_question_still_blocks_report(question, confirmed=confirmed, receipt=receipt):
+            continue
+        decision = decision_by_receipt_id.get(receipt_id)
+        context = _issue_context_from_confirmed(
+            confirmed,
+            receipt_id=receipt_id,
+            review_row_id=row_id_by_receipt_id.get(receipt_id) if receipt_id is not None else None,
+            match_decision_id=decision.id if decision else None,
+        )
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                code="open_clarification",
+                message=(
+                    "An approved receipt still has a relevant open clarification "
+                    f"question ({question.question_key})."
+                ),
+                **context,
+            )
+        )
 
     for receipt in receipts:
         if receipt.id is None or receipt.id not in confirmed_by_receipt_id:
@@ -428,6 +611,7 @@ def validate_report_readiness(
             currency_value = (confirmed.get("currency") or "").strip()
             business_reason_value = confirmed.get("business_reason")
             attendees_entries = _split_attendees(confirmed.get("attendees"))
+            is_telecom = _is_telecom_row(confirmed, receipt)
 
             if not bucket_value:
                 issues.append(
@@ -439,12 +623,14 @@ def validate_report_readiness(
                         review_row_id=row_id,
                         statement_transaction_id=confirmed.get("transaction_id"),
                         supplier=supplier,
+                        amount=_amount_to_context(amount_value),
+                        currency=currency_value or None,
                     )
                 )
 
             # Addition A: hard-block missing business reason. Reads confirmed_json
             # (canonical after M1 Day 2 pivot), not receipt column scaffolding.
-            if not (business_reason_value or "").strip():
+            if not is_telecom and not (business_reason_value or "").strip():
                 issues.append(
                     ValidationIssue(
                         severity="error",
@@ -458,6 +644,8 @@ def validate_report_readiness(
                         statement_transaction_id=confirmed.get("transaction_id"),
                         supplier=supplier,
                         transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                        amount=_amount_to_context(amount_value),
+                        currency=currency_value or None,
                         report_bucket=bucket_value or None,
                     )
                 )
@@ -465,7 +653,7 @@ def validate_report_readiness(
             # Addition A: hard-block meal rows missing attendees. Bucket check
             # uses the explicit spec list (MEAL_BUCKETS_REQUIRING_ATTENDEES)
             # rather than substring matching to avoid false positives.
-            if bucket_value in MEAL_BUCKETS_REQUIRING_ATTENDEES and not attendees_entries:
+            if _is_meal_bucket(bucket_value) and not attendees_entries:
                 amount_display = (
                     f"{amount_value} {currency_value}".strip()
                     if amount_value is not None
@@ -485,6 +673,8 @@ def validate_report_readiness(
                         statement_transaction_id=confirmed.get("transaction_id"),
                         supplier=supplier,
                         transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                        amount=_amount_to_context(amount_value),
+                        currency=currency_value or None,
                         report_bucket=bucket_value,
                     )
                 )
@@ -509,6 +699,8 @@ def validate_report_readiness(
                             statement_transaction_id=confirmed.get("transaction_id"),
                             supplier=supplier,
                             transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                            amount=_amount_to_context(amount_value),
+                            currency=currency_value or None,
                             report_bucket=bucket_value,
                         )
                     )
@@ -535,6 +727,8 @@ def validate_report_readiness(
                         statement_transaction_id=confirmed.get("transaction_id"),
                         supplier=supplier,
                         transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                        amount=_amount_to_context(amount_value),
+                        currency=currency_value or None,
                         report_bucket=bucket_value or None,
                     )
                 )
@@ -575,6 +769,8 @@ def validate_report_readiness(
                             statement_transaction_id=confirmed.get("transaction_id"),
                             supplier=supplier,
                             transaction_date=transaction_date if isinstance(transaction_date, str) else None,
+                            amount=_amount_to_context(amount_value),
+                            currency=currency_value or None,
                             report_bucket=bucket_value,
                         )
                     )

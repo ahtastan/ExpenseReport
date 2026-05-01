@@ -251,6 +251,8 @@ class ReportValidationIssue(BaseModel):
     review_row_id: int | None = None
     supplier: str | None = None
     transaction_date: str | None = None
+    amount: str | None = None
+    currency: str | None = None
     report_bucket: str | None = None
     air_travel_date: str | None = None
     air_travel_return_date: str | None = None

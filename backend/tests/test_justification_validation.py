@@ -42,6 +42,7 @@ from sqlmodel import Session  # noqa: E402
 
 from app.models import (  # noqa: E402
     AppUser,
+    ClarificationQuestion,
     ExpenseReport,
     MatchDecision,
     ReceiptDocument,
@@ -328,6 +329,119 @@ def test_personal_rows_not_validated(isolated_db):
     assert "missing_attendees_on_meal" not in codes
     assert "customer_entertainment_no_preapproval" not in codes
     assert "dinner_exceeds_cap" not in codes
+
+
+def test_personal_row_with_stale_open_clarification_does_not_block(isolated_db):
+    with Session(isolated_db) as session:
+        report_id, row_id = _seed_confirmed_row(
+            session,
+            bucket="Taxi",
+            business_or_personal="Personal",
+            business_reason=None,
+            attendees=None,
+            amount=Decimal("25.0"),
+            supplier="Yellow Taxi",
+        )
+        row = session.get(ReviewRow, row_id)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=row.receipt_document_id,
+                question_key="business_reason",
+                question_text="Please reply with the business purpose.",
+                status="open",
+            )
+        )
+        session.commit()
+
+        validation = validate_report_readiness(session, expense_report_id=report_id)
+
+    codes = [i.code for i in validation.issues]
+    assert "open_clarification" not in codes
+    assert "missing_business_reason" not in codes
+    assert validation.ready is True
+
+
+def test_telecom_row_ignores_stale_meal_clarification(isolated_db):
+    with Session(isolated_db) as session:
+        report_id, row_id = _seed_confirmed_row(
+            session,
+            bucket="Telephone/Internet",
+            business_or_personal="Business",
+            business_reason=None,
+            attendees=None,
+            amount=Decimal("1617.25"),
+            currency="TRY",
+            supplier="ZEYNEP ILETISIM ELEK.BIL.PAZ. VODAFONE",
+        )
+        row = session.get(ReviewRow, row_id)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=row.receipt_document_id,
+                question_key="telegram_meal_context",
+                question_text="Was this business or personal spending? If business, who was included?",
+                status="open",
+            )
+        )
+        session.commit()
+
+        validation = validate_report_readiness(session, expense_report_id=report_id)
+
+    codes = [i.code for i in validation.issues]
+    assert "open_clarification" not in codes
+    assert "missing_business_reason" not in codes
+    assert "missing_attendees_on_meal" not in codes
+    assert validation.ready is True
+
+
+def test_business_meal_with_answered_fields_ignores_stale_open_context_question(isolated_db):
+    with Session(isolated_db) as session:
+        report_id, row_id = _seed_confirmed_row(
+            session,
+            bucket="Dinner",
+            business_or_personal="Business",
+            business_reason="Customer dinner after site visit",
+            attendees="Hakan, Ahmet Yilmaz",
+            amount=Decimal("52.0"),
+            supplier="Bosnak Doner",
+        )
+        row = session.get(ReviewRow, row_id)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=row.receipt_document_id,
+                question_key="telegram_meal_context",
+                question_text="Was this business or personal spending? If business, who was included?",
+                status="open",
+            )
+        )
+        session.commit()
+
+        validation = validate_report_readiness(session, expense_report_id=report_id)
+
+    errors = [i for i in validation.issues if i.severity == "error"]
+    assert [i.code for i in errors] == []
+    assert validation.ready is True
+
+
+def test_validation_issue_contains_review_row_locator_context(isolated_db):
+    with Session(isolated_db) as session:
+        report_id, row_id = _seed_confirmed_row(
+            session,
+            bucket="Dinner",
+            business_or_personal="Business",
+            business_reason="Team dinner after late shift",
+            attendees=None,
+            amount=Decimal("55.0"),
+            supplier="Trattoria",
+        )
+        row = session.get(ReviewRow, row_id)
+        validation = validate_report_readiness(session, expense_report_id=report_id)
+
+    issue = next(i for i in validation.issues if i.code == "missing_attendees_on_meal")
+    assert issue.review_row_id == row_id
+    assert issue.receipt_id == row.receipt_document_id
+    assert issue.statement_transaction_id == row.statement_transaction_id
+    assert issue.supplier == "Trattoria"
+    assert issue.transaction_date == "2026-04-01"
 
 
 def test_solo_dinner_cap_stricter(isolated_db):

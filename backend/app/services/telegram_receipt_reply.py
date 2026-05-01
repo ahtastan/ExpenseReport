@@ -25,6 +25,7 @@ from app.services.clarifications import (
 )
 from app.services.agent_receipt_review_persistence import (
     build_canonical_receipt_snapshot,
+    latest_agent_read_payload_for_receipt,
     latest_ai_review_for_receipt,
     write_mock_agent_receipt_review,
 )
@@ -216,7 +217,8 @@ def maybe_create_telegram_receipt_ai_review(
     if existing and existing.get("status") in {"pass", "warn", "block"}:
         return TelegramReceiptAIReview(
             public_ai_review=existing,
-            agent_payload=existing.get("agent_read") if isinstance(existing.get("agent_read"), Mapping) else None,
+            agent_payload=latest_agent_read_payload_for_receipt(session, receipt)
+            or (existing.get("agent_read") if isinstance(existing.get("agent_read"), Mapping) else None),
         )
     return _try_live_ai_second_read(session, receipt)
 

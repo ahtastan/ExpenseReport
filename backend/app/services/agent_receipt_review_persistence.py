@@ -101,6 +101,22 @@ _AI_PUBLIC_RECOMMENDED_ACTIONS = {
 # Whitelist of risk_level codes. Anything else makes the row "malformed".
 _AI_PUBLIC_RISK_LEVELS = {"pass", "warn", "block"}
 
+_AGENT_READ_PAYLOAD_KEYS = {
+    "merchant_name",
+    "merchant_address",
+    "receipt_date",
+    "receipt_time",
+    "total_amount",
+    "currency",
+    "amount_text",
+    "line_items",
+    "tax_amount",
+    "payment_method",
+    "receipt_category",
+    "confidence",
+    "raw_text_summary",
+}
+
 
 def latest_ai_review_for_receipt(
     session: Session,
@@ -201,6 +217,33 @@ def latest_ai_review_for_receipt(
     return payload
 
 
+def latest_agent_read_payload_for_receipt(
+    session: Session,
+    receipt: ReceiptDocument,
+) -> dict[str, Any] | None:
+    """Return the latest safe AgentDB read payload for internal Telegram use.
+
+    Unlike ``latest_ai_review_for_receipt()``, this helper is not a public API
+    projection. It is intentionally limited to the normalized AgentReceiptRead
+    fields already stored in ``read_json`` so Telegram can reuse context such as
+    ``receipt_category`` and ``raw_text_summary`` without exposing prompts, raw
+    model JSON, paths, hashes, or debug metadata.
+    """
+    public_review = latest_ai_review_for_receipt(session, receipt)
+    if not public_review or public_review.get("status") not in {"pass", "warn", "block"}:
+        return None
+
+    if receipt is None or receipt.id is None:
+        return None
+
+    completed_comparison = get_latest_agent_receipt_comparison(session, receipt.id)
+    if completed_comparison is None:
+        return None
+
+    agent_read_row = _latest_agent_read_for_run(session, completed_comparison.run_id)
+    return _safe_load_agent_read_payload(agent_read_row.read_json if agent_read_row else None)
+
+
 def _latest_run_for_receipt(
     session: Session, receipt_document_id: int
 ) -> AgentReceiptReviewRun | None:
@@ -268,6 +311,18 @@ def _safe_load_canonical_snapshot(raw: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _safe_load_agent_read_payload(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return {key: parsed[key] for key in _AGENT_READ_PAYLOAD_KEYS if key in parsed}
 
 
 def _build_public_differences(

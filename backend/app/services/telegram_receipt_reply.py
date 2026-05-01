@@ -22,6 +22,7 @@ from app.services import agent_receipt_live_provider
 from app.services.clarifications import (
     TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
     TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
+    TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,
 )
 from app.services.agent_receipt_review_persistence import (
     build_canonical_receipt_snapshot,
@@ -62,7 +63,10 @@ _NON_CONTEXT_CATEGORIES = {
     "market",
     "other",
     "parking",
+    "personal_care",
+    "personal_care_drugstore",
     "petrol",
+    "pharmacy",
     "retail",
     "supermarket",
     "toll",
@@ -139,6 +143,8 @@ def receipt_business_context_question_keys(
         return (TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,)
     if context_kind == "market":
         return (TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,)
+    if context_kind == "personal_care_drugstore":
+        return (TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,)
     return ()
 
 
@@ -292,6 +298,8 @@ def _ai_context_note(ai_review: TelegramReceiptAIReview | Mapping[str, Any] | No
 
     if category in {"fuel", "gas", "gasoline", "petrol"} or _text_suggests_hard_non_context(context_text):
         return "AI context: This looks like a gas receipt."
+    if _category_is_personal_care_drugstore(category) or _text_suggests_personal_care_drugstore(context_text):
+        return "AI context: This looks like personal care / drugstore items."
     if category in {"market", "grocery", "supermarket"} or _text_suggests_market_snacks(context_text):
         return "AI context: This looks like market/snacks."
     if category in _BUSINESS_CONTEXT_CATEGORIES or _text_suggests_business_context(context_text):
@@ -308,6 +316,8 @@ def _receipt_context_note(
     context_kind = _receipt_context_kind(receipt, ai_review=None)
     if context_kind == "fuel":
         return "Context: This looks like a gas receipt."
+    if context_kind == "personal_care_drugstore":
+        return "Context: This looks like personal care / drugstore items."
     if context_kind == "market":
         return "Context: This looks like market/snacks."
     if context_kind == "meal":
@@ -325,6 +335,8 @@ def _receipt_context_kind(
         category = _clean(payload.get("business_context_category") or payload.get("receipt_category")).lower()
         if category in {"fuel", "gas", "gasoline", "petrol"} or _text_suggests_hard_non_context(context_text):
             return "fuel"
+        if _category_is_personal_care_drugstore(category) or _text_suggests_personal_care_drugstore(context_text):
+            return "personal_care_drugstore"
         if category in {"market", "grocery", "supermarket"} or _text_suggests_market_snacks(context_text):
             return "market"
         if category in _BUSINESS_CONTEXT_CATEGORIES or _text_suggests_business_context(context_text):
@@ -341,6 +353,8 @@ def _receipt_context_kind(
     ).lower()
     if _text_suggests_hard_non_context(receipt_text):
         return "fuel"
+    if _text_suggests_personal_care_drugstore(receipt_text):
+        return "personal_care_drugstore"
     if _text_suggests_market_snacks(receipt_text):
         return "market"
     if _is_meal_receipt(receipt):
@@ -531,6 +545,45 @@ def _text_suggests_market_snacks(text: str) -> bool:
             "cigarettes",
             "marlboro",
             "tuborg",
+        ),
+    )
+
+
+def _category_is_personal_care_drugstore(category: str) -> bool:
+    return category in {
+        "drugstore",
+        "health_beauty",
+        "hygiene",
+        "personal_care",
+        "personal_care_drugstore",
+        "pharmacy",
+    }
+
+
+def _text_suggests_personal_care_drugstore(text: str) -> bool:
+    return _text_contains_any(
+        text,
+        (
+            "rossmann",
+            "gratis",
+            "watsons",
+            "pharmacy",
+            "drugstore",
+            "eczane",
+            "facial tissue",
+            "tissue",
+            "toothpaste",
+            "shampoo",
+            "hygiene",
+            "cosmetic",
+            "cosmetics",
+            "hair brush",
+            "brush",
+            "cleaning",
+            "personal care",
+            "deodorant",
+            "soap",
+            "toothbrush",
         ),
     )
 

@@ -12,14 +12,18 @@ _AMOUNT_QUANT = Decimal("0.0001")
 logger = logging.getLogger(__name__)
 TELEGRAM_MEAL_CONTEXT_QUESTION_KEY = "telegram_meal_context"
 TELEGRAM_MARKET_CONTEXT_QUESTION_KEY = "telegram_market_context"
+TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY = "telegram_personal_care_context"
 TELEGRAM_MEAL_CONTEXT_RETRY_QUESTION_KEY = f"{TELEGRAM_MEAL_CONTEXT_QUESTION_KEY}_retry"
 TELEGRAM_MARKET_CONTEXT_RETRY_QUESTION_KEY = f"{TELEGRAM_MARKET_CONTEXT_QUESTION_KEY}_retry"
+TELEGRAM_PERSONAL_CARE_CONTEXT_RETRY_QUESTION_KEY = f"{TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY}_retry"
 DEFAULT_BUSINESS_CONTEXT_QUESTION_KEYS = ("business_reason", "attendees")
 TELEGRAM_CONTEXT_QUESTION_KEYS = (
     TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
     TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+    TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,
     TELEGRAM_MEAL_CONTEXT_RETRY_QUESTION_KEY,
     TELEGRAM_MARKET_CONTEXT_RETRY_QUESTION_KEY,
+    TELEGRAM_PERSONAL_CARE_CONTEXT_RETRY_QUESTION_KEY,
 )
 BUSINESS_CONTEXT_QUESTION_KEYS = (
     *DEFAULT_BUSINESS_CONTEXT_QUESTION_KEYS,
@@ -40,6 +44,9 @@ TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT = (
     "If business, please reply with who it was for.\n"
     "Example: business, EDT team or business, customer meeting with Ahmet + Hakan.\n"
     "If personal, reply personal."
+)
+TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_TEXT = (
+    "If this was business spending, reply with the reason. If personal, reply personal."
 )
 
 
@@ -271,6 +278,13 @@ def ensure_receipt_review_questions(
                     and not receipt.business_reason,
                     TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
                     TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT,
+                ),
+                (
+                    TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY in context_keys
+                    and receipt.business_or_personal != "Personal"
+                    and not receipt.business_reason,
+                    TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,
+                    TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_TEXT,
                 ),
             ]
         )
@@ -539,8 +553,10 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
     elif receipt and question.question_key in {
         TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
         TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+        TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,
         TELEGRAM_MEAL_CONTEXT_RETRY_QUESTION_KEY,
         TELEGRAM_MARKET_CONTEXT_RETRY_QUESTION_KEY,
+        TELEGRAM_PERSONAL_CARE_CONTEXT_RETRY_QUESTION_KEY,
     }:
         base_question_key = question.question_key.removesuffix("_retry")
         lowered = answer.lower()
@@ -563,11 +579,7 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
                         receipt_document_id=receipt.id,
                         user_id=question.user_id,
                         question_key=f"{base_question_key}_retry",
-                        question_text=(
-                            TELEGRAM_MEAL_CONTEXT_QUESTION_TEXT
-                            if base_question_key == TELEGRAM_MEAL_CONTEXT_QUESTION_KEY
-                            else TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT
-                        ),
+                        question_text=_telegram_context_question_text(base_question_key),
                     )
                 )
         else:
@@ -577,11 +589,7 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
                     receipt_document_id=receipt.id,
                     user_id=question.user_id,
                     question_key=f"{base_question_key}_retry",
-                    question_text=(
-                        TELEGRAM_MEAL_CONTEXT_QUESTION_TEXT
-                        if base_question_key == TELEGRAM_MEAL_CONTEXT_QUESTION_KEY
-                        else TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT
-                    ),
+                    question_text=_telegram_context_question_text(base_question_key),
                 )
             )
         receipt.updated_at = datetime.now(timezone.utc)
@@ -696,6 +704,8 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
         elif question.question_key in {
             TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
             f"{TELEGRAM_MARKET_CONTEXT_QUESTION_KEY}_retry",
+            TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY,
+            f"{TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY}_retry",
         }:
             needs_business_context = receipt.business_or_personal == "Business" and not receipt.business_reason
         else:
@@ -717,3 +727,11 @@ def _strip_business_context_prefix(answer_text: str) -> str:
         return text
     start = lowered.find("business") + len("business")
     return text[start:].lstrip(" :-,;").strip()
+
+
+def _telegram_context_question_text(base_question_key: str) -> str:
+    if base_question_key == TELEGRAM_MEAL_CONTEXT_QUESTION_KEY:
+        return TELEGRAM_MEAL_CONTEXT_QUESTION_TEXT
+    if base_question_key == TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_KEY:
+        return TELEGRAM_PERSONAL_CARE_CONTEXT_QUESTION_TEXT
+    return TELEGRAM_MARKET_CONTEXT_QUESTION_TEXT

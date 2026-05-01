@@ -27,6 +27,8 @@ def main() -> None:
     assert "issue.air_travel_date" in html
     assert "issue.air_travel_return_date" in html
     assert "issue.air_travel_rt_or_oneway" in html
+    assert "Open in Review Queue" in html
+    assert "onNavigateReview?.(issue.review_row_id)" in html
     assert "atReturn" in html
     assert "air_travel_return_date" in html
     assert "Return date" in html
@@ -100,6 +102,10 @@ def main() -> None:
         )
 
     print("review_ui_static_tests=passed")
+
+
+def test_review_ui_static_markers() -> None:
+    main()
 
 
 if __name__ == "__main__":

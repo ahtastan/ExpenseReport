@@ -1560,6 +1560,7 @@ function ValidationPanel({ statementId, sessionStatus, onGenerate, onNavigateRev
       issue.review_row_id ? `Row #${issue.review_row_id}` : null,
       issue.supplier || null,
       issue.transaction_date || null,
+      issue.amount ? `${issue.amount}${issue.currency ? ` ${issue.currency}` : ''}` : null,
       issue.report_bucket || null,
       issue.air_travel_date ? `Travel ${issue.air_travel_date}` : null,
       issue.air_travel_return_date ? `Return ${issue.air_travel_return_date}` : null,
@@ -1581,6 +1582,14 @@ function ValidationPanel({ statementId, sessionStatus, onGenerate, onNavigateRev
                   border:'1px solid var(--border)', borderRadius:5, padding:'2px 6px' }}>{item}</span>
               ))}
             </div>
+          )}
+          {issue.review_row_id && (
+            <button onClick={()=>onNavigateReview?.(issue.review_row_id)}
+              style={{ marginTop:8, padding:'4px 9px', borderRadius:5, border:'1px solid var(--border)',
+                background:'var(--surface-2)', color:'var(--accent)', fontSize:11, fontWeight:600,
+                cursor:'pointer' }}>
+              Open in Review Queue
+            </button>
           )}
           <div style={{ fontSize:11, color:'var(--text-3)', marginTop:4 }}>Code: {issue.code}</div>
         </div>

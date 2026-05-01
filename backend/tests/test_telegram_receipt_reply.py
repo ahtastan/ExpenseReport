@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from sqlmodel import Session, select
 
 from app.config import get_settings
@@ -498,6 +499,116 @@ def test_telegram_market_context_business_answer_stores_who_it_was_for(monkeypat
     assert receipt_row.needs_clarification is False
     assert [question.status for question in questions] == ["answered"]
     assert fake.messages[-1] == "Got it. I saved that clarification."
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected_context"),
+    [
+        ("Business, Ahmet", "Ahmet"),
+        ("business, Ahmet", "Ahmet"),
+        ("Business: Ahmet", "Ahmet"),
+        ("business Ahmet", "Ahmet"),
+        ("it is business, Ahmet", "Ahmet"),
+        ("business, Hakan + customer: Ahmet Yılmaz", "Hakan + customer: Ahmet Yılmaz"),
+        ("business, EDT team", "EDT team"),
+    ],
+)
+def test_telegram_market_context_business_answer_variants_are_saved(monkeypatch, answer, expected_context):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "Ambiguous Shop"
+        receipt.business_or_personal = None
+        receipt.uploader_user_id = user.id
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=receipt.id,
+                user_id=user.id,
+                question_key="telegram_market_context",
+                question_text="Was this business or personal spending?",
+            )
+        )
+        session.commit()
+
+    payload = {
+        "message": {
+            "message_id": 9011,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": answer,
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.exec(select(ReceiptDocument)).one()
+        question = session.exec(select(ClarificationQuestion)).one()
+
+    assert result["action"] == "answered_clarification"
+    assert receipt_row.business_or_personal == "Business"
+    assert receipt_row.business_reason == expected_context
+    assert receipt_row.needs_clarification is False
+    assert question.status == "answered"
+    assert fake.messages[-1] == "Got it. I saved that clarification."
+    assert "Send me a receipt photo/PDF" not in fake.messages[-1]
+
+
+@pytest.mark.parametrize("answer", ["Personal", "PERSONAL", "it is personal", "personal expense"])
+def test_telegram_market_context_personal_answer_variants_close_without_followup(monkeypatch, answer):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001")
+    fake = _install_fake_client(monkeypatch)
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "Ambiguous Shop"
+        receipt.business_or_personal = None
+        receipt.uploader_user_id = user.id
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=receipt.id,
+                user_id=user.id,
+                question_key="telegram_market_context",
+                question_text="Was this business or personal spending?",
+            )
+        )
+        session.commit()
+
+    payload = {
+        "message": {
+            "message_id": 9012,
+            "from": {"id": 41001, "first_name": "Op"},
+            "chat": {"id": 51001},
+            "text": answer,
+        }
+    }
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        receipt_row = session.exec(select(ReceiptDocument)).one()
+        question = session.exec(select(ClarificationQuestion)).one()
+
+    assert result["action"] == "answered_clarification"
+    assert receipt_row.business_or_personal == "Personal"
+    assert receipt_row.business_reason is None
+    assert receipt_row.attendees is None
+    assert receipt_row.needs_clarification is False
+    assert question.status == "answered"
+    assert fake.messages[-1] == "Got it. I saved that clarification."
+    assert "Send me a receipt photo/PDF" not in fake.messages[-1]
 
 
 def test_ai_receipt_reply_text_ignores_stale_business_context_questions(monkeypatch):

@@ -174,7 +174,14 @@ def _amount_to_context(value: object) -> str | None:
 
 def _is_telecom_row(confirmed: dict | None, receipt: ReceiptDocument | None) -> bool:
     confirmed = confirmed or {}
-    bucket = _lower_string(confirmed.get("report_bucket") or (receipt.report_bucket if receipt else None))
+    # Normalize before the OR fallback so a whitespace-only confirmed bucket
+    # (e.g. the operator clearing the field to "   ") behaves the same as
+    # None/"". Without `_clean_string` the raw "   " is truthy, so the
+    # fallback to `receipt.report_bucket` would never run, and a row with a
+    # cleared confirmed bucket but a real receipt-side bucket would silently
+    # take a different code path than its None/"" siblings.
+    confirmed_bucket = _clean_string(confirmed.get("report_bucket"))
+    bucket = _lower_string(confirmed_bucket or (receipt.report_bucket if receipt else None))
     if bucket in TELECOM_BUCKET_TOKENS:
         return True
     # Text-fallback guard: only inspect supplier / filename strings for

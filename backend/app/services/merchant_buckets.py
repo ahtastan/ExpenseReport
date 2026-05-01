@@ -26,8 +26,12 @@ _RULES: list[_Rule] = [
     _Rule(re.compile(r"\b(yemeksepeti|getir|trendyol\s*yemek|starbucks|cafe|kafeterya|d[oö]ner|k[oö]fteci|restaurant|restoran|lokanta|pizza|burger|mcdonalds|kfc|popeyes|subway|simit)\b", re.I), "Meals/Snacks"),
     # Airfare / intercity transport
     _Rule(re.compile(r"\b(thy|turkish\s*airlines?|pegasus|sunexpress|flypgs|anadolujet|havayollar[ıi]|havaalanı|airport)\b", re.I), "Airfare/Bus/Ferry/Other"),
-    # Telephone / internet
-    _Rule(re.compile(r"\b(turkcell|vodafone|t[uü]rk\s*telekom|superonline|turknet|internet|gsm|fatura)\b", re.I), "Telephone/Internet"),
+    # Telephone / internet — only strong, unambiguous signals so that
+    # venues like "Vodafone Park" (an Istanbul stadium) and meal slips
+    # whose name happens to contain "internet" / "gsm" / "fatura" don't
+    # get auto-bucketed as Telephone/Internet by the suggester. Keep this
+    # in sync with TELECOM_TEXT_TOKENS in app/services/report_validation.py.
+    _Rule(re.compile(r"\b(fatura\s+tahsilat[ıi]|phone\s+bill|superonline|t[uü]rk\s*telekom|t[uü]rknet|turk\.net)\b", re.I), "Telephone/Internet"),
     # Auto rental
     _Rule(re.compile(r"\b(avis|hertz|budget\s*rent|sixt|europcar|oto\s*kiralama|rent\s*a\s*car)\b", re.I), "Auto Rental"),
     # Entertainment

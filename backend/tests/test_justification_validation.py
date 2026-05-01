@@ -517,6 +517,18 @@ def test_is_telecom_row_false_for_meal_bucket_regardless_of_supplier_text():
     assert _is_telecom_row(confirmed, None) is False
 
 
+def test_is_telecom_row_false_for_meal_bucket_with_strong_token_in_supplier():
+    # Isolates the bucket allow-list guard from the strong-token list:
+    # even a strong, unambiguous telecom phrase ("türk telekom") in the
+    # supplier must NOT flip a Dinner-bucketed row to telecom. A future
+    # regression that drops the bucket short-circuit while keeping the
+    # strong-only token list would silently re-open the loophole on meal
+    # rows whose name happens to mention a phone-bill phrase — this test
+    # would then fail.
+    confirmed = {"report_bucket": "Dinner", "supplier": "Türk Telekom corporate cafe lunch"}
+    assert _is_telecom_row(confirmed, None) is False
+
+
 def test_is_telecom_row_false_for_entertainment_bucket_with_internet_in_filename():
     # Filename-based matches are easy to trigger by accident. Entertainment
     # bucket must rule out the heuristic.

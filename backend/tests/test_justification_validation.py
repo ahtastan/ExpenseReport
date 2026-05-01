@@ -51,7 +51,10 @@ from app.models import (  # noqa: E402
     StatementImport,
     StatementTransaction,
 )
-from app.services.report_validation import validate_report_readiness  # noqa: E402
+from app.services.report_validation import (  # noqa: E402
+    _is_telecom_row,
+    validate_report_readiness,
+)
 
 
 def _seed_confirmed_row(
@@ -468,3 +471,118 @@ def test_solo_dinner_cap_stricter(isolated_db):
     assert "without customer" in warn.message, f"expected solo framing, got: {warn.message!r}"
     assert "32.00" in warn.message
     assert validation.ready is True
+
+
+# ─── _is_telecom_row narrowing (PR #83 follow-up) ──────────────────────────
+#
+# PR #83 introduced `_is_telecom_row` with a substring-based text fallback
+# that scanned supplier / category / report_bucket / extracted_supplier /
+# original_file_name for telecom-flavoured tokens (vodafone, turkcell,
+# internet, gsm, telefon, …). Cross-evaluation found that the fallback
+# silently exempted Business rows with non-telecom buckets — e.g. a real
+# customer dinner at "Vodafone Park" (a stadium in Istanbul) or any receipt
+# whose filename happened to contain "internet" — from the
+# `missing_business_reason` hard block. These tests pin the narrowed
+# behavior: the text fallback is gated on a small bucket allow-list AND
+# only matches strong, unambiguous telecom signals.
+
+
+class _ReceiptStub:
+    """Minimal stand-in for ReceiptDocument used by `_is_telecom_row` unit tests."""
+
+    def __init__(
+        self,
+        *,
+        report_bucket: str | None = None,
+        extracted_supplier: str | None = None,
+        original_file_name: str | None = None,
+    ) -> None:
+        self.report_bucket = report_bucket
+        self.extracted_supplier = extracted_supplier
+        self.original_file_name = original_file_name
+
+
+def test_is_telecom_row_false_for_other_bucket_with_weak_brand_in_supplier():
+    # Vodafone Park is a real stadium in Istanbul — a legitimate non-telecom
+    # venue. The narrowed heuristic must not treat the row as telecom just
+    # because the supplier string contains "vodafone".
+    confirmed = {"report_bucket": "Other", "supplier": "Vodafone Park"}
+    assert _is_telecom_row(confirmed, None) is False
+
+
+def test_is_telecom_row_false_for_meal_bucket_regardless_of_supplier_text():
+    # Even if the supplier text mentions "Turkcell", a Dinner-bucketed row
+    # is a meal — the bucket itself rules out telecom.
+    confirmed = {"report_bucket": "Dinner", "supplier": "Turkcell Müşteri Yemeği"}
+    assert _is_telecom_row(confirmed, None) is False
+
+
+def test_is_telecom_row_false_for_entertainment_bucket_with_internet_in_filename():
+    # Filename-based matches are easy to trigger by accident. Entertainment
+    # bucket must rule out the heuristic.
+    confirmed = {"report_bucket": "Entertainment"}
+    receipt = _ReceiptStub(report_bucket="Entertainment", original_file_name="internet_cafe.jpg")
+    assert _is_telecom_row(confirmed, receipt) is False
+
+
+def test_is_telecom_row_true_for_telephone_internet_bucket():
+    # Preserve PR #83 behavior: when the operator (or the bucket suggester)
+    # has classified the row as Telephone/Internet, the row is telecom and
+    # business_reason is implicit in the supplier (the phone bill itself).
+    confirmed = {"report_bucket": "Telephone/Internet", "supplier": "Vodafone fatura"}
+    assert _is_telecom_row(confirmed, None) is True
+
+
+def test_is_telecom_row_true_for_unclassified_row_with_strong_telecom_signal():
+    # Truly unclassified rows (bucket="") may still leverage the text
+    # fallback — but only on strong, unambiguous signals like
+    # "fatura tahsilatı" (Turkish for "bill collection") or full brand
+    # phrases like "turk telekom".
+    confirmed = {"report_bucket": "", "supplier": "Turkcell fatura tahsilatı"}
+    assert _is_telecom_row(confirmed, None) is True
+
+
+def test_is_telecom_row_false_for_unclassified_row_with_weak_brand_only():
+    # Negative control for the strong-signal rule: a fresh, unclassified
+    # row whose only telecom evidence is the brand name "Vodafone" alone
+    # (no "fatura", no "tahsilatı", no full ISP brand phrase) must NOT
+    # be auto-classified as telecom.
+    confirmed = {"report_bucket": "", "supplier": "Vodafone Park"}
+    assert _is_telecom_row(confirmed, None) is False
+
+
+def test_is_telecom_row_true_for_other_bucket_with_strong_signal():
+    # The catch-all "Other" bucket is in the text-fallback allow-list, so
+    # a strong, unambiguous signal like "fatura tahsilatı" still flips
+    # is_telecom to True there. This pins the surviving exemption surface
+    # so a future tightening (e.g. dropping "other" from the allow-list)
+    # is a deliberate, test-driven decision rather than an accident.
+    confirmed = {"report_bucket": "Other", "supplier": "Turkcell fatura tahsilatı"}
+    assert _is_telecom_row(confirmed, None) is True
+
+
+def test_vodafone_park_business_row_with_other_bucket_blocks_on_missing_business_reason(isolated_db):
+    # Integration check: the loophole closed by this PR. A Business row at
+    # "Vodafone Park" with bucket="Other" and no business_reason must now
+    # surface `missing_business_reason` instead of silently being treated
+    # as telecom and skipping the gate.
+    with Session(isolated_db) as session:
+        report_id, row_id = _seed_confirmed_row(
+            session,
+            bucket="Other",
+            business_or_personal="Business",
+            business_reason=None,
+            attendees=None,
+            amount=Decimal("250.0"),
+            supplier="Vodafone Park",
+        )
+        validation = validate_report_readiness(session, expense_report_id=report_id)
+
+    codes = [i.code for i in validation.issues]
+    assert "missing_business_reason" in codes, (
+        f"Vodafone Park (a stadium) with bucket=Other and empty business_reason "
+        f"must still emit missing_business_reason; got issues={codes}"
+    )
+    block = next(i for i in validation.issues if i.code == "missing_business_reason")
+    assert block.severity == "error"
+    assert validation.ready is False

@@ -105,24 +105,33 @@ TELECOM_BUCKET_TOKENS = {
     "telecom bill",
     "utility payment",
 }
+# Buckets where the text-fallback in ``_is_telecom_row`` is still allowed
+# to inspect supplier / filename strings. For any other bucket (meals,
+# Entertainment, Hotel/Lodging/Laundry, Airfare/Bus/Ferry/Other, Customer
+# Entertainment, etc.) the bucket itself rules out telecom and the text
+# heuristic is skipped — otherwise a venue named "Vodafone Park" or a
+# filename like ``internet_cafe.jpg`` could silently exempt a real meal
+# row from ``missing_business_reason``. Telephone/Internet is included
+# here for defense-in-depth even though the bucket-token branch above
+# already short-circuits to True for it.
+TELECOM_TEXT_FALLBACK_BUCKETS = frozenset({"", "other", "telephone/internet"})
+
+# Strong, unambiguous telecom signals. Single-word brand tokens (vodafone,
+# turkcell) and generic terms (internet, gsm, telefon, iletişim, abonelik)
+# were intentionally dropped: they collide with venues like "Vodafone Park",
+# subsidiary shop names, and Turkish words that appear in non-telecom
+# receipts. Every entry here is either multi-word (uniquely a phone-bill
+# phrase) or a token that has no non-telecom meaning.
 TELECOM_TEXT_TOKENS = (
-    "abonelik",
     "fatura tahsilatı",
     "fatura tahsilati",
-    "gsm",
-    "iletişim",
-    "iletisim",
-    "internet",
     "phone bill",
     "superonline",
-    "telefon",
     "turk telekom",
-    "turkcell",
     "turknet",
     "turk.net",
     "türk telekom",
     "türknet",
-    "vodafone",
 )
 
 
@@ -168,6 +177,13 @@ def _is_telecom_row(confirmed: dict | None, receipt: ReceiptDocument | None) -> 
     bucket = _lower_string(confirmed.get("report_bucket") or (receipt.report_bucket if receipt else None))
     if bucket in TELECOM_BUCKET_TOKENS:
         return True
+    # Text-fallback guard: only inspect supplier / filename strings for
+    # buckets that are genuinely unclassified ("") or the catch-all "Other".
+    # Any specific non-telecom bucket (meal buckets, Entertainment, Hotel/
+    # Lodging/Laundry, Airfare/Bus/Ferry/Other, Customer Entertainment, …)
+    # rules out telecom, regardless of how the supplier or filename reads.
+    if bucket not in TELECOM_TEXT_FALLBACK_BUCKETS:
+        return False
     text = " ".join(
         part
         for part in (

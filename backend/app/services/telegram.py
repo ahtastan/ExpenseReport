@@ -16,6 +16,7 @@ from app.services.clarifications import (
     ensure_receipt_review_questions,
     next_open_question_for_receipt,
     next_open_question_for_user,
+    open_telegram_context_question_keys_for_receipt,
 )
 from app.services.receipt_extraction import apply_receipt_extraction
 from app.services.review_sessions import get_or_create_review_session
@@ -228,7 +229,17 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         if ai_receipt_reply_allowed and ai_receipt_followups_allowed:
             latest_receipt_id = _latest_receipt_id_for_user(session, user.id)
             latest_receipt = session.get(ReceiptDocument, latest_receipt_id) if latest_receipt_id is not None else None
-            include_business_context = (
+            active_context_question_keys = open_telegram_context_question_keys_for_receipt(
+                session,
+                user.id,
+                latest_receipt_id,
+            )
+            business_context_question_keys = active_context_question_keys or (
+                receipt_business_context_question_keys(latest_receipt)
+                if latest_receipt is not None
+                else ()
+            )
+            include_business_context = bool(active_context_question_keys) or (
                 should_include_receipt_business_context(latest_receipt)
                 if latest_receipt is not None
                 else False
@@ -238,11 +249,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 user.id,
                 latest_receipt_id,
                 include_business_context=include_business_context,
-                business_context_question_keys=(
-                    receipt_business_context_question_keys(latest_receipt)
-                    if latest_receipt is not None
-                    else ()
-                ),
+                business_context_question_keys=business_context_question_keys,
             )
         elif ai_receipt_reply_allowed:
             open_question = next_open_question_for_user(session, user.id, include_business_context=False)

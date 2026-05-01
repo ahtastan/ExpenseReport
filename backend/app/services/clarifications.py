@@ -12,11 +12,18 @@ _AMOUNT_QUANT = Decimal("0.0001")
 logger = logging.getLogger(__name__)
 TELEGRAM_MEAL_CONTEXT_QUESTION_KEY = "telegram_meal_context"
 TELEGRAM_MARKET_CONTEXT_QUESTION_KEY = "telegram_market_context"
+TELEGRAM_MEAL_CONTEXT_RETRY_QUESTION_KEY = f"{TELEGRAM_MEAL_CONTEXT_QUESTION_KEY}_retry"
+TELEGRAM_MARKET_CONTEXT_RETRY_QUESTION_KEY = f"{TELEGRAM_MARKET_CONTEXT_QUESTION_KEY}_retry"
 DEFAULT_BUSINESS_CONTEXT_QUESTION_KEYS = ("business_reason", "attendees")
-BUSINESS_CONTEXT_QUESTION_KEYS = (
-    *DEFAULT_BUSINESS_CONTEXT_QUESTION_KEYS,
+TELEGRAM_CONTEXT_QUESTION_KEYS = (
     TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
     TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
+    TELEGRAM_MEAL_CONTEXT_RETRY_QUESTION_KEY,
+    TELEGRAM_MARKET_CONTEXT_RETRY_QUESTION_KEY,
+)
+BUSINESS_CONTEXT_QUESTION_KEYS = (
+    *DEFAULT_BUSINESS_CONTEXT_QUESTION_KEYS,
+    *TELEGRAM_CONTEXT_QUESTION_KEYS,
 )
 MEAL_ATTENDEES_QUESTION_TEXT = (
     "Please reply with who was included in the meal. "
@@ -417,6 +424,29 @@ def next_open_question_for_receipt(
     ).first()
 
 
+def open_telegram_context_question_keys_for_receipt(
+    session: Session,
+    user_id: int,
+    receipt_id: int | None,
+) -> tuple[str, ...]:
+    if receipt_id is None:
+        return ()
+    keys = session.exec(
+        select(ClarificationQuestion.question_key)
+        .where(
+            ClarificationQuestion.user_id == user_id,
+            ClarificationQuestion.receipt_document_id == receipt_id,
+            ClarificationQuestion.status == "open",
+            ClarificationQuestion.question_key.in_(TELEGRAM_CONTEXT_QUESTION_KEYS),
+        )
+        .order_by(
+            ClarificationQuestion.created_at,
+            ClarificationQuestion.id,
+        )
+    ).all()
+    return tuple(dict.fromkeys(str(key) for key in keys))
+
+
 def answer_question(session: Session, question: ClarificationQuestion, answer: str) -> list[ClarificationQuestion]:
     answer_text = answer.strip()
     if question.question_key in {"receipt_date", "receipt_date_retry"} and _looks_like_non_answer(answer_text):
@@ -486,8 +516,8 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
     elif receipt and question.question_key in {
         TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
         TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
-        f"{TELEGRAM_MEAL_CONTEXT_QUESTION_KEY}_retry",
-        f"{TELEGRAM_MARKET_CONTEXT_QUESTION_KEY}_retry",
+        TELEGRAM_MEAL_CONTEXT_RETRY_QUESTION_KEY,
+        TELEGRAM_MARKET_CONTEXT_RETRY_QUESTION_KEY,
     }:
         base_question_key = question.question_key.removesuffix("_retry")
         lowered = answer.lower()

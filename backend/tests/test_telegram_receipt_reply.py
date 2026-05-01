@@ -25,6 +25,7 @@ from app.models import (
 from app.services.receipt_extraction import ReceiptExtraction
 from app.services import telegram as telegram_service
 from app.services import telegram_receipt_reply
+from app.services.agent_receipt_review_persistence import write_mock_agent_receipt_review
 
 
 VERIFY_ROOT = Path(tempfile.gettempdir()) / "expense_telegram_receipt_reply_tests"
@@ -893,6 +894,85 @@ def test_ai_receipt_reply_duplicate_ignores_stale_business_context_questions_for
     assert "SHELL PETROL" in fake.messages[-1]
     assert "project, customer, or trip" not in fake.messages[-1].lower()
     assert "attended" not in fake.messages[-1].lower()
+
+
+def test_duplicate_reuses_stored_ai_read_payload_for_fuel_context(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
+    fake = _install_fake_client(monkeypatch)
+    file_unique_id = str(uuid4())
+    payload = _photo_payload(telegram_user_id=41001)
+    payload["message"]["photo"][0]["file_unique_id"] = file_unique_id
+
+    def fail_live(**kwargs):
+        raise AssertionError("duplicate with existing AgentDB read must not call live provider")
+
+    monkeypatch.setattr(
+        telegram_receipt_reply.agent_receipt_live_provider,
+        "call_live_agent_receipt_review",
+        fail_live,
+    )
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(
+            business_reason=None,
+            attendees=None,
+            report_bucket=None,
+        )
+        receipt.extracted_supplier = "KAPTANLAR TURIZM PAZ. SAN. VE TIC.A.S."
+        receipt.extracted_date = date(2026, 4, 27)
+        receipt.extracted_local_amount = Decimal("1660.22")
+        receipt.extracted_currency = "TRY"
+        receipt.uploader_user_id = user.id
+        receipt.telegram_file_unique_id = file_unique_id
+        receipt.status = "extracted"
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        write_mock_agent_receipt_review(
+            session,
+            receipt=receipt,
+            agent_json_text=json.dumps(
+                {
+                    "merchant_name": "KAPTANLAR TURIZM PAZ. SAN. VE TIC.A.S.",
+                    "merchant_address": None,
+                    "receipt_date": "2026-04-27",
+                    "receipt_time": None,
+                    "total_amount": "1660.22",
+                    "currency": "TRY",
+                    "amount_text": "1660.22 TRY",
+                    "line_items": [{"description": "benzin"}],
+                    "tax_amount": None,
+                    "payment_method": None,
+                    "receipt_category": "fuel",
+                    "confidence": 0.91,
+                    "raw_text_summary": "Visible receipt is a Petrol Ofisi fuel receipt for benzin.",
+                },
+                sort_keys=True,
+            ),
+            run_source="telegram_receipt_ai_reply",
+            model_provider="openai",
+            model_name="gpt-live-test",
+        )
+        session.commit()
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        questions = session.exec(select(ClarificationQuestion)).all()
+        runs = session.exec(select(AgentReceiptReviewRun)).all()
+
+    assert result["action"] == "receipt_duplicate"
+    assert result["questions_created"] == 0
+    assert len(runs) == 1
+    assert questions == []
+    assert fake.messages[-1].startswith("Receipt received.")
+    assert "AI second read is advisory only." in fake.messages[-1]
+    assert "AI context: This looks like a gas receipt." in fake.messages[-1]
+    assert "business or personal" not in fake.messages[-1].lower()
+    assert "who was included" not in fake.messages[-1].lower()
 
 
 def test_ai_receipt_reply_duplicate_seeds_meal_context_questions(monkeypatch):

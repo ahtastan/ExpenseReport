@@ -21,7 +21,6 @@ from app.services.receipt_statement_safety import (
     receipt_statement_issues,
 )
 from app.services.merchant_buckets import suggest_bucket
-from app.services.telegram_ai_reply_drafts import build_review_row_reply_draft
 
 
 REQUIRED_FIELDS = [
@@ -308,28 +307,6 @@ def _row_payload(
     if ai_review is not None:
         source["ai_review"] = ai_review
 
-    # F-AI-TG-2: deterministic Telegram reply draft preview for the row.
-    # Display-only; ``send_allowed`` is always False from the draft engine.
-    # The draft input is assembled from the row's existing source block plus
-    # a small receipt-context dict so build_review_row_reply_draft() can
-    # reach both the deterministic safety codes and the per-receipt
-    # business-context fields. This NEVER calls a model, NEVER sends a
-    # Telegram message, NEVER mutates canonical rows, and NEVER affects
-    # attention_required, confirm_review_session, or report_validation.
-    telegram_draft = build_review_row_reply_draft(
-        {
-            "source": source,
-            "receipt": {
-                "business_or_personal": receipt.business_or_personal,
-                "business_reason": receipt.business_reason,
-                "attendees": receipt.attendees,
-                "report_bucket": receipt.report_bucket
-                or suggest_bucket(tx.supplier_raw),
-            },
-        }
-    )
-    if telegram_draft is not None:
-        source["telegram_draft"] = telegram_draft
     suggested = {
         "transaction_id": tx.id,
         "receipt_id": receipt.id,

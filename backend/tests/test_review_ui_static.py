@@ -81,15 +81,12 @@ def main() -> None:
     ):
         assert code in html, f"expected difference code {code!r} in HTML"
 
-    # F-AI-TG-2: Telegram draft preview markers. Display-only component
-    # rendered inside the expanded row. Must clearly say "Not sent" and
-    # must NOT include any send-button copy.
-    assert "TelegramDraftPreview" in html
-    assert "Telegram draft preview" in html
-    assert "Not sent" in html
-    assert "src.telegram_draft" in html
-    assert "telegramDraft" in html
-    assert "TELEGRAM_DRAFT_SEVERITY_PRESENTATION" in html
+    # Telegram draft preview was removed from the review queue.
+    assert "TelegramDraftPreview" not in html
+    assert "Telegram draft preview" not in html
+    assert "src.telegram_draft" not in html
+    assert "telegramDraft" not in html
+    assert "TELEGRAM_DRAFT_SEVERITY_PRESENTATION" not in html
     for forbidden in (
         "Send Telegram",
         "Send to Telegram",

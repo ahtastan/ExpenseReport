@@ -56,6 +56,14 @@ class ReceiptDocument(SQLModel, table=True):
     report_bucket: str | None = None
     business_reason: str | None = None
     attendees: str | None = None
+    # F-AI-Stage1 / F-Data-1 source-tagging additions:
+    category_source: str | None = Field(default=None, index=True)
+    bucket_source: str | None = Field(default=None, index=True)
+    business_reason_source: str | None = Field(default=None, index=True)
+    attendees_source: str | None = Field(default=None, index=True)
+    # Allowed values for all four:
+    # 'user' | 'telegram_user' | 'ai_advisory' | 'auto_confirmed_default' |
+    # 'matching' | 'auto_suggester' | 'legacy_unknown'
     needs_clarification: bool = Field(default=True, index=True)
     # Attach a receipt to an expense report; NULL until M1 Day 4+ endpoint links it.
     expense_report_id: int | None = Field(
@@ -95,6 +103,8 @@ class AgentReceiptReviewRun(SQLModel, table=True):
     # Reserved for later Review Queue / statement-context snapshots. F-AI-0b-1
     # only persists receipt-local canonical snapshots.
     statement_snapshot_json: str | None = Field(default=None, sa_column=Column(Text))
+    # F-AI-Stage1 addition:
+    context_window_json: str | None = Field(default=None, sa_column=Column(Text))
     input_hash: str | None = Field(default=None, index=True)
     raw_model_json: str | None = Field(default=None, sa_column=Column(Text))
     raw_model_json_redacted: bool = True
@@ -130,6 +140,13 @@ class AgentReceiptRead(SQLModel, table=True):
     confidence_json: str | None = Field(default=None, sa_column=Column(Text))
     evidence_json: str | None = Field(default=None, sa_column=Column(Text))
     warnings_json: str | None = Field(default=None, sa_column=Column(Text))
+    # F-AI-Stage1 additions:
+    suggested_business_or_personal: str | None = Field(default=None, index=True)
+    suggested_report_bucket: str | None = Field(default=None, index=True)
+    suggested_attendees_json: str | None = Field(default=None, sa_column=Column(Text))
+    suggested_customer: str | None = None
+    suggested_business_reason: str | None = Field(default=None, sa_column=Column(Text))
+    suggested_confidence_overall: float | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -154,6 +171,37 @@ class AgentReceiptComparison(SQLModel, table=True):
     ai_review_note: str | None = Field(default=None, sa_column=Column(Text))
     canonical_snapshot_hash: str | None = Field(default=None, index=True)
     agent_read_hash: str | None = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class AgentReceiptUserResponse(SQLModel, table=True):
+    """Tracks the user's response to an AI inline-keyboard proposal.
+
+    Mutable (action arrives later). Kept out of the immutable comparison row.
+    One row per AI proposal (one per AgentReceiptReviewRun of run_kind='receipt_inline_keyboard').
+    """
+
+    __tablename__ = "agent_receipt_user_response"
+
+    id: int | None = Field(default=None, primary_key=True)
+    receipt_document_id: int = Field(foreign_key="receiptdocument.id", index=True)
+    agent_receipt_review_run_id: int = Field(
+        foreign_key="agent_receipt_review_run.id", index=True
+    )
+    agent_receipt_read_id: int = Field(
+        foreign_key="agent_receipt_read.id", index=True
+    )
+    telegram_user_id: int | None = Field(default=None, index=True)
+    keyboard_message_id: int | None = None
+
+    user_action: str = Field(index=True)
+    # Allowed values:
+    # 'pending' | 'confirmed' | 'edited' | 'cancelled' |
+    # 'auto_confirmed_timeout' | 'auto_confirmed_supersede'
+
+    user_action_at: datetime | None = Field(default=None, index=True)
+    free_text_reply: str | None = Field(default=None, sa_column=Column(Text))
+    canonical_write_json: str | None = Field(default=None, sa_column=Column(Text))
     created_at: datetime = Field(default_factory=utc_now)
 
 

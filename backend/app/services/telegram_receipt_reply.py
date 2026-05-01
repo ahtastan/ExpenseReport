@@ -130,7 +130,7 @@ def build_telegram_receipt_reply(
         return None
 
     lines = ["Receipt received."]
-    field_lines = _receipt_field_lines(receipt)
+    field_lines = _receipt_field_lines(receipt, ai_review=ai_review)
     if field_lines:
         lines.append("")
         lines.append("I read:")
@@ -283,13 +283,44 @@ def _ai_payload(ai_review: TelegramReceiptAIReview | Mapping[str, Any]) -> Mappi
     return ai_review
 
 
-def _receipt_field_lines(receipt: ReceiptDocument) -> list[str]:
+def _receipt_field_lines(
+    receipt: ReceiptDocument,
+    *,
+    ai_review: TelegramReceiptAIReview | Mapping[str, Any] | None = None,
+) -> list[str]:
+    payload = _ai_payload(ai_review) if ai_review is not None else None
+    if isinstance(payload, Mapping):
+        lines = _ai_receipt_field_lines(payload, receipt)
+        if lines:
+            return lines
+
     lines: list[str] = []
     if receipt.extracted_supplier:
         lines.append(f"Supplier: {receipt.extracted_supplier}")
     if receipt.extracted_date:
         lines.append(f"Date: {receipt.extracted_date.isoformat()}")
     amount = _format_amount(receipt.extracted_local_amount, receipt.extracted_currency)
+    if amount:
+        lines.append(f"Amount: {amount}")
+    return lines
+
+
+def _ai_receipt_field_lines(payload: Mapping[str, Any], receipt: ReceiptDocument) -> list[str]:
+    lines: list[str] = []
+    supplier = _clean(payload.get("merchant_name") or payload.get("supplier") or receipt.extracted_supplier)
+    if supplier:
+        lines.append(f"Supplier: {supplier}")
+
+    date_value = payload.get("receipt_date") or payload.get("date") or receipt.extracted_date
+    date_text = _clean(date_value.isoformat() if hasattr(date_value, "isoformat") else date_value)
+    if date_text:
+        lines.append(f"Date: {date_text}")
+
+    amount_value = payload.get("total_amount") if payload.get("total_amount") is not None else payload.get("amount")
+    if amount_value is None:
+        amount_value = receipt.extracted_local_amount
+    currency = _clean(payload.get("currency") or receipt.extracted_currency)
+    amount = _format_amount(amount_value, currency)
     if amount:
         lines.append(f"Amount: {amount}")
     return lines

@@ -378,7 +378,21 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
                 )
                 .order_by(ClarificationQuestion.id)
             ).all()
-            if open_questions:
+            ai_receipt_reply_sent = False
+            if ai_receipt_reply_allowed:
+                ai_receipt_reply_sent = maybe_send_telegram_receipt_reply(
+                    session,
+                    client,
+                    settings=settings,
+                    receipt=existing,
+                    telegram_user_id=user.telegram_user_id,
+                    chat_id=chat_id,
+                    ai_review=ai_review,
+                )
+            if ai_receipt_reply_sent:
+                if open_questions:
+                    client.send_message(chat_id, open_questions[0].question_text)
+            elif open_questions:
                 if existing.ocr_confidence is not None and existing.ocr_confidence >= 0.6:
                     summary = (
                         f"I read: {existing.extracted_date or '?'} | "

@@ -498,7 +498,10 @@ def test_ai_receipt_reply_duplicate_ignores_stale_business_context_questions_for
         result = telegram_service.handle_update(session, payload)
 
     assert result["action"] == "receipt_duplicate"
-    assert fake.messages[-1] == "Receipt saved."
+    assert fake.messages[-1].startswith("Receipt received.")
+    assert "SHELL PETROL" in fake.messages[-1]
+    assert "project, customer, or trip" not in fake.messages[-1].lower()
+    assert "attended" not in fake.messages[-1].lower()
 
 
 def test_ai_receipt_reply_duplicate_seeds_meal_context_questions(monkeypatch):
@@ -538,6 +541,30 @@ def test_ai_advisory_result_included_uses_advisory_only_copy():
     )
     assert reply is not None
     assert "AI second read is advisory only." in reply
+
+
+def test_live_ai_reply_uses_agent_read_fields_as_primary_display():
+    receipt = _receipt()
+    receipt.extracted_supplier = "OCR Supplier"
+    ai_review = telegram_receipt_reply.TelegramReceiptAIReview(
+        public_ai_review={"status": "pass"},
+        agent_payload={
+            "merchant_name": "AI Supplier",
+            "receipt_date": "2025-12-17",
+            "total_amount": "691.00",
+            "currency": "TRY",
+            "business_context_category": "market",
+            "raw_text_summary": "Visible receipt shows market shopping.",
+        },
+    )
+
+    reply = telegram_receipt_reply.build_telegram_receipt_reply(receipt, ai_review=ai_review)
+
+    assert reply is not None
+    assert "Supplier: AI Supplier" in reply
+    assert "Date: 2025-12-17" in reply
+    assert "Amount: 691.00 TRY" in reply
+    assert "OCR Supplier" not in reply
 
 
 def test_reply_never_contains_forbidden_phrases_or_private_fields():
@@ -921,6 +948,71 @@ def test_duplicate_live_ai_second_read_controls_meal_context_when_ocr_supplier_i
     assert calls
     assert [question.question_key for question in questions] == ["business_reason", "attendees"]
     assert fake.messages[-1] == "What project, customer, or trip should this receipt be attached to?"
+
+
+def test_duplicate_live_ai_sends_ai_reply_when_no_questions(monkeypatch):
+    _set_reply_env(monkeypatch, enabled=True, allowlist="41001", live=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake = _install_fake_client(monkeypatch)
+    file_unique_id = str(uuid4())
+    payload = _photo_payload(telegram_user_id=41001)
+    payload["message"]["photo"][0]["file_unique_id"] = file_unique_id
+
+    def fake_live(**kwargs):
+        return telegram_receipt_reply.agent_receipt_live_provider.LiveAgentReceiptReviewResult(
+            agent_payload={
+                "merchant_name": "Serbest Market",
+                "merchant_address": None,
+                "receipt_date": "2025-12-17",
+                "receipt_time": None,
+                "total_amount": "691.00",
+                "currency": "TRY",
+                "amount_text": "691.00 TRY",
+                "line_items": [{"description": "Monster Ultra Energy"}],
+                "tax_amount": None,
+                "payment_method": None,
+                "receipt_category": "market",
+                "confidence": 0.91,
+                "raw_text_summary": "Visible receipt shows market shopping and snacks.",
+                "business_context_needed": False,
+                "business_context_category": "market",
+                "business_context_reason": "market/snacks purchase",
+            },
+            raw_response_json=json.dumps({"business_context_category": "market"}),
+            prompt_text="hidden prompt",
+            model_name="gpt-live-test",
+        )
+
+    monkeypatch.setattr(
+        telegram_receipt_reply.agent_receipt_live_provider,
+        "call_live_agent_receipt_review",
+        fake_live,
+    )
+
+    with Session(engine) as session:
+        user = AppUser(telegram_user_id=41001, display_name="Op")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        receipt = _receipt(business_reason=None, attendees=None, report_bucket=None)
+        receipt.extracted_supplier = "Serbest Market"
+        receipt.uploader_user_id = user.id
+        receipt.telegram_file_unique_id = file_unique_id
+        receipt.status = "extracted"
+        session.add(receipt)
+        session.commit()
+
+    with Session(engine) as session:
+        result = telegram_service.handle_update(session, payload)
+        questions = session.exec(select(ClarificationQuestion).order_by(ClarificationQuestion.id)).all()
+
+    assert result["action"] == "receipt_duplicate"
+    assert result["questions_created"] == 0
+    assert questions == []
+    assert fake.messages[-1].startswith("Receipt received.")
+    assert "Supplier: Serbest Market" in fake.messages[-1]
+    assert "AI context: This looks like market/snacks." in fake.messages[-1]
+    assert fake.messages[-1] != "Receipt saved."
 
 
 def test_live_model_failure_falls_back_to_deterministic_reply(monkeypatch):

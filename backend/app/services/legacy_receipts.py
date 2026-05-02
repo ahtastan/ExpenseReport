@@ -104,6 +104,14 @@ def import_legacy_receipt_mapping(
         receipt.report_bucket = row.get("Suggested Expense Report Bucket") or None
         receipt.business_reason = None
         receipt.attendees = None
+        # F-AI-Stage1 sub-PR 5: source-tag the legacy CSV mapping import. The
+        # canonical fields here come from the pre-EDT spreadsheet; we have no
+        # provenance richer than "from the legacy backfill", which is exactly
+        # what ``legacy_unknown`` means in the locked vocabulary.
+        if receipt.business_or_personal is not None and receipt.category_source is None:
+            receipt.category_source = "legacy_unknown"
+        if receipt.report_bucket is not None and receipt.bucket_source is None:
+            receipt.bucket_source = "legacy_unknown"
         receipt.needs_clarification = _bool_from_yes(row.get("Needs Manual Review"), default=True)
 
         session.add(receipt)

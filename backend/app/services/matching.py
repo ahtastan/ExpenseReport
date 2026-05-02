@@ -387,6 +387,11 @@ def run_matching(
                     and receipt.report_bucket is None
                 ):
                     receipt.report_bucket = decision.suggested_bucket
+                    # F-AI-Stage1 sub-PR 5: source-tag match-decision-driven
+                    # canonical writes. Per the locked vocabulary, a bucket
+                    # auto-applied from a Diners-statement disambiguation/
+                    # classification is ``matching``.
+                    receipt.bucket_source = "matching"
                     receipt.updated_at = now
                     session.add(receipt)
                     stats.bucket_auto_applied += 1

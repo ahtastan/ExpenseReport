@@ -500,6 +500,12 @@ def apply_receipt_extraction(session: Session, receipt: ReceiptDocument) -> Rece
     receipt.extracted_local_amount = result.extracted_local_amount
     receipt.extracted_currency = result.extracted_currency
     receipt.business_or_personal = result.business_or_personal
+    # F-AI-Stage1 sub-PR 5: source-tag the OCR/vision-derived classification
+    # whenever this is the first writer to set business_or_personal. We do
+    # NOT overwrite an upload-time keyboard default (auto_confirmed_default)
+    # or any later user/AI tag — those are sticky.
+    if result.business_or_personal is not None and receipt.category_source is None:
+        receipt.category_source = "auto_suggester"
     # Addition B: stored wins — don't clobber an existing classification.
     if receipt.receipt_type is None and result.receipt_type is not None:
         receipt.receipt_type = result.receipt_type

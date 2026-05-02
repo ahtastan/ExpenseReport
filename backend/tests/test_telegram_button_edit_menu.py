@@ -800,6 +800,68 @@ def test_skip_reason_attendees_button_sets_needs_clarification(isolated_db, monk
     assert response.user_action == "edited"
 
 
+def test_skip_then_confirm_preserves_needs_clarification(isolated_db, monkeypatch):
+    """Skip-for-now on Meals attendees+reason then Confirm: the
+    'review me later' signal must survive the AI-advisory write that
+    Confirm triggers. The canonical writer otherwise auto-clears
+    ``needs_clarification`` whenever it writes any field."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(
+            session,
+            suggested_business_or_personal="Business",
+            suggested_report_bucket="Meals/Snacks",
+            suggested_attendees=["AI proposed attendee"],
+            suggested_business_reason="AI proposed reason",
+        )
+
+    from app.category_vocab import all_buckets, categories
+
+    flat = all_buckets()
+    cats = categories()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+            handle_update(session, _menu_callback("edit", "category", ids["response_id"]))
+            handle_update(
+                session,
+                _menu_callback("cat1", str(cats.index("Meals & Entertainment")), ids["response_id"]),
+            )
+            handle_update(
+                session,
+                _menu_callback("cat2", str(flat.index("Lunch")), ids["response_id"]),
+            )
+            handle_update(session, _menu_callback("skip_ra", "", ids["response_id"]))
+        with Session(isolated_db) as session:
+            r = handle_update(session, _callback("confirm", ids["response_id"]))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_confirmed"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    # The "user pressed Skip" signal must persist past Confirm. The
+    # writer detects the ``telegram_user_skipped`` sentinel on attendees
+    # / business_reason source and skips its usual auto-clear of
+    # ``needs_clarification``.
+    assert receipt.needs_clarification is True
+    # User-picked bucket stays sticky.
+    assert receipt.report_bucket == "Lunch"
+    assert receipt.bucket_source == "telegram_user"
+    # Per Phase 4 spec, AI's proposal lands on Confirm with ai_advisory
+    # source for fields the user didn't explicitly set. The Skip-for-now
+    # sentinel does not block this — it only preserves the flag.
+    assert receipt.attendees == "AI proposed attendee"
+    assert receipt.attendees_source == "ai_advisory"
+    assert receipt.business_reason == "AI proposed reason"
+    assert receipt.business_reason_source == "ai_advisory"
+    assert response.user_action == "confirmed"
+
+
 # ─── Type toggle ────────────────────────────────────────────────────────────
 
 

@@ -1581,10 +1581,14 @@ def _handle_menu_skip_reason_attendees(
     message_id: int | None,
 ) -> dict[str, Any]:
     """Skip the attendees+reason prompt after a Meals bucket pick. Does NOT
-    write attendees/business_reason. Marks the receipt as needing follow-up
-    via ``needs_clarification=True`` (the only ReceiptDocument-level
-    attention column available)."""
+    write attendees/business_reason values, but stamps both source columns
+    with the ``telegram_user_skipped`` sentinel so the canonical writer
+    (a) won't overwrite the AI proposal that lands on Confirm with its own
+    advisory and (b) preserves ``needs_clarification=True`` across the
+    write — the "review me later" signal must survive."""
     receipt.needs_clarification = True
+    receipt.attendees_source = "telegram_user_skipped"
+    receipt.business_reason_source = "telegram_user_skipped"
     receipt.updated_at = utc_now()
     session.add(receipt)
 

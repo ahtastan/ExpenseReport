@@ -113,6 +113,16 @@ def write_ai_proposal_to_canonical(
     suggestion = _suggestion_view(agent_read)
     written: dict[str, Any] = {"source_tag": source_tag, "fields": {}}
 
+    # ``telegram_user_skipped`` is a PR4 sentinel set by the Skip-for-now
+    # handler on Meals attendees+reason. It is NOT a user-source for the
+    # overwrite rule — per spec, Confirm must let AI's proposal land
+    # (source=ai_advisory) on these fields. The sentinel only signals
+    # "preserve ``needs_clarification`` across this write" — captured
+    # below before the field writes (which may overwrite the source).
+    skip_signal = (
+        receipt.attendees_source == "telegram_user_skipped"
+        or receipt.business_reason_source == "telegram_user_skipped"
+    )
     user_sources = {"telegram_user", "user"} if respect_existing_user_source else set()
 
     if suggestion["business_or_personal"] is not None and (
@@ -157,12 +167,15 @@ def write_ai_proposal_to_canonical(
         written["fields"]["customer"] = suggestion["customer"]
 
     # Once the AI proposal is accepted (or auto-confirmed) the receipt
-    # no longer needs the clarification-question follow-up flow. Always
-    # clear ``needs_clarification`` whenever any field is written, so
-    # the legacy "Was this business or personal..." prompts don't
-    # re-fire on a Telegram user who already used the keyboard.
+    # no longer needs the clarification-question follow-up flow. Clear
+    # ``needs_clarification`` whenever any field is written, so the
+    # legacy "Was this business or personal..." prompts don't re-fire on
+    # a Telegram user who already used the keyboard. Opt-out: the
+    # ``telegram_user_skipped`` sentinel detected above signals "user
+    # explicitly deferred attendees+reason — keep the flag for review."
     if written["fields"]:
-        receipt.needs_clarification = False
+        if not skip_signal:
+            receipt.needs_clarification = False
         receipt.updated_at = utc_now()
         session.add(receipt)
 

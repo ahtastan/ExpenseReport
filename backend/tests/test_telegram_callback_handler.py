@@ -18,6 +18,10 @@ from app.models import (
     ClarificationQuestion,
     ReceiptDocument,
 )
+from app.services.agent_receipt_canonical_writer import (
+    CanonicalWriteLinkageError,
+    write_ai_proposal_to_canonical,
+)
 from app.services.telegram import handle_update
 
 
@@ -555,6 +559,129 @@ def test_edit_reply_only_tags_changed_fields_telegram_user(isolated_db, monkeypa
     assert receipt.bucket_source == "ai_advisory"
     assert receipt.business_reason_source == "ai_advisory"
     assert response.user_action == "confirmed"
+
+
+def test_canonical_writer_rejects_mismatched_linkage(isolated_db):
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+        target_receipt = ReceiptDocument(
+            source="telegram",
+            status="received",
+            content_type="photo",
+            extracted_supplier="Wrong Receipt",
+            extracted_date=date(2026, 5, 2),
+            extracted_local_amount=Decimal("10.00"),
+            extracted_currency="TRY",
+        )
+        session.add(target_receipt)
+        session.commit()
+        session.refresh(target_receipt)
+
+        agent_read = session.get(AgentReceiptRead, ids["agent_read_id"])
+        with pytest.raises(CanonicalWriteLinkageError):
+            write_ai_proposal_to_canonical(
+                session,
+                receipt=target_receipt,
+                agent_read=agent_read,
+                source_tag="ai_advisory",
+            )
+        session.rollback()
+
+        refreshed = session.get(ReceiptDocument, target_receipt.id)
+        assert refreshed.business_or_personal is None
+        assert refreshed.report_bucket is None
+        assert refreshed.attendees is None
+        assert refreshed.business_reason is None
+        assert refreshed.category_source is None
+        assert refreshed.bucket_source is None
+        assert refreshed.attendees_source is None
+        assert refreshed.business_reason_source is None
+
+
+def test_canonical_writer_rejects_mismatched_review_run(isolated_db):
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        agent_read = session.get(AgentReceiptRead, ids["agent_read_id"])
+        other_run = AgentReceiptReviewRun(
+            receipt_document_id=receipt.id,
+            run_source="telegram_receipt_inline_keyboard",
+            run_kind="receipt_inline_keyboard",
+            status="completed",
+            schema_version="stage1",
+            prompt_version="agent_receipt_inline_keyboard_prompt_stage1_v1",
+            comparator_version="agent_receipt_comparator_0a",
+        )
+        session.add(other_run)
+        session.commit()
+        session.refresh(other_run)
+
+        with pytest.raises(CanonicalWriteLinkageError):
+            write_ai_proposal_to_canonical(
+                session,
+                receipt=receipt,
+                agent_read=agent_read,
+                source_tag="ai_advisory",
+                expected_review_run_id=other_run.id,
+            )
+        session.rollback()
+
+        refreshed = session.get(ReceiptDocument, ids["receipt_id"])
+        assert refreshed.business_or_personal is None
+        assert refreshed.report_bucket is None
+        assert refreshed.category_source is None
+        assert refreshed.bucket_source is None
+
+
+def test_callback_handles_linkage_error_gracefully(isolated_db, caplog):
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+        other_receipt = ReceiptDocument(
+            source="telegram",
+            status="received",
+            content_type="photo",
+            extracted_supplier="Other Receipt",
+            extracted_date=date(2026, 5, 2),
+            extracted_local_amount=Decimal("10.00"),
+            extracted_currency="TRY",
+        )
+        session.add(other_receipt)
+        session.commit()
+        session.refresh(other_receipt)
+
+        agent_read = session.get(AgentReceiptRead, ids["agent_read_id"])
+        agent_read.receipt_document_id = other_receipt.id
+        session.add(agent_read)
+        session.commit()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    caplog.set_level(logging.ERROR, logger="app.services.telegram")
+    try:
+        with Session(isolated_db) as session:
+            result = handle_update(
+                session,
+                _callback_payload(
+                    telegram_user_id=ids["telegram_user_id"],
+                    response_id=ids["response_id"],
+                    action="confirm",
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert result["action"] == "callback_failed_validation"
+    assert any(c[0] == "answerCallbackQuery" for c in client.calls)
+    assert "canonical write linkage failed" in caplog.text
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+
+    assert response.user_action == "failed_validation"
+    assert response.canonical_write_json is None
+    assert receipt.business_or_personal is None
+    assert receipt.report_bucket is None
+    assert receipt.category_source is None
 
 
 @pytest.mark.parametrize("action", ("confirm", "edit", "cancel"))

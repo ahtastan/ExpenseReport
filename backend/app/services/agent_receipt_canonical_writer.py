@@ -33,6 +33,11 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
+
+class CanonicalWriteLinkageError(RuntimeError):
+    """Raised when an AI read is not linked to the receipt being written."""
+
+
 _ALLOWED_SOURCE_TAGS = {
     "user",
     "telegram_user",
@@ -50,6 +55,7 @@ def write_ai_proposal_to_canonical(
     receipt: ReceiptDocument,
     agent_read: AgentReceiptRead,
     source_tag: str,
+    expected_review_run_id: int | None = None,
 ) -> dict[str, Any]:
     """Write the AI proposal into the canonical receipt + review row.
 
@@ -61,12 +67,40 @@ def write_ai_proposal_to_canonical(
             ``auto_confirmed_default`` (timeout / supersede). Other
             values from the source-tag vocabulary are accepted for
             forward compatibility.
+        expected_review_run_id: optional linkage guard used by
+            ``AgentReceiptUserResponse`` callers.
 
     Returns:
         The dict that was persisted, suitable for storage in
         ``AgentReceiptUserResponse.canonical_write_json`` as an audit
         trail of what changed.
     """
+    if agent_read.receipt_document_id != receipt.id:
+        logger.error(
+            "write_ai_proposal_to_canonical: linkage mismatch - "
+            "agent_read.id=%s claims receipt_document_id=%s but caller "
+            "passed receipt.id=%s; refusing to write",
+            agent_read.id,
+            agent_read.receipt_document_id,
+            receipt.id,
+        )
+        raise CanonicalWriteLinkageError(
+            f"agent_read {agent_read.id} does not belong to receipt {receipt.id}"
+        )
+    if expected_review_run_id is not None and agent_read.run_id != expected_review_run_id:
+        logger.error(
+            "write_ai_proposal_to_canonical: review-run linkage mismatch - "
+            "agent_read.id=%s claims run_id=%s but caller expected run_id=%s; "
+            "refusing to write",
+            agent_read.id,
+            agent_read.run_id,
+            expected_review_run_id,
+        )
+        raise CanonicalWriteLinkageError(
+            f"agent_read {agent_read.id} does not belong to review run "
+            f"{expected_review_run_id}"
+        )
+
     if source_tag not in _ALLOWED_SOURCE_TAGS:
         raise ValueError(f"unknown source_tag: {source_tag!r}")
 

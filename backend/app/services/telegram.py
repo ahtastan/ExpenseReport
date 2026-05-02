@@ -20,7 +20,10 @@ from app.models import (
     ReceiptDocument,
     utc_now,
 )
-from app.services.agent_receipt_canonical_writer import write_ai_proposal_to_canonical
+from app.services.agent_receipt_canonical_writer import (
+    CanonicalWriteLinkageError,
+    write_ai_proposal_to_canonical,
+)
 from app.services.clarifications import (
     TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
     answer_question,
@@ -321,12 +324,25 @@ def _close_pending_response(
         session.commit()
         return
 
-    written = write_ai_proposal_to_canonical(
-        session,
-        receipt=receipt,
-        agent_read=agent_read,
-        source_tag="auto_confirmed_default",
-    )
+    try:
+        written = write_ai_proposal_to_canonical(
+            session,
+            receipt=receipt,
+            agent_read=agent_read,
+            source_tag="auto_confirmed_default",
+            expected_review_run_id=user_response.agent_receipt_review_run_id,
+        )
+    except CanonicalWriteLinkageError as exc:
+        logger.error(
+            "canonical write linkage failed during auto-close response_id=%s "
+            "agent_read_id=%s receipt_id=%s: %s",
+            user_response.id,
+            agent_read.id,
+            receipt.id,
+            exc,
+        )
+        _mark_response_failed_validation(session, user_response)
+        return
     user_response.user_action = (
         "auto_confirmed_timeout" if reason == "timeout" else "auto_confirmed_supersede"
     )
@@ -358,11 +374,22 @@ def _close_pending_response(
             )
 
 
+def _mark_response_failed_validation(
+    session: Session,
+    user_response: AgentReceiptUserResponse,
+) -> None:
+    user_response.user_action = "failed_validation"
+    user_response.user_action_at = utc_now()
+    session.add(user_response)
+    session.commit()
+
+
 def _auto_close_pending_responses(
     session: Session,
     client: "TelegramClient",
     *,
     user_id: int,
+    telegram_user_id: int | None,
     chat_id: int | None,
     reason: str,
     now: datetime | None = None,
@@ -394,6 +421,27 @@ def _auto_close_pending_responses(
                 response_created_at = response_created_at.replace(tzinfo=timezone.utc)
             if response_created_at > cutoff:
                 continue
+        if response.telegram_user_id is None:
+            logger.warning(
+                "inline keyboard auto-close: response_id=%s has null "
+                "telegram_user_id; marking failed_validation",
+                response.id,
+            )
+            _mark_response_failed_validation(session, response)
+            closed += 1
+            continue
+        if response.telegram_user_id != telegram_user_id:
+            logger.warning(
+                "inline keyboard auto-close: response_id=%s owned by "
+                "telegram_user_id=%s but current telegram_user_id=%s; "
+                "marking failed_validation",
+                response.id,
+                response.telegram_user_id,
+                telegram_user_id,
+            )
+            _mark_response_failed_validation(session, response)
+            closed += 1
+            continue
         _close_pending_response(
             session,
             client,
@@ -480,6 +528,7 @@ def _handle_callback_query(
         session,
         client,
         user_id=user.id,
+        telegram_user_id=user.telegram_user_id,
         chat_id=chat_id,
         reason="timeout",
     )
@@ -567,12 +616,29 @@ def _handle_callback_confirm(
     chat_id: int | None,
     message_id: int | None,
 ) -> dict[str, Any]:
-    written = write_ai_proposal_to_canonical(
-        session,
-        receipt=receipt,
-        agent_read=agent_read,
-        source_tag="ai_advisory",
-    )
+    try:
+        written = write_ai_proposal_to_canonical(
+            session,
+            receipt=receipt,
+            agent_read=agent_read,
+            source_tag="ai_advisory",
+            expected_review_run_id=user_response.agent_receipt_review_run_id,
+        )
+    except CanonicalWriteLinkageError as exc:
+        logger.error(
+            "canonical write linkage failed during confirm callback response_id=%s "
+            "agent_read_id=%s receipt_id=%s: %s",
+            user_response.id,
+            agent_read.id,
+            receipt.id,
+            exc,
+        )
+        _mark_response_failed_validation(session, user_response)
+        return {
+            "ok": False,
+            "action": "callback_failed_validation",
+            "user_response_id": user_response.id,
+        }
     user_response.user_action = "confirmed"
     user_response.user_action_at = utc_now()
     user_response.canonical_write_json = json_dumps(written, sort_keys=True)
@@ -746,6 +812,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         session,
         client,
         user_id=user.id,
+        telegram_user_id=user.telegram_user_id,
         chat_id=chat_id,
         reason="timeout",
     )
@@ -1041,6 +1108,7 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
             session,
             client,
             user_id=user.id,
+            telegram_user_id=user.telegram_user_id,
             chat_id=chat_id,
             reason="supersede",
         )

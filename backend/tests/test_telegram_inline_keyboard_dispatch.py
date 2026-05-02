@@ -424,6 +424,272 @@ def test_supersede_flow(isolated_db, monkeypatch):
         assert prior_receipt_refreshed.business_reason_source == "auto_confirmed_default"
 
 
+def test_auto_confirm_skips_null_owner_rows(isolated_db, monkeypatch):
+    _enable_flag_env(monkeypatch, keyboard=True)
+    old_time = datetime.now(timezone.utc) - timedelta(hours=25)
+    with Session(isolated_db) as session:
+        user_id = _seed_user(session, telegram_user_id=8038997793)
+        prior_receipt = ReceiptDocument(
+            uploader_user_id=user_id,
+            source="telegram",
+            status="received",
+            content_type="photo",
+            telegram_chat_id=42,
+            extracted_supplier="Old Cafe",
+            extracted_date=date(2026, 4, 28),
+            extracted_local_amount=Decimal("50.00"),
+            extracted_currency="TRY",
+        )
+        session.add(prior_receipt)
+        session.commit()
+        session.refresh(prior_receipt)
+        run = AgentReceiptReviewRun(
+            receipt_document_id=prior_receipt.id,
+            run_source="telegram_receipt_inline_keyboard",
+            run_kind="receipt_inline_keyboard",
+            status="completed",
+            schema_version="stage1",
+            prompt_version="agent_receipt_inline_keyboard_prompt_stage1_v1",
+            comparator_version="agent_receipt_comparator_0a",
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        read = AgentReceiptRead(
+            run_id=run.id,
+            receipt_document_id=prior_receipt.id,
+            read_schema_version="stage1",
+            read_json="{}",
+            suggested_business_or_personal="Business",
+            suggested_report_bucket="Meals/Snacks",
+            suggested_business_reason="Old proposal",
+        )
+        session.add(read)
+        session.commit()
+        session.refresh(read)
+        response = AgentReceiptUserResponse(
+            receipt_document_id=prior_receipt.id,
+            agent_receipt_review_run_id=run.id,
+            agent_receipt_read_id=read.id,
+            telegram_user_id=None,
+            keyboard_message_id=777,
+            user_action="pending",
+            created_at=old_time,
+        )
+        session.add(response)
+        session.commit()
+        response_id = response.id
+        receipt_id = prior_receipt.id
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update_local(
+                session,
+                {
+                    "message": {
+                        "message_id": 1,
+                        "from": {"id": 8038997793, "first_name": "Hakan"},
+                        "chat": {"id": 42, "type": "private"},
+                        "text": "hi",
+                    }
+                },
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    with Session(isolated_db) as session:
+        refreshed_response = session.get(AgentReceiptUserResponse, response_id)
+        refreshed_receipt = session.get(ReceiptDocument, receipt_id)
+    assert refreshed_response.user_action == "failed_validation"
+    assert refreshed_response.canonical_write_json is None
+    assert refreshed_receipt.business_or_personal is None
+    assert refreshed_receipt.category_source is None
+
+
+def test_auto_confirm_skips_cross_user_rows(isolated_db, monkeypatch):
+    _enable_flag_env(monkeypatch, keyboard=True, allowlist="8038997793 8038997794")
+    old_time = datetime.now(timezone.utc) - timedelta(hours=25)
+    with Session(isolated_db) as session:
+        user_a_id = _seed_user(session, telegram_user_id=8038997793)
+        _seed_user(session, telegram_user_id=8038997794)
+        prior_receipt = ReceiptDocument(
+            uploader_user_id=user_a_id,
+            source="telegram",
+            status="received",
+            content_type="photo",
+            telegram_chat_id=42,
+            extracted_supplier="User A Cafe",
+            extracted_date=date(2026, 4, 28),
+            extracted_local_amount=Decimal("50.00"),
+            extracted_currency="TRY",
+        )
+        session.add(prior_receipt)
+        session.commit()
+        session.refresh(prior_receipt)
+        run = AgentReceiptReviewRun(
+            receipt_document_id=prior_receipt.id,
+            run_source="telegram_receipt_inline_keyboard",
+            run_kind="receipt_inline_keyboard",
+            status="completed",
+            schema_version="stage1",
+            prompt_version="agent_receipt_inline_keyboard_prompt_stage1_v1",
+            comparator_version="agent_receipt_comparator_0a",
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        read = AgentReceiptRead(
+            run_id=run.id,
+            receipt_document_id=prior_receipt.id,
+            read_schema_version="stage1",
+            read_json="{}",
+            suggested_business_or_personal="Business",
+            suggested_report_bucket="Meals/Snacks",
+            suggested_business_reason="User A proposal",
+        )
+        session.add(read)
+        session.commit()
+        session.refresh(read)
+        response = AgentReceiptUserResponse(
+            receipt_document_id=prior_receipt.id,
+            agent_receipt_review_run_id=run.id,
+            agent_receipt_read_id=read.id,
+            telegram_user_id=8038997793,
+            keyboard_message_id=777,
+            user_action="pending",
+            created_at=old_time,
+        )
+        session.add(response)
+        session.commit()
+        response_id = response.id
+        receipt_id = prior_receipt.id
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update_local(
+                session,
+                {
+                    "message": {
+                        "message_id": 1,
+                        "from": {"id": 8038997794, "first_name": "Burak"},
+                        "chat": {"id": 42, "type": "private"},
+                        "text": "hi",
+                    }
+                },
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    with Session(isolated_db) as session:
+        refreshed_response = session.get(AgentReceiptUserResponse, response_id)
+        refreshed_receipt = session.get(ReceiptDocument, receipt_id)
+    assert refreshed_response.user_action == "pending"
+    assert refreshed_response.canonical_write_json is None
+    assert refreshed_receipt.business_or_personal is None
+    assert refreshed_receipt.category_source is None
+
+
+def test_auto_confirm_linkage_error_marks_failed_validation(isolated_db, monkeypatch):
+    _enable_flag_env(monkeypatch, keyboard=True)
+    old_time = datetime.now(timezone.utc) - timedelta(hours=25)
+    with Session(isolated_db) as session:
+        user_id = _seed_user(session, telegram_user_id=8038997793)
+        prior_receipt = ReceiptDocument(
+            uploader_user_id=user_id,
+            source="telegram",
+            status="received",
+            content_type="photo",
+            telegram_chat_id=42,
+            extracted_supplier="Old Cafe",
+            extracted_date=date(2026, 4, 28),
+            extracted_local_amount=Decimal("50.00"),
+            extracted_currency="TRY",
+        )
+        other_receipt = ReceiptDocument(
+            uploader_user_id=user_id,
+            source="telegram",
+            status="received",
+            content_type="photo",
+            telegram_chat_id=42,
+            extracted_supplier="Other Cafe",
+            extracted_date=date(2026, 4, 29),
+            extracted_local_amount=Decimal("10.00"),
+            extracted_currency="TRY",
+        )
+        session.add(prior_receipt)
+        session.add(other_receipt)
+        session.commit()
+        session.refresh(prior_receipt)
+        session.refresh(other_receipt)
+        run = AgentReceiptReviewRun(
+            receipt_document_id=other_receipt.id,
+            run_source="telegram_receipt_inline_keyboard",
+            run_kind="receipt_inline_keyboard",
+            status="completed",
+            schema_version="stage1",
+            prompt_version="agent_receipt_inline_keyboard_prompt_stage1_v1",
+            comparator_version="agent_receipt_comparator_0a",
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        read = AgentReceiptRead(
+            run_id=run.id,
+            receipt_document_id=other_receipt.id,
+            read_schema_version="stage1",
+            read_json="{}",
+            suggested_business_or_personal="Business",
+            suggested_report_bucket="Meals/Snacks",
+            suggested_business_reason="Wrong receipt proposal",
+        )
+        session.add(read)
+        session.commit()
+        session.refresh(read)
+        response = AgentReceiptUserResponse(
+            receipt_document_id=prior_receipt.id,
+            agent_receipt_review_run_id=run.id,
+            agent_receipt_read_id=read.id,
+            telegram_user_id=8038997793,
+            keyboard_message_id=777,
+            user_action="pending",
+            created_at=old_time,
+        )
+        session.add(response)
+        session.commit()
+        response_id = response.id
+        receipt_id = prior_receipt.id
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update_local(
+                session,
+                {
+                    "message": {
+                        "message_id": 1,
+                        "from": {"id": 8038997793, "first_name": "Hakan"},
+                        "chat": {"id": 42, "type": "private"},
+                        "text": "hi",
+                    }
+                },
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    with Session(isolated_db) as session:
+        refreshed_response = session.get(AgentReceiptUserResponse, response_id)
+        refreshed_receipt = session.get(ReceiptDocument, receipt_id)
+    assert refreshed_response.user_action == "failed_validation"
+    assert refreshed_response.canonical_write_json is None
+    assert refreshed_receipt.business_or_personal is None
+    assert refreshed_receipt.category_source is None
+
+
 def test_timeout_flow(isolated_db, monkeypatch):
     """Pending row >24h → flips to auto_confirmed_timeout on next webhook event."""
     _enable_flag_env(monkeypatch, keyboard=True)
@@ -504,6 +770,11 @@ def test_timeout_flow(isolated_db, monkeypatch):
     with Session(isolated_db) as session:
         old_refreshed = session.get(AgentReceiptUserResponse, old_response_id)
         assert old_refreshed.user_action == "auto_confirmed_timeout"
+        receipt = session.get(ReceiptDocument, old_refreshed.receipt_document_id)
+        assert receipt.business_or_personal == "Personal"
+        assert receipt.report_bucket == "Other"
+        assert receipt.category_source == "auto_confirmed_default"
+        assert receipt.bucket_source == "auto_confirmed_default"
 
 
 def test_reviewer_failure_falls_back_to_legacy(isolated_db, monkeypatch):

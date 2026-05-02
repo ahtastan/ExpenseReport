@@ -197,7 +197,11 @@ class AgentReceiptUserResponse(SQLModel, table=True):
     user_action: str = Field(index=True)
     # Allowed values:
     # 'pending' | 'confirmed' | 'edited' | 'cancelled' |
-    # 'auto_confirmed_timeout' | 'auto_confirmed_supersede'
+    # 'auto_confirmed_timeout' | 'auto_confirmed_supersede' |
+    # 'failed_validation' |
+    # PR4 button-driven Edit menu interim states (additive, no schema change):
+    # 'awaiting_supplier' | 'awaiting_date' | 'awaiting_amount' |
+    # 'awaiting_attendees_reason'
 
     user_action_at: datetime | None = Field(default=None, index=True)
     free_text_reply: str | None = Field(default=None, sa_column=Column(Text))

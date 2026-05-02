@@ -1,13 +1,27 @@
-"""F-AI-Stage1 sub-PR 3: build the three-button inline-keyboard reply.
+"""F-AI-Stage1 sub-PR 3 + PR4: inline-keyboard composition + Edit menu.
 
-Composes a Telegram ``sendMessage`` payload containing the canonical OCR
-read, the AI proposal (``suggested_*`` columns from the
-``receipt_inline_keyboard`` run), and three callback buttons:
-``[✅ Confirm] [✏️ Edit] [❌ Cancel]``.
+PR3 introduced the top-level keyboard with three buttons:
+  ``[✅ Confirm] [✏️ Edit] [❌ Cancel]``
+encoded as ``fai1:<action>:<user_response_id>``.
 
-Callback data uses the format ``fai1:<action>:<user_response_id>`` where
-``action`` is ``confirm`` / ``edit`` / ``cancel``. Total length stays
-within Telegram's 64-byte limit for any reasonable response id.
+PR4 replaces the text-parse Edit fallback with a button-driven Edit menu.
+New callback prefix ``fai1m`` for menu navigation:
+  ``fai1m:<scope>:<choice>:<user_response_id>``
+where ``scope`` selects which sub-menu the button lives in:
+
+* ``edit``  - top-level Edit menu (choice in {receipt, category, type, back})
+* ``rcpt``  - Receipt info quick-pick (choice in {supplier, date, amount, back})
+* ``cat1``  - Tier 1 category picker (choice = numeric index or 'back')
+* ``cat2``  - Tier 2 bucket picker (choice = global bucket index or 'back')
+* ``type``  - Type toggle (choice in {personal, back})
+* ``skip_ra`` - one-button "skip reason/attendees" (no choice; uses
+                ``fai1m:skip_ra::<user_response_id>``)
+
+Indices for cat1/cat2 are positions in
+``app.category_vocab.categories()`` and ``app.category_vocab.all_buckets()``,
+respectively. Using indices keeps callback_data well under Telegram's
+64-byte limit even for long bucket names like 'Membership/Subscription
+Fees'.
 
 Reference: docs/F-AI-Stage1-Telegram-Inline-Keyboard.md §5.3
 """
@@ -26,6 +40,13 @@ CALLBACK_DATA_PREFIX = "fai1"
 CALLBACK_ACTIONS = ("confirm", "edit", "cancel")
 _CALLBACK_DATA_MAX_BYTES = 64
 _BUSINESS_REASON_DISPLAY_LIMIT = 200
+
+# PR4: menu-navigation callback data.
+MENU_CALLBACK_DATA_PREFIX = "fai1m"
+MENU_SCOPES = ("edit", "rcpt", "cat1", "cat2", "type", "skip_ra")
+EDIT_MENU_CHOICES = ("receipt", "category", "type", "back")
+RECEIPT_MENU_CHOICES = ("supplier", "date", "amount", "back")
+TYPE_MENU_CHOICES = ("personal", "back")
 
 
 def build_inline_keyboard_reply(
@@ -53,12 +74,13 @@ def build_inline_keyboard_reply(
 
 
 def parse_callback_data(data: str | None) -> tuple[str, int] | None:
-    """Inverse of the format used by :func:`build_inline_keyboard_reply`.
+    """Top-level button parser.
 
-    Returns ``(action, user_response_id)`` or ``None`` when ``data`` is
-    malformed (wrong prefix, unknown action, non-integer id, missing
-    parts). Callers handle ``None`` by silently dismissing the callback
-    (no exception raised).
+    Returns ``(action, user_response_id)`` for ``fai1:<action>:<id>`` where
+    ``action`` is one of :data:`CALLBACK_ACTIONS`. Returns ``None`` for
+    malformed data, an unknown action, or any callback that uses the
+    menu-navigation prefix :data:`MENU_CALLBACK_DATA_PREFIX` (those go
+    through :func:`parse_menu_callback_data` instead).
     """
     if not isinstance(data, str) or not data:
         return None
@@ -75,6 +97,218 @@ def parse_callback_data(data: str | None) -> tuple[str, int] | None:
     except (TypeError, ValueError):
         return None
     return action, user_response_id
+
+
+def parse_menu_callback_data(data: str | None) -> tuple[str, str, int] | None:
+    """Menu-navigation button parser.
+
+    Format: ``fai1m:<scope>:<choice>:<user_response_id>`` where ``scope`` is
+    one of :data:`MENU_SCOPES`. ``choice`` is a free-form string the caller
+    interprets per-scope (e.g. category index, ``"back"``, ``"personal"``).
+    For the ``skip_ra`` scope the choice slot is empty (one button, no
+    sub-choice).
+
+    Returns ``(scope, choice, user_response_id)`` or ``None`` on any
+    malformed input. ``choice`` may be the empty string for ``skip_ra``.
+    """
+    if not isinstance(data, str) or not data:
+        return None
+    parts = data.split(":")
+    if len(parts) != 4:
+        return None
+    prefix, scope, choice, raw_id = parts
+    if prefix != MENU_CALLBACK_DATA_PREFIX:
+        return None
+    if scope not in MENU_SCOPES:
+        return None
+    try:
+        user_response_id = int(raw_id)
+    except (TypeError, ValueError):
+        return None
+    return scope, choice, user_response_id
+
+
+def build_menu_callback_data(scope: str, choice: str, user_response_id: int) -> str:
+    """Construct ``callback_data`` for one menu button. Validates length."""
+    if scope not in MENU_SCOPES:
+        raise ValueError(f"unknown menu scope: {scope!r}")
+    data = f"{MENU_CALLBACK_DATA_PREFIX}:{scope}:{choice}:{user_response_id}"
+    if len(data.encode("utf-8")) > _CALLBACK_DATA_MAX_BYTES:
+        raise ValueError(
+            f"callback_data exceeds Telegram's 64-byte limit: {len(data)} chars"
+        )
+    return data
+
+
+def build_edit_menu_markup(
+    user_response_id: int,
+    *,
+    include_type_button: bool,
+) -> dict[str, Any]:
+    """Top-level Edit menu: Receipt info / Category / Type (allowlist) / Back."""
+    row1: list[dict[str, str]] = [
+        {
+            "text": "📝 Receipt info",
+            "callback_data": build_menu_callback_data("edit", "receipt", user_response_id),
+        },
+        {
+            "text": "🏷 Category",
+            "callback_data": build_menu_callback_data("edit", "category", user_response_id),
+        },
+    ]
+    if include_type_button:
+        row1.append(
+            {
+                "text": "🔄 Type",
+                "callback_data": build_menu_callback_data("edit", "type", user_response_id),
+            }
+        )
+    row2: list[dict[str, str]] = [
+        {
+            "text": "⬅ Back",
+            "callback_data": build_menu_callback_data("edit", "back", user_response_id),
+        }
+    ]
+    return {"inline_keyboard": [row1, row2]}
+
+
+def build_receipt_menu_markup(user_response_id: int) -> dict[str, Any]:
+    """Receipt info quick-pick: Supplier / Date / Amount / Back."""
+    row1 = [
+        {
+            "text": "🏪 Supplier",
+            "callback_data": build_menu_callback_data("rcpt", "supplier", user_response_id),
+        },
+        {
+            "text": "📅 Date",
+            "callback_data": build_menu_callback_data("rcpt", "date", user_response_id),
+        },
+        {
+            "text": "💵 Amount",
+            "callback_data": build_menu_callback_data("rcpt", "amount", user_response_id),
+        },
+    ]
+    row2 = [
+        {
+            "text": "⬅ Back",
+            "callback_data": build_menu_callback_data("rcpt", "back", user_response_id),
+        }
+    ]
+    return {"inline_keyboard": [row1, row2]}
+
+
+def build_category_tier1_markup(user_response_id: int) -> dict[str, Any]:
+    """Category Tier 1 picker. Reads from ``category_vocab.categories()``.
+
+    Buttons are sized to fit one or two per row; each is labelled with the
+    Tier 1 name (with a small emoji prefix for scanability). Callback data
+    encodes the index to keep the payload short.
+    """
+    from app.category_vocab import categories  # local import: tight cycle-free
+
+    emoji_map = {
+        "Hotel & Travel": "🏨",
+        "Meals & Entertainment": "🍽",
+        "Air Travel": "✈",
+        "Other": "📦",
+    }
+    cats = categories()
+    rows: list[list[dict[str, str]]] = []
+    current: list[dict[str, str]] = []
+    for idx, name in enumerate(cats):
+        emoji = emoji_map.get(name, "•")
+        current.append(
+            {
+                "text": f"{emoji} {name}",
+                "callback_data": build_menu_callback_data("cat1", str(idx), user_response_id),
+            }
+        )
+        if len(current) == 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append(
+        [
+            {
+                "text": "⬅ Back",
+                "callback_data": build_menu_callback_data("cat1", "back", user_response_id),
+            }
+        ]
+    )
+    return {"inline_keyboard": rows}
+
+
+def build_category_tier2_markup(
+    user_response_id: int, category: str
+) -> dict[str, Any]:
+    """Category Tier 2 picker for a given Tier 1 ``category``. Reads from
+    ``category_vocab.buckets_for(category)`` for the labels and from
+    ``category_vocab.all_buckets()`` for the global index used in
+    callback_data."""
+    from app.category_vocab import all_buckets, buckets_for  # local import
+
+    labels = buckets_for(category)
+    if not labels:
+        raise ValueError(f"unknown or empty category for tier 2: {category!r}")
+    global_buckets = all_buckets()
+    rows: list[list[dict[str, str]]] = []
+    current: list[dict[str, str]] = []
+    for label in labels:
+        try:
+            global_idx = global_buckets.index(label)
+        except ValueError:  # pragma: no cover — drift detector should catch
+            raise RuntimeError(
+                f"bucket {label!r} listed under {category!r} but missing from all_buckets()"
+            )
+        current.append(
+            {
+                "text": label,
+                "callback_data": build_menu_callback_data(
+                    "cat2", str(global_idx), user_response_id
+                ),
+            }
+        )
+        if len(current) == 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append(
+        [
+            {
+                "text": "⬅ Back",
+                "callback_data": build_menu_callback_data("cat2", "back", user_response_id),
+            }
+        ]
+    )
+    return {"inline_keyboard": rows}
+
+
+def build_type_menu_markup(user_response_id: int) -> dict[str, Any]:
+    """Type toggle (allowlist-only): Mark Personal / Back."""
+    row = [
+        {
+            "text": "Mark Personal",
+            "callback_data": build_menu_callback_data("type", "personal", user_response_id),
+        },
+        {
+            "text": "⬅ Back",
+            "callback_data": build_menu_callback_data("type", "back", user_response_id),
+        },
+    ]
+    return {"inline_keyboard": [row]}
+
+
+def build_skip_reason_attendees_markup(user_response_id: int) -> dict[str, Any]:
+    """Single 'Skip for now' button shown after a Meals bucket is committed."""
+    row = [
+        {
+            "text": "⏭ Skip for now",
+            "callback_data": build_menu_callback_data("skip_ra", "", user_response_id),
+        }
+    ]
+    return {"inline_keyboard": [row]}
 
 
 def _build_message_body(receipt: ReceiptDocument, agent_read: AgentReceiptRead) -> str:

@@ -597,12 +597,12 @@ def _handle_callback_query(
     )
     session.refresh(user_response)
 
-    # Top-level Confirm/Edit/Cancel are valid only while pending. Menu
-    # callbacks are valid whenever the response is in any interim Edit state
-    # (``pending`` for the very first Edit tap, ``edited`` after navigating,
-    # or any of the ``awaiting_*`` reply-collection states — the user can
-    # back out via the menu instead of typing).
-    _MENU_VALID_STATES = {
+    # Confirm/Cancel are valid in any non-finalized state — the user may
+    # have edited some fields via the menu and is now confirming. Edit
+    # itself is valid only while ``pending`` (first tap) or already
+    # ``edited`` (re-opening the top-level menu). Menu callbacks are valid
+    # in pending/edited and any awaiting_* reply-collection state.
+    _NON_FINAL_STATES = {
         "pending",
         "edited",
         "awaiting_supplier",
@@ -610,8 +610,8 @@ def _handle_callback_query(
         "awaiting_amount",
         "awaiting_attendees_reason",
     }
-    if action == "menu":
-        if user_response.user_action not in _MENU_VALID_STATES:
+    if action in {"confirm", "cancel", "edit", "menu"}:
+        if user_response.user_action not in _NON_FINAL_STATES:
             _safe_answer_callback(client, callback_id)
             return {
                 "ok": True,

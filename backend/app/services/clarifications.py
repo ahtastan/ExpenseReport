@@ -801,27 +801,37 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
         session.add(receipt)
 
     # F-AI-Stage1 sub-PR 3: source-tag canonical writes that resolved an
-    # inline-keyboard ``edited`` state. Compare pre- and post-answer
-    # values; tag only the columns that actually changed in this call.
+    # inline-keyboard ``edited`` state. Once the edit answer is accepted
+    # without a retry question, the user reply becomes the source for the
+    # receipt's classification context and the response moves to a terminal
+    # state so later text is not treated as part of the same Edit flow.
     if edited_response is not None and receipt is not None:
-        changed_fields: dict[str, Any] = {}
-        if receipt.business_or_personal != pre_answer_values["business_or_personal"]:
+        canonical_fields: dict[str, Any] = {
+            "business_or_personal": receipt.business_or_personal,
+            "report_bucket": receipt.report_bucket,
+            "business_reason": receipt.business_reason,
+            "attendees": receipt.attendees,
+        }
+        changed_fields = {
+            key: value
+            for key, value in canonical_fields.items()
+            if value != pre_answer_values[key]
+        }
+        if not new_questions:
             receipt.category_source = "telegram_user"
-            changed_fields["business_or_personal"] = receipt.business_or_personal
-        if receipt.report_bucket != pre_answer_values["report_bucket"]:
             receipt.bucket_source = "telegram_user"
-            changed_fields["report_bucket"] = receipt.report_bucket
-        if receipt.business_reason != pre_answer_values["business_reason"]:
             receipt.business_reason_source = "telegram_user"
-            changed_fields["business_reason"] = receipt.business_reason
-        if receipt.attendees != pre_answer_values["attendees"]:
             receipt.attendees_source = "telegram_user"
-            changed_fields["attendees"] = receipt.attendees
-        if changed_fields:
             session.add(receipt)
+            edited_response.user_action = "confirmed"
+            edited_response.user_action_at = datetime.now(timezone.utc)
         edited_response.free_text_reply = answer_text
         edited_response.canonical_write_json = json.dumps(
-            {"source_tag": "telegram_user", "fields": changed_fields},
+            {
+                "source_tag": "telegram_user",
+                "fields": canonical_fields,
+                "changed_fields": changed_fields,
+            },
             sort_keys=True,
         )
         session.add(edited_response)

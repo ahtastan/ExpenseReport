@@ -22,6 +22,7 @@ from app.models import (
 )
 from app.services.agent_receipt_canonical_writer import write_ai_proposal_to_canonical
 from app.services.clarifications import (
+    TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
     answer_question,
     ensure_receipt_review_questions,
     looks_like_telegram_context_answer,
@@ -47,6 +48,7 @@ from app.services.telegram_receipt_reply import (
 )
 
 INLINE_KEYBOARD_TIMEOUT = timedelta(hours=24)
+INLINE_KEYBOARD_EDIT_REPLY_WINDOW = timedelta(minutes=60)
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +239,62 @@ def _pending_responses_for_user(
         .order_by(AgentReceiptUserResponse.id)
     ).all()
     return [response for response, _receipt in rows]
+
+
+def _recent_edited_response_for_user(
+    session: Session,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> AgentReceiptUserResponse | None:
+    """Return a recent inline-keyboard Edit response for this user, if any."""
+    cutoff = (now or utc_now()) - INLINE_KEYBOARD_EDIT_REPLY_WINDOW
+    rows = session.exec(
+        select(AgentReceiptUserResponse, ReceiptDocument)
+        .join(
+            ReceiptDocument,
+            AgentReceiptUserResponse.receipt_document_id == ReceiptDocument.id,
+        )
+        .where(
+            ReceiptDocument.uploader_user_id == user_id,
+            AgentReceiptUserResponse.user_action == "edited",
+        )
+        .order_by(
+            AgentReceiptUserResponse.user_action_at.desc(),
+            AgentReceiptUserResponse.id.desc(),
+        )
+    ).all()
+    for response, _receipt in rows:
+        action_at = response.user_action_at
+        if action_at is None:
+            continue
+        if action_at.tzinfo is None:
+            action_at = action_at.replace(tzinfo=timezone.utc)
+        if action_at >= cutoff:
+            return response
+    return None
+
+
+def _open_question_for_edited_response(
+    session: Session,
+    *,
+    user_id: int,
+    user_response: AgentReceiptUserResponse,
+) -> ClarificationQuestion | None:
+    context_keys = open_telegram_context_question_keys_for_receipt(
+        session,
+        user_id,
+        user_response.receipt_document_id,
+    )
+    if not context_keys:
+        return None
+    return next_open_question_for_receipt(
+        session,
+        user_id,
+        user_response.receipt_document_id,
+        include_business_context=True,
+        business_context_question_keys=context_keys,
+    )
 
 
 def _close_pending_response(
@@ -440,6 +498,8 @@ def _handle_callback_query(
             session, client,
             user_response=user_response,
             receipt=receipt,
+            agent_read=agent_read,
+            user=user,
             chat_id=chat_id,
             message_id=message_id,
         )
@@ -522,6 +582,8 @@ def _handle_callback_edit(
     *,
     user_response: AgentReceiptUserResponse,
     receipt: ReceiptDocument,
+    agent_read: AgentReceiptRead,
+    user: AppUser,
     chat_id: int | None,
     message_id: int | None,
 ) -> dict[str, Any]:
@@ -529,6 +591,34 @@ def _handle_callback_edit(
     user_response.user_action_at = utc_now()
     session.add(user_response)
     session.commit()
+
+    ai_review: dict[str, Any] | None = None
+    try:
+        parsed_read_json = json.loads(agent_read.read_json or "{}")
+        if isinstance(parsed_read_json, dict):
+            ai_review = parsed_read_json
+    except json.JSONDecodeError:
+        logger.warning(
+            "inline keyboard edit: invalid agent_read.read_json for response_id=%s",
+            user_response.id,
+        )
+    business_context_question_keys = receipt_business_context_question_keys(
+        receipt,
+        ai_review=ai_review,
+    )
+    question_key = (
+        business_context_question_keys[0]
+        if business_context_question_keys
+        else TELEGRAM_MARKET_CONTEXT_QUESTION_KEY
+    )
+    ensure_receipt_review_questions(
+        session,
+        receipt,
+        user.id,
+        include_business_context=True,
+        business_context_question_keys=(question_key,),
+        include_business_personal=False,
+    )
 
     edit_text = "✏️ Got it — please type the correction."
     if chat_id is not None and message_id is not None:
@@ -633,32 +723,59 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     text = (message.get("text") or "").strip()
     if text:
         if ai_receipt_reply_allowed and ai_receipt_followups_allowed:
-            latest_receipt_id = _latest_receipt_id_for_user(session, user.id)
-            latest_receipt = session.get(ReceiptDocument, latest_receipt_id) if latest_receipt_id is not None else None
-            active_context_question_keys = open_telegram_context_question_keys_for_receipt(
-                session,
-                user.id,
-                latest_receipt_id,
-            )
-            business_context_question_keys = active_context_question_keys or (
-                receipt_business_context_question_keys(latest_receipt)
-                if latest_receipt is not None
-                else ()
-            )
-            include_business_context = bool(active_context_question_keys) or (
-                should_include_receipt_business_context(latest_receipt)
-                if latest_receipt is not None
-                else False
-            )
-            open_question = next_open_question_for_receipt(
-                session,
-                user.id,
-                latest_receipt_id,
-                include_business_context=include_business_context,
-                business_context_question_keys=business_context_question_keys,
-            )
-            if open_question is None and looks_like_telegram_context_answer(text):
-                open_question = next_open_telegram_context_question_for_user(session, user.id)
+            edited_response = _recent_edited_response_for_user(session, user.id)
+            if edited_response is not None:
+                open_question = _open_question_for_edited_response(
+                    session,
+                    user_id=user.id,
+                    user_response=edited_response,
+                )
+                if open_question is None:
+                    logger.warning(
+                        "inline keyboard edit: missing seeded clarification question "
+                        "for response_id=%s receipt_id=%s user_id=%s",
+                        edited_response.id,
+                        edited_response.receipt_document_id,
+                        user.id,
+                    )
+                    client.send_message(
+                        chat_id,
+                        "Reply with the correction for this receipt, for example: business, customer dinner with Hakan.",
+                    )
+                    return {
+                        "ok": True,
+                        "action": "edit_reply_missing_question_prompted",
+                        "user_id": user.id,
+                        "user_response_id": edited_response.id,
+                        "receipt_id": edited_response.receipt_document_id,
+                    }
+            else:
+                latest_receipt_id = _latest_receipt_id_for_user(session, user.id)
+                latest_receipt = session.get(ReceiptDocument, latest_receipt_id) if latest_receipt_id is not None else None
+                active_context_question_keys = open_telegram_context_question_keys_for_receipt(
+                    session,
+                    user.id,
+                    latest_receipt_id,
+                )
+                business_context_question_keys = active_context_question_keys or (
+                    receipt_business_context_question_keys(latest_receipt)
+                    if latest_receipt is not None
+                    else ()
+                )
+                include_business_context = bool(active_context_question_keys) or (
+                    should_include_receipt_business_context(latest_receipt)
+                    if latest_receipt is not None
+                    else False
+                )
+                open_question = next_open_question_for_receipt(
+                    session,
+                    user.id,
+                    latest_receipt_id,
+                    include_business_context=include_business_context,
+                    business_context_question_keys=business_context_question_keys,
+                )
+                if open_question is None and looks_like_telegram_context_answer(text):
+                    open_question = next_open_telegram_context_question_for_user(session, user.id)
         elif ai_receipt_reply_allowed:
             open_question = next_open_question_for_user(session, user.id, include_business_context=False)
         else:

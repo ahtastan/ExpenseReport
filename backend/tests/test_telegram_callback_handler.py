@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.models import (
     AgentReceiptRead,
     AgentReceiptReviewRun,
     AgentReceiptUserResponse,
     AppUser,
+    ClarificationQuestion,
     ReceiptDocument,
 )
 from app.services.telegram import handle_update
@@ -34,20 +36,29 @@ class _FakeClient:
         self.calls.append((method, payload))
         return {"ok": True, "result": {"message_id": 999}}
 
+    def download_file(self, file_id, user_id, fallback_name):
+        return None
+
 
 def _seed_pending_response(
     session: Session,
     *,
+    user: AppUser | None = None,
+    telegram_user_id: int = 8038997793,
+    receipt_supplier: str = "Acme Cafe",
+    receipt_report_bucket: str | None = None,
+    receipt_business_or_personal: str | None = None,
     suggested_business_or_personal: str | None = "Business",
     suggested_report_bucket: str | None = "Meals/Snacks",
     suggested_attendees: list[str] | None = None,
     suggested_business_reason: str | None = "Team lunch",
     created_at: datetime | None = None,
 ) -> dict[str, int]:
-    user = AppUser(telegram_user_id=8038997793, display_name="Hakan")
-    session.add(user)
-    session.commit()
-    session.refresh(user)
+    if user is None:
+        user = AppUser(telegram_user_id=telegram_user_id, display_name="Hakan")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
 
     receipt = ReceiptDocument(
         uploader_user_id=user.id,
@@ -56,10 +67,12 @@ def _seed_pending_response(
         content_type="photo",
         telegram_chat_id=42,
         telegram_message_id=100,
-        extracted_supplier="Acme Cafe",
+        extracted_supplier=receipt_supplier,
         extracted_date=date(2026, 5, 1),
         extracted_local_amount=Decimal("42.50"),
         extracted_currency="TRY",
+        business_or_personal=receipt_business_or_personal,
+        report_bucket=receipt_report_bucket,
     )
     session.add(receipt)
     session.commit()
@@ -138,6 +151,59 @@ def _callback_payload(
             },
         }
     }
+
+
+def _text_payload(
+    *,
+    telegram_user_id: int,
+    text: str,
+    chat_id: int = 42,
+    message_id: int = 9001,
+) -> dict[str, Any]:
+    return {
+        "message": {
+            "message_id": message_id,
+            "from": {"id": telegram_user_id, "first_name": "Hakan"},
+            "chat": {"id": chat_id},
+            "text": text,
+        }
+    }
+
+
+def _photo_payload(
+    *,
+    telegram_user_id: int,
+    chat_id: int = 42,
+    message_id: int = 1001,
+    file_unique_id: str = "receipt-photo-1",
+) -> dict[str, Any]:
+    return {
+        "message": {
+            "message_id": message_id,
+            "from": {"id": telegram_user_id, "first_name": "Hakan"},
+            "chat": {"id": chat_id},
+            "photo": [
+                {
+                    "file_id": "AgACA-test",
+                    "file_unique_id": file_unique_id,
+                    "file_size": 12345,
+                    "width": 800,
+                    "height": 1200,
+                }
+            ],
+        }
+    }
+
+
+def _set_ai_reply_env(monkeypatch, *, allowlist: str = "8038997793") -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("AI_TELEGRAM_REPLY_ENABLED", "true")
+    monkeypatch.setenv("AI_TELEGRAM_LIVE_MODEL_ENABLED", "true")
+    monkeypatch.setenv("AI_TELEGRAM_INLINE_KEYBOARD_ENABLED", "true")
+    monkeypatch.setenv("AI_TELEGRAM_REPLY_ALLOWLIST", allowlist)
+    from app.config import get_settings
+
+    get_settings.cache_clear()
 
 
 def _patch_telegram_client(client: _FakeClient):
@@ -269,6 +335,380 @@ def test_edit_marks_response_edited_and_replies(isolated_db):
     edit_message_calls = [c for c in client.calls if c[0] == "editMessageText"]
     assert any("Got it" in c[1]["text"] for c in edit_message_calls)
     assert client.send_messages, "expected a follow-up sendMessage prompting the correction"
+
+
+def test_edit_seeds_clarification_question(isolated_db):
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session, receipt_supplier="Serbest Market")
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            result = handle_update(
+                session,
+                _callback_payload(
+                    telegram_user_id=ids["telegram_user_id"],
+                    response_id=ids["response_id"],
+                    action="edit",
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert result["action"] == "callback_edit_requested"
+    with Session(isolated_db) as session:
+        questions = session.exec(
+            select(ClarificationQuestion).where(
+                ClarificationQuestion.receipt_document_id == ids["receipt_id"],
+            )
+        ).all()
+    assert len(questions) == 1
+    assert questions[0].question_key in {
+        "telegram_meal_context",
+        "telegram_market_context",
+        "telegram_telecom_context",
+        "telegram_personal_care_context",
+    }
+    assert questions[0].status == "open"
+
+
+def test_edit_text_reply_round_trip(isolated_db, monkeypatch):
+    _set_ai_reply_env(monkeypatch)
+    client = _FakeClient()
+    telegram_module, original_client = _patch_telegram_client(client)
+    original_extract = telegram_module.apply_receipt_extraction
+    original_send_keyboard = telegram_module.send_inline_keyboard_proposal
+
+    class _ExtractionStub:
+        confidence = 0.8
+
+    def _stub_extraction(session, receipt):
+        receipt.extracted_supplier = "Serbest Market"
+        receipt.extracted_date = date(2026, 5, 1)
+        receipt.extracted_local_amount = Decimal("42.50")
+        receipt.extracted_currency = "TRY"
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        return _ExtractionStub()
+
+    def _stub_send_keyboard(session, _client, **kwargs):
+        receipt = kwargs["receipt"]
+        run = AgentReceiptReviewRun(
+            receipt_document_id=receipt.id,
+            run_source="telegram_receipt_inline_keyboard",
+            run_kind="receipt_inline_keyboard",
+            status="completed",
+            schema_version="stage1",
+            prompt_version="agent_receipt_inline_keyboard_prompt_stage1_v1",
+            comparator_version="agent_receipt_comparator_0a",
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        read = AgentReceiptRead(
+            run_id=run.id,
+            receipt_document_id=receipt.id,
+            read_schema_version="stage1",
+            read_json="{}",
+            suggested_business_or_personal="Business",
+            suggested_report_bucket="Meals/Snacks",
+            suggested_business_reason="Team lunch",
+            suggested_confidence_overall=0.85,
+        )
+        session.add(read)
+        session.commit()
+        session.refresh(read)
+        response = AgentReceiptUserResponse(
+            receipt_document_id=receipt.id,
+            agent_receipt_review_run_id=run.id,
+            agent_receipt_read_id=read.id,
+            telegram_user_id=kwargs["telegram_user_id"],
+            keyboard_message_id=999,
+            user_action="pending",
+        )
+        session.add(response)
+        session.commit()
+        return True
+
+    telegram_module.apply_receipt_extraction = _stub_extraction
+    telegram_module.send_inline_keyboard_proposal = _stub_send_keyboard
+    try:
+        with Session(isolated_db) as session:
+            upload_result = handle_update(
+                session,
+                _photo_payload(telegram_user_id=8038997793),
+            )
+            response = session.exec(select(AgentReceiptUserResponse)).one()
+
+        assert upload_result["action"] == "receipt_keyboard_sent"
+
+        with Session(isolated_db) as session:
+            edit_result = handle_update(
+                session,
+                _callback_payload(
+                    telegram_user_id=8038997793,
+                    response_id=response.id,
+                    action="edit",
+                ),
+            )
+        assert edit_result["action"] == "callback_edit_requested"
+
+        with Session(isolated_db) as session:
+            reply_result = handle_update(
+                session,
+                _text_payload(
+                    telegram_user_id=8038997793,
+                    text="business, EDT team meeting",
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original_client
+        telegram_module.apply_receipt_extraction = original_extract
+        telegram_module.send_inline_keyboard_proposal = original_send_keyboard
+
+    assert reply_result["action"] == "answered_clarification"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, upload_result["receipt_id"])
+        response = session.exec(select(AgentReceiptUserResponse)).one()
+        question = session.exec(select(ClarificationQuestion)).one()
+
+    assert receipt.business_or_personal == "Business"
+    assert receipt.business_reason == "EDT team meeting"
+    assert receipt.category_source == "telegram_user"
+    assert receipt.bucket_source == "telegram_user"
+    assert receipt.business_reason_source == "telegram_user"
+    assert receipt.attendees_source == "telegram_user"
+    assert response.user_action == "confirmed"
+    assert response.free_text_reply == "business, EDT team meeting"
+    assert response.user_action_at is not None
+    payload = json.loads(response.canonical_write_json)
+    assert payload["source_tag"] == "telegram_user"
+    assert payload["fields"]["business_or_personal"] == "Business"
+    assert question.status == "answered"
+
+
+def test_edit_text_reply_does_not_route_to_unrelated_receipt(isolated_db, monkeypatch):
+    _set_ai_reply_env(monkeypatch)
+    with Session(isolated_db) as session:
+        user = AppUser(telegram_user_id=8038997793, display_name="Hakan")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+        old_receipt = ReceiptDocument(
+            uploader_user_id=user.id,
+            source="telegram",
+            status="received",
+            content_type="photo",
+            extracted_supplier="Old Market",
+            extracted_date=date(2026, 4, 1),
+            extracted_local_amount=Decimal("12.00"),
+            extracted_currency="TRY",
+        )
+        session.add(old_receipt)
+        session.commit()
+        session.refresh(old_receipt)
+        old_question = ClarificationQuestion(
+            receipt_document_id=old_receipt.id,
+            user_id=user.id,
+            question_key="telegram_market_context",
+            question_text="Was this business or personal spending?",
+        )
+        session.add(old_question)
+        session.commit()
+        session.refresh(old_question)
+        old_question_id = old_question.id
+        old_receipt_id = old_receipt.id
+
+        ids = _seed_pending_response(
+            session,
+            user=user,
+            receipt_supplier="Serbest Market",
+            suggested_report_bucket="Meals/Snacks",
+        )
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(
+                session,
+                _callback_payload(
+                    telegram_user_id=ids["telegram_user_id"],
+                    response_id=ids["response_id"],
+                    action="edit",
+                ),
+            )
+        with Session(isolated_db) as session:
+            result = handle_update(
+                session,
+                _text_payload(
+                    telegram_user_id=ids["telegram_user_id"],
+                    text="business, latest receipt context",
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert result["action"] == "answered_clarification"
+    with Session(isolated_db) as session:
+        old_receipt = session.get(ReceiptDocument, old_receipt_id)
+        old_question = session.get(ClarificationQuestion, old_question_id)
+        latest_receipt = session.get(ReceiptDocument, ids["receipt_id"])
+
+    assert old_question.status == "open"
+    assert old_question.answer_text is None
+    assert old_receipt.business_reason is None
+    assert latest_receipt.business_reason == "latest receipt context"
+
+
+def test_edit_text_reply_with_no_seeded_question_logs_warning(
+    isolated_db,
+    monkeypatch,
+    caplog,
+):
+    _set_ai_reply_env(monkeypatch)
+    with Session(isolated_db) as session:
+        user = AppUser(telegram_user_id=8038997793, display_name="Hakan")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+        old_receipt = ReceiptDocument(
+            uploader_user_id=user.id,
+            source="telegram",
+            status="received",
+            content_type="photo",
+            extracted_supplier="Old Market",
+            extracted_date=date(2026, 4, 1),
+            extracted_local_amount=Decimal("12.00"),
+            extracted_currency="TRY",
+        )
+        session.add(old_receipt)
+        session.commit()
+        session.refresh(old_receipt)
+        old_question = ClarificationQuestion(
+            receipt_document_id=old_receipt.id,
+            user_id=user.id,
+            question_key="telegram_market_context",
+            question_text="Was this business or personal spending?",
+        )
+        session.add(old_question)
+        session.commit()
+        session.refresh(old_question)
+
+        ids = _seed_pending_response(
+            session,
+            user=user,
+            receipt_supplier="Serbest Market",
+        )
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+        response.user_action = "edited"
+        response.user_action_at = datetime.now(timezone.utc)
+        session.add(response)
+        session.commit()
+        old_receipt_id = old_receipt.id
+        old_question_id = old_question.id
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    caplog.set_level(logging.WARNING, logger="app.services.telegram")
+    try:
+        with Session(isolated_db) as session:
+            result = handle_update(
+                session,
+                _text_payload(
+                    telegram_user_id=ids["telegram_user_id"],
+                    text="business, should stay on latest receipt",
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert result["action"] == "edit_reply_missing_question_prompted"
+    assert "missing seeded clarification question" in caplog.text
+    assert client.send_messages
+    assert "Reply with the correction" in client.send_messages[-1][1]
+    with Session(isolated_db) as session:
+        old_receipt = session.get(ReceiptDocument, old_receipt_id)
+        old_question = session.get(ClarificationQuestion, old_question_id)
+        latest_receipt = session.get(ReceiptDocument, ids["receipt_id"])
+
+    assert old_question.status == "open"
+    assert old_question.answer_text is None
+    assert old_receipt.business_reason is None
+    assert latest_receipt.business_reason is None
+
+
+def test_legacy_user_text_reply_unchanged(isolated_db, monkeypatch):
+    _set_ai_reply_env(monkeypatch)
+    with Session(isolated_db) as session:
+        user = AppUser(telegram_user_id=8038997793, display_name="Hakan")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+        old_receipt = ReceiptDocument(
+            uploader_user_id=user.id,
+            source="telegram",
+            status="received",
+            content_type="photo",
+            extracted_supplier="Old Market",
+            extracted_date=date(2026, 4, 1),
+            extracted_local_amount=Decimal("12.00"),
+            extracted_currency="TRY",
+        )
+        session.add(old_receipt)
+        session.commit()
+        session.refresh(old_receipt)
+        session.add(
+            ClarificationQuestion(
+                receipt_document_id=old_receipt.id,
+                user_id=user.id,
+                question_key="telegram_market_context",
+                question_text="Was this business or personal spending?",
+            )
+        )
+
+        latest_receipt = ReceiptDocument(
+            uploader_user_id=user.id,
+            source="telegram",
+            status="received",
+            content_type="photo",
+            extracted_supplier="Later Fuel",
+            extracted_date=date(2026, 5, 1),
+            extracted_local_amount=Decimal("50.00"),
+            extracted_currency="TRY",
+            report_bucket="Auto Gasoline",
+            needs_clarification=False,
+        )
+        session.add(latest_receipt)
+        session.commit()
+        old_receipt_id = old_receipt.id
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            result = handle_update(
+                session,
+                _text_payload(
+                    telegram_user_id=8038997793,
+                    text="business, legacy market context",
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert result["action"] == "answered_clarification"
+    with Session(isolated_db) as session:
+        old_receipt = session.get(ReceiptDocument, old_receipt_id)
+        question = session.exec(select(ClarificationQuestion)).one()
+
+    assert question.status == "answered"
+    assert old_receipt.business_reason == "legacy market context"
 
 
 def test_cancel_sets_receipt_cancelled(isolated_db):

@@ -1129,28 +1129,22 @@ def _call_openai(
 _vision_call = _call_openai
 
 
-# Closed-set EDT template buckets + categories. Mirrors CATEGORY_GROUPS in
-# frontend/review-table.html — kept in sync via
+# Closed-set EDT template buckets + categories. Sourced from the shared
+# vocabulary module in app/category_vocab.py, which mirrors CATEGORY_GROUPS
+# in frontend/review-table.html. Kept in sync via
 # tests/test_match_prompt_buckets_match_category_map.py (drift detector).
-# When EDT changes its template, BOTH this list AND the frontend map must
-# be updated together.
-EDT_BUCKETS: tuple[str, ...] = (
-    # Hotel & Travel
-    "Hotel/Lodging/Laundry", "Auto Rental", "Auto Gasoline",
-    "Taxi/Parking/Tolls/Uber", "Other Travel Related",
-    # Meals & Entertainment
-    "Meals/Snacks", "Breakfast", "Lunch", "Dinner", "Entertainment",
-    # Air Travel
-    "Airfare/Bus/Ferry/Other",
-    # Other
-    "Membership/Subscription Fees", "Customer Gifts", "Telephone/Internet",
-    "Postage/Shipping", "Admin Supplies", "Lab Supplies",
-    "Field Service Supplies", "Assets", "Other",
-)
-EDT_CATEGORIES: tuple[str, ...] = (
-    "Hotel & Travel", "Meals & Entertainment",
-    "Air Travel", "Personal Car", "Other",
-)
+# When EDT changes its template, BOTH category_vocab.CATEGORY_GROUPS AND
+# the frontend map must be updated together.
+#
+# EDT_CATEGORIES adds "Personal Car" beyond category_vocab (which excludes it
+# because Personal Car has no buckets and is deferred from the Telegram Edit
+# menu). The matching model still needs Personal Car in its closed set so it
+# can name the category if it ever applies to a receipt.
+from app.category_vocab import all_buckets as _vocab_all_buckets
+from app.category_vocab import categories as _vocab_categories
+
+EDT_BUCKETS: tuple[str, ...] = _vocab_all_buckets()
+EDT_CATEGORIES: tuple[str, ...] = _vocab_categories() + ("Personal Car",)
 
 # Bumped from implicit v1 (no version) to v2 — v2 is the first prompt that
 # returns suggested_bucket + suggested_category. Future bumps (e.g. v3)

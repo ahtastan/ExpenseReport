@@ -339,6 +339,118 @@ def test_legacy_clarification_attendees_reply_tags_telegram_user(
         _assert_invariant(session, "answer_question/attendees")
 
 
+def test_legacy_clarification_business_with_followup_tags_source(
+    isolated_db, monkeypatch
+):
+    """Regression for the post-merge follow-up gate: when the user answers
+    'Business' to a ``business_or_personal`` question, ``answer_question``
+    queues a ``business_reason`` follow-up. The source-tag stamp must
+    still fire — previously it was gated on ``not new_questions`` and
+    silently skipped, leaving ``category_source=NULL`` while
+    ``business_or_personal='Business'`` (invariant violation surfaced by
+    review-validation-checker + telegram-flow-checker on PR #94)."""
+    monkeypatch.delenv("AI_TELEGRAM_INLINE_KEYBOARD_ENABLED", raising=False)
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+
+    with Session(isolated_db) as session:
+        user = AppUser(telegram_user_id=300003)
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+        receipt = ReceiptDocument(
+            uploader_user_id=user.id,
+            source="telegram",
+            status="needs_extraction_review",
+            content_type="photo",
+            telegram_chat_id=12345,
+            extracted_supplier="Acme Cafe",
+            extracted_local_amount=Decimal("120.00"),
+            extracted_currency="TRY",
+            extracted_date=date(2026, 4, 2),
+            business_or_personal=None,
+        )
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+
+        question = ClarificationQuestion(
+            receipt_document_id=receipt.id,
+            user_id=user.id,
+            question_key="business_or_personal",
+            question_text="Business or Personal?",
+        )
+        session.add(question)
+        session.commit()
+        session.refresh(question)
+
+        new_questions = answer_question(session, question, "Business")
+        session.refresh(receipt)
+
+        # The follow-up is queued (this is the path that previously hid
+        # the source-tag write).
+        assert any(q.question_key == "business_reason" for q in new_questions)
+        # Canonical write happened AND source was stamped.
+        assert receipt.business_or_personal == "Business"
+        assert receipt.category_source == "telegram_user"
+        _assert_invariant(session, "answer_question/business-with-followup")
+
+
+def test_legacy_clarification_business_reason_queues_attendees_tags_source(
+    isolated_db, monkeypatch
+):
+    """Same gate-removal regression for the business_reason answer path:
+    answering business_reason text queues an attendees follow-up; the
+    source for business_reason must still be stamped."""
+    monkeypatch.delenv("AI_TELEGRAM_INLINE_KEYBOARD_ENABLED", raising=False)
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+
+    with Session(isolated_db) as session:
+        user = AppUser(telegram_user_id=300004)
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+        receipt = ReceiptDocument(
+            uploader_user_id=user.id,
+            source="telegram",
+            status="needs_extraction_review",
+            content_type="photo",
+            telegram_chat_id=12345,
+            extracted_supplier="Acme Cafe",
+            extracted_local_amount=Decimal("120.00"),
+            extracted_currency="TRY",
+            extracted_date=date(2026, 4, 2),
+            business_or_personal="Business",
+            category_source="telegram_user",
+        )
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+
+        question = ClarificationQuestion(
+            receipt_document_id=receipt.id,
+            user_id=user.id,
+            question_key="business_reason",
+            question_text="Reason?",
+        )
+        session.add(question)
+        session.commit()
+        session.refresh(question)
+
+        new_questions = answer_question(session, question, "team meeting")
+        session.refresh(receipt)
+
+        assert any(q.question_key == "attendees" for q in new_questions)
+        assert receipt.business_reason == "team meeting"
+        assert receipt.business_reason_source == "telegram_user"
+        _assert_invariant(session, "answer_question/business-reason-with-followup")
+
+
 def test_web_patch_receipt_tags_user(isolated_db):
     """PATCH /receipts/{id} from the web review-table -> source 'user'."""
     with Session(isolated_db) as session:

@@ -812,10 +812,13 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
     # so the source is always ``telegram_user`` — regardless of whether
     # this resolved an inline-keyboard ``edited`` state (PR3) or a legacy
     # text-clarification flow (PR5 closing the gap on the non-keyboard path).
-    # When no retry question was generated and at least one canonical field
-    # changed, stamp the corresponding ``*_source`` columns. The
-    # AgentReceiptUserResponse audit row is only updated when a keyboard
-    # ``edited_response`` is in flight (PR3 behavior preserved).
+    # PR5 follow-up: stamp ``*_source`` for any changed canonical field
+    # independent of whether a follow-up question was queued. The previous
+    # gate ``and not new_questions`` left a real invariant gap on the
+    # Business → business_reason and meal-context retry paths, where a
+    # canonical field could land non-NULL with source NULL. The
+    # AgentReceiptUserResponse audit row is still only updated when a
+    # keyboard ``edited_response`` is in flight (PR3 behavior preserved).
     if receipt is not None:
         canonical_fields: dict[str, Any] = {
             "business_or_personal": receipt.business_or_personal,
@@ -828,7 +831,7 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
             for key, value in canonical_fields.items()
             if value != pre_answer_values.get(key)
         }
-        if changed_fields and not new_questions:
+        if changed_fields:
             if "business_or_personal" in changed_fields:
                 receipt.category_source = "telegram_user"
             if "report_bucket" in changed_fields:

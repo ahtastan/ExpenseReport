@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from sqlmodel import Session, select
 
 from app.models import (
@@ -487,6 +488,153 @@ def test_edit_text_reply_round_trip(isolated_db, monkeypatch):
     assert payload["source_tag"] == "telegram_user"
     assert payload["fields"]["business_or_personal"] == "Business"
     assert question.status == "answered"
+
+
+@pytest.mark.parametrize("action", ("confirm", "edit", "cancel"))
+def test_callback_rejected_when_telegram_user_does_not_own_response(
+    isolated_db,
+    caplog,
+    action,
+):
+    owner_telegram_id = 8038997793
+    other_telegram_id = 8038997794
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session, telegram_user_id=owner_telegram_id)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    caplog.set_level(logging.WARNING, logger="app.services.telegram")
+    try:
+        with Session(isolated_db) as session:
+            result = handle_update(
+                session,
+                _callback_payload(
+                    telegram_user_id=other_telegram_id,
+                    response_id=ids["response_id"],
+                    action=action,
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert result["action"] == "callback_owner_mismatch_ignored"
+    assert any(c[0] == "answerCallbackQuery" for c in client.calls)
+    assert "owned by telegram_user_id" in caplog.text
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+        questions = session.exec(select(ClarificationQuestion)).all()
+
+    assert response.user_action == "pending"
+    assert response.user_action_at is None
+    assert response.canonical_write_json is None
+    assert receipt.status == "received"
+    assert receipt.business_or_personal is None
+    assert receipt.report_bucket is None
+    assert receipt.category_source is None
+    assert questions == []
+
+
+@pytest.mark.parametrize("action", ("confirm", "edit", "cancel"))
+def test_callback_rejected_when_user_response_has_null_owner(
+    isolated_db,
+    caplog,
+    action,
+):
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+        response.telegram_user_id = None
+        session.add(response)
+        session.commit()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    caplog.set_level(logging.WARNING, logger="app.services.telegram")
+    try:
+        with Session(isolated_db) as session:
+            result = handle_update(
+                session,
+                _callback_payload(
+                    telegram_user_id=ids["telegram_user_id"],
+                    response_id=ids["response_id"],
+                    action=action,
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert result["action"] == "callback_owner_mismatch_ignored"
+    assert any(c[0] == "answerCallbackQuery" for c in client.calls)
+    assert "owned by telegram_user_id=None" in caplog.text
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+        questions = session.exec(select(ClarificationQuestion)).all()
+
+    assert response.user_action == "pending"
+    assert response.user_action_at is None
+    assert response.canonical_write_json is None
+    assert receipt.status == "received"
+    assert receipt.business_or_personal is None
+    assert receipt.report_bucket is None
+    assert receipt.category_source is None
+    assert questions == []
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_result", "expected_response_action"),
+    (
+        ("confirm", "callback_confirmed", "confirmed"),
+        ("edit", "callback_edit_requested", "edited"),
+        ("cancel", "callback_cancelled", "cancelled"),
+    ),
+)
+def test_callback_succeeds_when_telegram_user_matches_response_owner(
+    isolated_db,
+    action,
+    expected_result,
+    expected_response_action,
+):
+    # Ownership-positive regression: the same Telegram user that received
+    # the keyboard can still use every button.
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            result = handle_update(
+                session,
+                _callback_payload(
+                    telegram_user_id=ids["telegram_user_id"],
+                    response_id=ids["response_id"],
+                    action=action,
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert result["action"] == expected_result
+    assert any(c[0] == "answerCallbackQuery" for c in client.calls)
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        questions = session.exec(select(ClarificationQuestion)).all()
+
+    assert response.user_action == expected_response_action
+    assert response.user_action_at is not None
+    if action == "confirm":
+        assert receipt.business_or_personal == "Business"
+        assert receipt.category_source == "ai_advisory"
+    elif action == "edit":
+        assert len(questions) == 1
+        question = questions[0]
+        assert question.receipt_document_id == receipt.id
+        assert question.status == "open"
+    else:
+        assert receipt.status == "cancelled"
 
 
 def test_edit_text_reply_does_not_route_to_unrelated_receipt(isolated_db, monkeypatch):

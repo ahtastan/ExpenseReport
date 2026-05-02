@@ -459,6 +459,22 @@ def _handle_callback_query(
         _safe_answer_callback(client, callback_id)
         return {"ok": True, "action": "callback_unknown_ignored"}
 
+    callback_telegram_user_id = user_payload.get("id")
+    if user_response.telegram_user_id != callback_telegram_user_id:
+        logger.warning(
+            "callback_query received from telegram_user_id=%s "
+            "for user_response.id=%s owned by telegram_user_id=%s; ignoring",
+            callback_telegram_user_id,
+            user_response.id,
+            user_response.telegram_user_id,
+        )
+        _safe_answer_callback(client, callback_id)
+        return {
+            "ok": True,
+            "action": "callback_owner_mismatch_ignored",
+            "user_response_id": user_response_id,
+        }
+
     # Lazy timeout sweep on every callback event.
     _auto_close_pending_responses(
         session,
@@ -483,6 +499,22 @@ def _handle_callback_query(
         )
         _safe_answer_callback(client, callback_id)
         return {"ok": False, "action": "callback_missing_state", "user_response_id": user_response_id}
+    if receipt.uploader_user_id != user.id:
+        logger.warning(
+            "callback_query received from telegram_user_id=%s user_id=%s "
+            "for user_response.id=%s receipt_id=%s owned by user_id=%s; ignoring",
+            callback_telegram_user_id,
+            user.id,
+            user_response.id,
+            receipt.id,
+            receipt.uploader_user_id,
+        )
+        _safe_answer_callback(client, callback_id)
+        return {
+            "ok": True,
+            "action": "callback_owner_mismatch_ignored",
+            "user_response_id": user_response_id,
+        }
 
     if action == "confirm":
         result = _handle_callback_confirm(

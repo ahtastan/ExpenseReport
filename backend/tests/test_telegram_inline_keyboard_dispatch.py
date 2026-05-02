@@ -252,6 +252,75 @@ def test_flag_on_allowlisted_user_uses_keyboard(isolated_db, monkeypatch):
         assert len(questions) == 0  # keyboard replaces clarification flow
 
 
+def test_send_failure_creates_no_pending_response(isolated_db, monkeypatch):
+    """If Telegram sendMessage fails, fallback runs without an orphan response."""
+    _enable_flag_env(monkeypatch, keyboard=True)
+    with Session(isolated_db) as session:
+        _seed_user(session, telegram_user_id=8038997793)
+
+    class _SendFailureClient(_FakeClient):
+        def call(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((method, payload))
+            if method == "sendMessage":
+                raise RuntimeError("telegram send failed")
+            return {"ok": True, "result": {"message_id": 999}}
+
+    client = _SendFailureClient()
+    telegram_module, original = _patch_telegram_client(client)
+    import app.services.telegram_receipt_reply as reply_module
+
+    provider = reply_module.agent_receipt_live_provider
+    orig_ensure = provider.ensure_live_provider_configured
+    orig_call = provider.call_live_model_with_image
+    orig_model_name = provider.live_agent_receipt_model_name
+    provider.ensure_live_provider_configured = lambda: None
+    provider.call_live_model_with_image = lambda **_kwargs: json.dumps(
+        {
+            "business_or_personal": "Business",
+            "report_bucket": "Meals/Snacks",
+            "attendees": ["Hakan"],
+            "customer": None,
+            "business_reason": "Team lunch",
+            "confidence_overall": 0.8,
+        }
+    )
+    provider.live_agent_receipt_model_name = lambda: "test-model"
+
+    orig_maybe_send = telegram_module.maybe_send_telegram_receipt_reply
+    orig_maybe_create = telegram_module.maybe_create_telegram_receipt_ai_review
+    telegram_module.maybe_send_telegram_receipt_reply = lambda *a, **k: False
+    telegram_module.maybe_create_telegram_receipt_ai_review = lambda *a, **k: None
+
+    orig_extract = telegram_module.apply_receipt_extraction
+
+    class _ExtractionStub:
+        confidence = 0.5
+
+    telegram_module.apply_receipt_extraction = lambda *a, **k: _ExtractionStub()
+
+    try:
+        with Session(isolated_db) as session:
+            result = handle_update_local(
+                session,
+                _photo_message(telegram_user_id=8038997793),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+        provider.ensure_live_provider_configured = orig_ensure
+        provider.call_live_model_with_image = orig_call
+        provider.live_agent_receipt_model_name = orig_model_name
+        telegram_module.maybe_send_telegram_receipt_reply = orig_maybe_send
+        telegram_module.maybe_create_telegram_receipt_ai_review = orig_maybe_create
+        telegram_module.apply_receipt_extraction = orig_extract
+
+    assert result["action"] == "receipt_captured"
+    assert any(method == "sendMessage" for method, _payload in client.calls)
+    with Session(isolated_db) as session:
+        assert session.exec(_select_first(AgentReceiptUserResponse)).all() == []
+        questions = session.exec(_select_first(ClarificationQuestion)).all()
+        assert questions, "legacy fallback should still seed a clarification path"
+
+
 def test_supersede_flow(isolated_db, monkeypatch):
     """Pending row + new receipt → previous flips to auto_confirmed_supersede,
     canonical written with auto_confirmed_default."""

@@ -818,11 +818,16 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
             if value != pre_answer_values[key]
         }
         if not new_questions:
-            receipt.category_source = "telegram_user"
-            receipt.bucket_source = "telegram_user"
-            receipt.business_reason_source = "telegram_user"
-            receipt.attendees_source = "telegram_user"
-            session.add(receipt)
+            if "business_or_personal" in changed_fields:
+                receipt.category_source = "telegram_user"
+            if "report_bucket" in changed_fields:
+                receipt.bucket_source = "telegram_user"
+            if "business_reason" in changed_fields:
+                receipt.business_reason_source = "telegram_user"
+            if "attendees" in changed_fields:
+                receipt.attendees_source = "telegram_user"
+            if changed_fields:
+                session.add(receipt)
             edited_response.user_action = "confirmed"
             edited_response.user_action_at = datetime.now(timezone.utc)
         edited_response.free_text_reply = answer_text

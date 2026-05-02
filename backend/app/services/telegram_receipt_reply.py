@@ -843,6 +843,8 @@ def send_inline_keyboard_proposal(
         session.commit()
         return False
 
+    # Flush the response row only to reserve the callback id. It is not
+    # committed until Telegram confirms the keyboard was actually sent.
     user_response = AgentReceiptUserResponse(
         receipt_document_id=receipt.id or 0,
         agent_receipt_review_run_id=outcome.run.id or 0,
@@ -852,9 +854,7 @@ def send_inline_keyboard_proposal(
         user_action="pending",
     )
     session.add(user_response)
-    session.commit()
-    session.refresh(user_response)
-
+    session.flush()
     payload = build_inline_keyboard_reply(receipt, agent_read, user_response.id or 0)
     try:
         api_response = client.call(
@@ -871,12 +871,20 @@ def send_inline_keyboard_proposal(
             receipt.id,
             exc,
         )
+        session.rollback()
         return False
 
     message_id = (api_response or {}).get("result", {}).get("message_id")
-    if isinstance(message_id, int):
-        user_response.keyboard_message_id = message_id
-        session.add(user_response)
-        session.commit()
+    if not isinstance(message_id, int):
+        logger.warning(
+            "inline keyboard: sendMessage response missing message_id for receipt_id=%s",
+            receipt.id,
+        )
+        session.rollback()
+        return False
+
+    user_response.keyboard_message_id = message_id
+    session.add(user_response)
+    session.commit()
 
     return True

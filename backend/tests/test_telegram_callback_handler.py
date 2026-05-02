@@ -376,6 +376,10 @@ def test_edit_seeds_clarification_question(isolated_db):
 
 def test_edit_text_reply_round_trip(isolated_db, monkeypatch):
     _set_ai_reply_env(monkeypatch)
+    monkeypatch.setenv("BUSINESS_PERSONAL_CLARIFICATION_TELEGRAM_IDS", "8038997793")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
     client = _FakeClient()
     telegram_module, original_client = _patch_telegram_client(client)
     original_extract = telegram_module.apply_receipt_extraction
@@ -478,9 +482,9 @@ def test_edit_text_reply_round_trip(isolated_db, monkeypatch):
     assert receipt.business_or_personal == "Business"
     assert receipt.business_reason == "EDT team meeting"
     assert receipt.category_source == "telegram_user"
-    assert receipt.bucket_source == "telegram_user"
     assert receipt.business_reason_source == "telegram_user"
-    assert receipt.attendees_source == "telegram_user"
+    assert receipt.bucket_source is None
+    assert receipt.attendees_source is None
     assert response.user_action == "confirmed"
     assert response.free_text_reply == "business, EDT team meeting"
     assert response.user_action_at is not None
@@ -488,6 +492,69 @@ def test_edit_text_reply_round_trip(isolated_db, monkeypatch):
     assert payload["source_tag"] == "telegram_user"
     assert payload["fields"]["business_or_personal"] == "Business"
     assert question.status == "answered"
+
+
+def test_edit_reply_only_tags_changed_fields_telegram_user(isolated_db, monkeypatch):
+    _set_ai_reply_env(monkeypatch)
+    monkeypatch.setenv("BUSINESS_PERSONAL_CLARIFICATION_TELEGRAM_IDS", "8038997793")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(
+            session,
+            receipt_supplier="Acme Cafe",
+            receipt_report_bucket="Lunch",
+            suggested_report_bucket="Lunch",
+        )
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        receipt.business_reason = "AI proposed reason"
+        receipt.category_source = "ai_advisory"
+        receipt.bucket_source = "ai_advisory"
+        receipt.business_reason_source = "ai_advisory"
+        receipt.attendees_source = "ai_advisory"
+        session.add(receipt)
+        session.commit()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            edit_result = handle_update(
+                session,
+                _callback_payload(
+                    telegram_user_id=ids["telegram_user_id"],
+                    response_id=ids["response_id"],
+                    action="edit",
+                ),
+            )
+        assert edit_result["action"] == "callback_edit_requested"
+
+        with Session(isolated_db) as session:
+            reply_result = handle_update(
+                session,
+                _text_payload(
+                    telegram_user_id=ids["telegram_user_id"],
+                    text="business, Hakan + Burak",
+                ),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert reply_result["action"] == "answered_clarification"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+
+    assert receipt.business_or_personal == "Business"
+    assert receipt.attendees == "Hakan + Burak"
+    assert receipt.report_bucket == "Lunch"
+    assert receipt.business_reason == "AI proposed reason"
+    assert receipt.category_source == "telegram_user"
+    assert receipt.attendees_source == "telegram_user"
+    assert receipt.bucket_source == "ai_advisory"
+    assert receipt.business_reason_source == "ai_advisory"
+    assert response.user_action == "confirmed"
 
 
 @pytest.mark.parametrize("action", ("confirm", "edit", "cancel"))

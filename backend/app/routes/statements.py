@@ -188,6 +188,10 @@ def create_manual_statement_transaction(
         session.add(receipt)
     if receipt and payload.business_reason is not None:
         receipt.business_reason = payload.business_reason.strip() or None
+        # F-AI-Stage1 sub-PR 5: source-tag manual statement entry. The web
+        # operator typed this reason directly, so the source is ``user``.
+        if receipt.business_reason is not None:
+            receipt.business_reason_source = "user"
         session.add(receipt)
 
     transaction = StatementTransaction(

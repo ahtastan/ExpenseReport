@@ -56,6 +56,14 @@ def get_receipt_file(receipt_id: int, session: Session = Depends(get_session)):
     )
 
 
+_CANONICAL_SOURCE_COLUMNS: dict[str, str] = {
+    "business_or_personal": "category_source",
+    "report_bucket": "bucket_source",
+    "business_reason": "business_reason_source",
+    "attendees": "attendees_source",
+}
+
+
 @router.patch("/{receipt_id}", response_model=ReceiptRead)
 def update_receipt(
     receipt_id: int,
@@ -65,8 +73,21 @@ def update_receipt(
     receipt = session.get(ReceiptDocument, receipt_id)
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    for field, value in updates.items():
         setattr(receipt, field, value)
+    # F-AI-Stage1 sub-PR 5: source-tag every canonical write. The PATCH
+    # endpoint is the web review-table direct edit; source is ``user``.
+    # Apply the tag whenever the canonical column was sent in this PATCH,
+    # even when the value is being cleared to NULL — that NULL was still a
+    # user choice and we want to overwrite any prior auto/AI source so the
+    # reviewer audit reflects the operator's intent.
+    for field, source_col in _CANONICAL_SOURCE_COLUMNS.items():
+        if field in updates:
+            if updates[field] is None:
+                setattr(receipt, source_col, None)
+            else:
+                setattr(receipt, source_col, "user")
     session.add(receipt)
     session.commit()
     session.refresh(receipt)

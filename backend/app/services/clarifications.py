@@ -245,6 +245,11 @@ def ensure_receipt_review_questions(
     )
     if receipt.business_or_personal is None and default_business:
         receipt.business_or_personal = "Business"
+        # F-AI-Stage1 sub-PR 5: source-tag the upload-time Telegram default.
+        # This is the legacy (non-keyboard) auto-default policy that mirrors
+        # the keyboard-flow upload default in services/telegram.py.
+        if receipt.category_source is None:
+            receipt.category_source = "auto_confirmed_default"
         logger.info(
             "Defaulted receipt business_or_personal to Business receipt_id=%s "
             "uploader_user_id=%s telegram_user_id=%s reason=default_business_policy "
@@ -587,15 +592,17 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
     if question.receipt_document_id:
         receipt = session.get(ReceiptDocument, question.receipt_document_id)
 
-    # F-AI-Stage1 sub-PR 3: snapshot canonical values BEFORE the parser
-    # runs so we can detect which fields the answer changed and tag them
-    # with ``*_source='telegram_user'`` if an ``edited`` keyboard
-    # response is in flight for this receipt.
+    # F-AI-Stage1 sub-PR 3 + sub-PR 5: snapshot canonical values BEFORE the
+    # parser runs so we can detect which fields the answer changed and tag
+    # them with ``*_source='telegram_user'``. The user IS the source on
+    # both the keyboard Edit flow (``edited_response is not None``) and the
+    # legacy text-clarification flow — both come from the same Telegram
+    # user replying to the same bot, so both write ``telegram_user``.
     edited_response = _active_edited_user_response(
         session, question.receipt_document_id
     )
     pre_answer_values: dict[str, Any] = {}
-    if edited_response is not None and receipt is not None:
+    if receipt is not None:
         pre_answer_values = {
             "business_or_personal": receipt.business_or_personal,
             "report_bucket": receipt.report_bucket,
@@ -800,12 +807,19 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
         receipt.updated_at = datetime.now(timezone.utc)
         session.add(receipt)
 
-    # F-AI-Stage1 sub-PR 3: source-tag canonical writes that resolved an
-    # inline-keyboard ``edited`` state. Once the edit answer is accepted
-    # without a retry question, the user reply becomes the source for the
-    # receipt's classification context and the response moves to a terminal
-    # state so later text is not treated as part of the same Edit flow.
-    if edited_response is not None and receipt is not None:
+    # F-AI-Stage1 sub-PR 3 + sub-PR 5: source-tag canonical writes from a
+    # Telegram clarification reply. The user typed the answer on Telegram,
+    # so the source is always ``telegram_user`` — regardless of whether
+    # this resolved an inline-keyboard ``edited`` state (PR3) or a legacy
+    # text-clarification flow (PR5 closing the gap on the non-keyboard path).
+    # PR5 follow-up: stamp ``*_source`` for any changed canonical field
+    # independent of whether a follow-up question was queued. The previous
+    # gate ``and not new_questions`` left a real invariant gap on the
+    # Business → business_reason and meal-context retry paths, where a
+    # canonical field could land non-NULL with source NULL. The
+    # AgentReceiptUserResponse audit row is still only updated when a
+    # keyboard ``edited_response`` is in flight (PR3 behavior preserved).
+    if receipt is not None:
         canonical_fields: dict[str, Any] = {
             "business_or_personal": receipt.business_or_personal,
             "report_bucket": receipt.report_bucket,
@@ -815,9 +829,9 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
         changed_fields = {
             key: value
             for key, value in canonical_fields.items()
-            if value != pre_answer_values[key]
+            if value != pre_answer_values.get(key)
         }
-        if not new_questions:
+        if changed_fields:
             if "business_or_personal" in changed_fields:
                 receipt.category_source = "telegram_user"
             if "report_bucket" in changed_fields:
@@ -826,20 +840,21 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
                 receipt.business_reason_source = "telegram_user"
             if "attendees" in changed_fields:
                 receipt.attendees_source = "telegram_user"
-            if changed_fields:
-                session.add(receipt)
-            edited_response.user_action = "confirmed"
-            edited_response.user_action_at = datetime.now(timezone.utc)
-        edited_response.free_text_reply = answer_text
-        edited_response.canonical_write_json = json.dumps(
-            {
-                "source_tag": "telegram_user",
-                "fields": canonical_fields,
-                "changed_fields": changed_fields,
-            },
-            sort_keys=True,
-        )
-        session.add(edited_response)
+            session.add(receipt)
+        if edited_response is not None:
+            if not new_questions:
+                edited_response.user_action = "confirmed"
+                edited_response.user_action_at = datetime.now(timezone.utc)
+            edited_response.free_text_reply = answer_text
+            edited_response.canonical_write_json = json.dumps(
+                {
+                    "source_tag": "telegram_user",
+                    "fields": canonical_fields,
+                    "changed_fields": changed_fields,
+                },
+                sort_keys=True,
+            )
+            session.add(edited_response)
 
     session.commit()
     for new_question in new_questions:

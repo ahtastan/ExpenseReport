@@ -56,6 +56,7 @@ def write_ai_proposal_to_canonical(
     agent_read: AgentReceiptRead,
     source_tag: str,
     expected_review_run_id: int | None = None,
+    respect_existing_user_source: bool = False,
 ) -> dict[str, Any]:
     """Write the AI proposal into the canonical receipt + review row.
 
@@ -69,6 +70,11 @@ def write_ai_proposal_to_canonical(
             forward compatibility.
         expected_review_run_id: optional linkage guard used by
             ``AgentReceiptUserResponse`` callers.
+        respect_existing_user_source: PR4. When True, skip writing any
+            field whose ``*_source`` is already ``'telegram_user'`` or
+            ``'user'``. The Confirm callback uses this so that user-edited
+            fields (set via the Edit menu before tapping Confirm) are
+            preserved instead of overwritten by the AI proposal.
 
     Returns:
         The dict that was persisted, suitable for storage in
@@ -107,23 +113,37 @@ def write_ai_proposal_to_canonical(
     suggestion = _suggestion_view(agent_read)
     written: dict[str, Any] = {"source_tag": source_tag, "fields": {}}
 
-    if suggestion["business_or_personal"] is not None:
+    user_sources = {"telegram_user", "user"} if respect_existing_user_source else set()
+
+    if suggestion["business_or_personal"] is not None and (
+        receipt.category_source not in user_sources
+    ):
+        # PR4 phase 2: when the upload-time auto_confirmed_default is in
+        # place, treat it as a transparent default and let the AI proposal
+        # overwrite it on Confirm with ai_advisory tagging. Only an
+        # explicit user-driven edit ('telegram_user' / 'user') is sticky.
         receipt.business_or_personal = suggestion["business_or_personal"]
         receipt.category_source = source_tag
         written["fields"]["business_or_personal"] = suggestion["business_or_personal"]
 
-    if suggestion["report_bucket"] is not None:
+    if suggestion["report_bucket"] is not None and (
+        receipt.bucket_source not in user_sources
+    ):
         receipt.report_bucket = suggestion["report_bucket"]
         receipt.bucket_source = source_tag
         written["fields"]["report_bucket"] = suggestion["report_bucket"]
 
     attendees_value = _attendees_to_canonical_string(suggestion["attendees"])
-    if attendees_value is not None:
+    if attendees_value is not None and (
+        receipt.attendees_source not in user_sources
+    ):
         receipt.attendees = attendees_value
         receipt.attendees_source = source_tag
         written["fields"]["attendees"] = attendees_value
 
-    if suggestion["business_reason"] is not None:
+    if suggestion["business_reason"] is not None and (
+        receipt.business_reason_source not in user_sources
+    ):
         receipt.business_reason = suggestion["business_reason"]
         receipt.business_reason_source = source_tag
         written["fields"]["business_reason"] = suggestion["business_reason"]

@@ -314,7 +314,10 @@ def test_confirm_skips_blank_suggestions(isolated_db):
         assert refreshed.business_reason_source == "ai_advisory"
 
 
-def test_edit_marks_response_edited_and_replies(isolated_db):
+def test_edit_marks_response_edited_and_shows_menu(isolated_db):
+    """PR4: Edit button taps show the top-level Edit menu in place. The
+    previous PR3 behavior of seeding a clarification question + sending a
+    follow-up text prompt is replaced."""
     with Session(isolated_db) as session:
         ids = _seed_pending_response(session)
 
@@ -333,16 +336,22 @@ def test_edit_marks_response_edited_and_replies(isolated_db):
     finally:
         telegram_module.TelegramClient = original
 
-    assert result["action"] == "callback_edit_requested"
+    assert result["action"] == "callback_edit_menu_shown"
     with Session(isolated_db) as session:
         refreshed = session.get(AgentReceiptUserResponse, ids["response_id"])
         assert refreshed.user_action == "edited"
     edit_message_calls = [c for c in client.calls if c[0] == "editMessageText"]
-    assert any("Got it" in c[1]["text"] for c in edit_message_calls)
-    assert client.send_messages, "expected a follow-up sendMessage prompting the correction"
+    assert edit_message_calls, "expected an editMessageText to swap in the menu"
+    last_edit = edit_message_calls[-1][1]
+    assert "edit" in last_edit["text"].lower()
+    assert "reply_markup" in last_edit, "Edit menu must include reply_markup"
+    assert "📝" in last_edit["reply_markup"] or "Receipt" in last_edit["reply_markup"]
 
 
-def test_edit_seeds_clarification_question(isolated_db):
+def test_edit_does_not_seed_clarification_question(isolated_db):
+    """PR4: button-driven Edit menu does NOT seed a ClarificationQuestion.
+    The PR3 seed-on-Edit behavior is replaced by the menu state machine.
+    This test guards against accidental regression to the legacy flow."""
     with Session(isolated_db) as session:
         ids = _seed_pending_response(session, receipt_supplier="Serbest Market")
 
@@ -361,204 +370,25 @@ def test_edit_seeds_clarification_question(isolated_db):
     finally:
         telegram_module.TelegramClient = original
 
-    assert result["action"] == "callback_edit_requested"
+    assert result["action"] == "callback_edit_menu_shown"
     with Session(isolated_db) as session:
         questions = session.exec(
             select(ClarificationQuestion).where(
                 ClarificationQuestion.receipt_document_id == ids["receipt_id"],
             )
         ).all()
-    assert len(questions) == 1
-    assert questions[0].question_key in {
-        "telegram_meal_context",
-        "telegram_market_context",
-        "telegram_telecom_context",
-        "telegram_personal_care_context",
-    }
-    assert questions[0].status == "open"
+    assert questions == [], (
+        "PR4 keyboard Edit must not seed clarification questions; the "
+        "button-driven menu replaces that flow."
+    )
 
 
-def test_edit_text_reply_round_trip(isolated_db, monkeypatch):
-    _set_ai_reply_env(monkeypatch)
-    monkeypatch.setenv("BUSINESS_PERSONAL_CLARIFICATION_TELEGRAM_IDS", "8038997793")
-    from app.config import get_settings
-
-    get_settings.cache_clear()
-    client = _FakeClient()
-    telegram_module, original_client = _patch_telegram_client(client)
-    original_extract = telegram_module.apply_receipt_extraction
-    original_send_keyboard = telegram_module.send_inline_keyboard_proposal
-
-    class _ExtractionStub:
-        confidence = 0.8
-
-    def _stub_extraction(session, receipt):
-        receipt.extracted_supplier = "Serbest Market"
-        receipt.extracted_date = date(2026, 5, 1)
-        receipt.extracted_local_amount = Decimal("42.50")
-        receipt.extracted_currency = "TRY"
-        session.add(receipt)
-        session.commit()
-        session.refresh(receipt)
-        return _ExtractionStub()
-
-    def _stub_send_keyboard(session, _client, **kwargs):
-        receipt = kwargs["receipt"]
-        run = AgentReceiptReviewRun(
-            receipt_document_id=receipt.id,
-            run_source="telegram_receipt_inline_keyboard",
-            run_kind="receipt_inline_keyboard",
-            status="completed",
-            schema_version="stage1",
-            prompt_version="agent_receipt_inline_keyboard_prompt_stage1_v1",
-            comparator_version="agent_receipt_comparator_0a",
-        )
-        session.add(run)
-        session.commit()
-        session.refresh(run)
-        read = AgentReceiptRead(
-            run_id=run.id,
-            receipt_document_id=receipt.id,
-            read_schema_version="stage1",
-            read_json="{}",
-            suggested_business_or_personal="Business",
-            suggested_report_bucket="Meals/Snacks",
-            suggested_business_reason="Team lunch",
-            suggested_confidence_overall=0.85,
-        )
-        session.add(read)
-        session.commit()
-        session.refresh(read)
-        response = AgentReceiptUserResponse(
-            receipt_document_id=receipt.id,
-            agent_receipt_review_run_id=run.id,
-            agent_receipt_read_id=read.id,
-            telegram_user_id=kwargs["telegram_user_id"],
-            keyboard_message_id=999,
-            user_action="pending",
-        )
-        session.add(response)
-        session.commit()
-        return True
-
-    telegram_module.apply_receipt_extraction = _stub_extraction
-    telegram_module.send_inline_keyboard_proposal = _stub_send_keyboard
-    try:
-        with Session(isolated_db) as session:
-            upload_result = handle_update(
-                session,
-                _photo_payload(telegram_user_id=8038997793),
-            )
-            response = session.exec(select(AgentReceiptUserResponse)).one()
-
-        assert upload_result["action"] == "receipt_keyboard_sent"
-
-        with Session(isolated_db) as session:
-            edit_result = handle_update(
-                session,
-                _callback_payload(
-                    telegram_user_id=8038997793,
-                    response_id=response.id,
-                    action="edit",
-                ),
-            )
-        assert edit_result["action"] == "callback_edit_requested"
-
-        with Session(isolated_db) as session:
-            reply_result = handle_update(
-                session,
-                _text_payload(
-                    telegram_user_id=8038997793,
-                    text="business, EDT team meeting",
-                ),
-            )
-    finally:
-        telegram_module.TelegramClient = original_client
-        telegram_module.apply_receipt_extraction = original_extract
-        telegram_module.send_inline_keyboard_proposal = original_send_keyboard
-
-    assert reply_result["action"] == "answered_clarification"
-    with Session(isolated_db) as session:
-        receipt = session.get(ReceiptDocument, upload_result["receipt_id"])
-        response = session.exec(select(AgentReceiptUserResponse)).one()
-        question = session.exec(select(ClarificationQuestion)).one()
-
-    assert receipt.business_or_personal == "Business"
-    assert receipt.business_reason == "EDT team meeting"
-    assert receipt.category_source == "telegram_user"
-    assert receipt.business_reason_source == "telegram_user"
-    assert receipt.bucket_source is None
-    assert receipt.attendees_source is None
-    assert response.user_action == "confirmed"
-    assert response.free_text_reply == "business, EDT team meeting"
-    assert response.user_action_at is not None
-    payload = json.loads(response.canonical_write_json)
-    assert payload["source_tag"] == "telegram_user"
-    assert payload["fields"]["business_or_personal"] == "Business"
-    assert question.status == "answered"
-
-
-def test_edit_reply_only_tags_changed_fields_telegram_user(isolated_db, monkeypatch):
-    _set_ai_reply_env(monkeypatch)
-    monkeypatch.setenv("BUSINESS_PERSONAL_CLARIFICATION_TELEGRAM_IDS", "8038997793")
-    from app.config import get_settings
-
-    get_settings.cache_clear()
-    with Session(isolated_db) as session:
-        ids = _seed_pending_response(
-            session,
-            receipt_supplier="Acme Cafe",
-            receipt_report_bucket="Lunch",
-            suggested_report_bucket="Lunch",
-        )
-        receipt = session.get(ReceiptDocument, ids["receipt_id"])
-        receipt.business_reason = "AI proposed reason"
-        receipt.category_source = "ai_advisory"
-        receipt.bucket_source = "ai_advisory"
-        receipt.business_reason_source = "ai_advisory"
-        receipt.attendees_source = "ai_advisory"
-        session.add(receipt)
-        session.commit()
-
-    client = _FakeClient()
-    telegram_module, original = _patch_telegram_client(client)
-    try:
-        with Session(isolated_db) as session:
-            edit_result = handle_update(
-                session,
-                _callback_payload(
-                    telegram_user_id=ids["telegram_user_id"],
-                    response_id=ids["response_id"],
-                    action="edit",
-                ),
-            )
-        assert edit_result["action"] == "callback_edit_requested"
-
-        with Session(isolated_db) as session:
-            reply_result = handle_update(
-                session,
-                _text_payload(
-                    telegram_user_id=ids["telegram_user_id"],
-                    text="business, Hakan + Burak",
-                ),
-            )
-    finally:
-        telegram_module.TelegramClient = original
-
-    assert reply_result["action"] == "answered_clarification"
-    with Session(isolated_db) as session:
-        receipt = session.get(ReceiptDocument, ids["receipt_id"])
-        response = session.get(AgentReceiptUserResponse, ids["response_id"])
-
-    assert receipt.business_or_personal == "Business"
-    assert receipt.attendees == "Hakan + Burak"
-    assert receipt.report_bucket == "Lunch"
-    assert receipt.business_reason == "AI proposed reason"
-    assert receipt.category_source == "telegram_user"
-    assert receipt.attendees_source == "telegram_user"
-    assert receipt.bucket_source == "ai_advisory"
-    assert receipt.business_reason_source == "ai_advisory"
-    assert response.user_action == "confirmed"
+# PR3 text-parse Edit round-trip and source-tag tests removed in PR4.
+# The keyboard Edit flow no longer routes free-text replies through
+# clarifications.py; instead, button taps drive an ``awaiting_*`` state
+# machine that parses each field individually. New tests for the menu
+# flow live in tests/test_telegram_button_edit_menu.py and
+# tests/test_telegram_edit_parsers.py.
 
 
 def test_canonical_writer_rejects_mismatched_linkage(isolated_db):
@@ -780,7 +610,7 @@ def test_callback_rejected_when_user_response_has_null_owner(
     ("action", "expected_result", "expected_response_action"),
     (
         ("confirm", "callback_confirmed", "confirmed"),
-        ("edit", "callback_edit_requested", "edited"),
+        ("edit", "callback_edit_menu_shown", "edited"),
         ("cancel", "callback_cancelled", "cancelled"),
     ),
 )
@@ -823,165 +653,23 @@ def test_callback_succeeds_when_telegram_user_matches_response_owner(
         assert receipt.business_or_personal == "Business"
         assert receipt.category_source == "ai_advisory"
     elif action == "edit":
-        assert len(questions) == 1
-        question = questions[0]
-        assert question.receipt_document_id == receipt.id
-        assert question.status == "open"
+        # PR4: keyboard Edit shows the menu; no clarification question seeded.
+        assert questions == []
     else:
         assert receipt.status == "cancelled"
 
 
-def test_edit_text_reply_does_not_route_to_unrelated_receipt(isolated_db, monkeypatch):
-    _set_ai_reply_env(monkeypatch)
-    with Session(isolated_db) as session:
-        user = AppUser(telegram_user_id=8038997793, display_name="Hakan")
-        session.add(user)
-        session.commit()
-        session.refresh(user)
+# PR3 cross-receipt fallback test removed in PR4. The keyboard Edit flow
+# no longer seeds clarification questions, so the cross-receipt routing
+# path it guarded against is unreachable from the keyboard. The legacy
+# clarifications.py path (still used for non-allowlisted users) keeps its
+# own coverage in test_clarification_queue_receipt_scope.py.
 
-        old_receipt = ReceiptDocument(
-            uploader_user_id=user.id,
-            source="telegram",
-            status="received",
-            content_type="photo",
-            extracted_supplier="Old Market",
-            extracted_date=date(2026, 4, 1),
-            extracted_local_amount=Decimal("12.00"),
-            extracted_currency="TRY",
-        )
-        session.add(old_receipt)
-        session.commit()
-        session.refresh(old_receipt)
-        old_question = ClarificationQuestion(
-            receipt_document_id=old_receipt.id,
-            user_id=user.id,
-            question_key="telegram_market_context",
-            question_text="Was this business or personal spending?",
-        )
-        session.add(old_question)
-        session.commit()
-        session.refresh(old_question)
-        old_question_id = old_question.id
-        old_receipt_id = old_receipt.id
-
-        ids = _seed_pending_response(
-            session,
-            user=user,
-            receipt_supplier="Serbest Market",
-            suggested_report_bucket="Meals/Snacks",
-        )
-
-    client = _FakeClient()
-    telegram_module, original = _patch_telegram_client(client)
-    try:
-        with Session(isolated_db) as session:
-            handle_update(
-                session,
-                _callback_payload(
-                    telegram_user_id=ids["telegram_user_id"],
-                    response_id=ids["response_id"],
-                    action="edit",
-                ),
-            )
-        with Session(isolated_db) as session:
-            result = handle_update(
-                session,
-                _text_payload(
-                    telegram_user_id=ids["telegram_user_id"],
-                    text="business, latest receipt context",
-                ),
-            )
-    finally:
-        telegram_module.TelegramClient = original
-
-    assert result["action"] == "answered_clarification"
-    with Session(isolated_db) as session:
-        old_receipt = session.get(ReceiptDocument, old_receipt_id)
-        old_question = session.get(ClarificationQuestion, old_question_id)
-        latest_receipt = session.get(ReceiptDocument, ids["receipt_id"])
-
-    assert old_question.status == "open"
-    assert old_question.answer_text is None
-    assert old_receipt.business_reason is None
-    assert latest_receipt.business_reason == "latest receipt context"
-
-
-def test_edit_text_reply_with_no_seeded_question_logs_warning(
-    isolated_db,
-    monkeypatch,
-    caplog,
-):
-    _set_ai_reply_env(monkeypatch)
-    with Session(isolated_db) as session:
-        user = AppUser(telegram_user_id=8038997793, display_name="Hakan")
-        session.add(user)
-        session.commit()
-        session.refresh(user)
-
-        old_receipt = ReceiptDocument(
-            uploader_user_id=user.id,
-            source="telegram",
-            status="received",
-            content_type="photo",
-            extracted_supplier="Old Market",
-            extracted_date=date(2026, 4, 1),
-            extracted_local_amount=Decimal("12.00"),
-            extracted_currency="TRY",
-        )
-        session.add(old_receipt)
-        session.commit()
-        session.refresh(old_receipt)
-        old_question = ClarificationQuestion(
-            receipt_document_id=old_receipt.id,
-            user_id=user.id,
-            question_key="telegram_market_context",
-            question_text="Was this business or personal spending?",
-        )
-        session.add(old_question)
-        session.commit()
-        session.refresh(old_question)
-
-        ids = _seed_pending_response(
-            session,
-            user=user,
-            receipt_supplier="Serbest Market",
-        )
-        response = session.get(AgentReceiptUserResponse, ids["response_id"])
-        response.user_action = "edited"
-        response.user_action_at = datetime.now(timezone.utc)
-        session.add(response)
-        session.commit()
-        old_receipt_id = old_receipt.id
-        old_question_id = old_question.id
-
-    client = _FakeClient()
-    telegram_module, original = _patch_telegram_client(client)
-    caplog.set_level(logging.WARNING, logger="app.services.telegram")
-    try:
-        with Session(isolated_db) as session:
-            result = handle_update(
-                session,
-                _text_payload(
-                    telegram_user_id=ids["telegram_user_id"],
-                    text="business, should stay on latest receipt",
-                ),
-            )
-    finally:
-        telegram_module.TelegramClient = original
-
-    assert result["action"] == "edit_reply_missing_question_prompted"
-    assert "missing seeded clarification question" in caplog.text
-    assert client.send_messages
-    assert "Reply with the correction" in client.send_messages[-1][1]
-    with Session(isolated_db) as session:
-        old_receipt = session.get(ReceiptDocument, old_receipt_id)
-        old_question = session.get(ClarificationQuestion, old_question_id)
-        latest_receipt = session.get(ReceiptDocument, ids["receipt_id"])
-
-    assert old_question.status == "open"
-    assert old_question.answer_text is None
-    assert old_receipt.business_reason is None
-    assert latest_receipt.business_reason is None
+# PR3 missing-seeded-question warning test removed in PR4. The new
+# keyboard Edit flow never seeds a clarification, so the "missing seeded
+# clarification" warning the test exercised is unreachable from the menu
+# state machine. Awaiting_* states route through telegram_edit_parsers,
+# not clarifications.py.
 
 
 def test_legacy_user_text_reply_unchanged(isolated_db, monkeypatch):

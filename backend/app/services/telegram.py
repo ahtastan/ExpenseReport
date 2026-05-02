@@ -1078,6 +1078,19 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         storage_path = None
         print(f"Telegram download failed for file_id={file_id}: {exc}")
 
+    # F-AI-Stage1 PR4 Phase 2: when the inline-keyboard flow is gated on for
+    # this user (allowlist + flag), default business_or_personal=Business at
+    # upload time so the AI proposal and keyboard always show a defined Type.
+    # The legacy clarifications-based default for non-allowlisted users runs
+    # later (clarifications.py:_should_default_business_for_telegram_receipt)
+    # and only fires when business_or_personal is still None.
+    keyboard_gate_open = should_use_inline_keyboard(settings, user.telegram_user_id)
+    initial_business_or_personal: str | None = None
+    initial_category_source: str | None = None
+    if keyboard_gate_open:
+        initial_business_or_personal = "Business"
+        initial_category_source = "auto_confirmed_default"
+
     receipt = ReceiptDocument(
         uploader_user_id=user.id,
         status=status,
@@ -1090,6 +1103,8 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         mime_type=file_payload.get("mime_type"),
         storage_path=storage_path,
         caption=message.get("caption"),
+        business_or_personal=initial_business_or_personal,
+        category_source=initial_category_source,
     )
     session.add(receipt)
     session.commit()
@@ -1103,7 +1118,8 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     # F-AI-Stage1 sub-PR 3: when the inline-keyboard flag is on for this
     # user, supersede any pending old keyboard, then run the new flow and
     # short-circuit the legacy clarification-question + reply sequence.
-    if should_use_inline_keyboard(settings, user.telegram_user_id):
+    # ``keyboard_gate_open`` was computed above for the upload-time default.
+    if keyboard_gate_open:
         _auto_close_pending_responses(
             session,
             client,

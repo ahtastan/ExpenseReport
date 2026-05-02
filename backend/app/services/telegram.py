@@ -2,7 +2,7 @@ import json
 import logging
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -10,8 +10,22 @@ from typing import Any
 from sqlmodel import Session, select
 
 from app.config import get_settings
-from app.models import AppUser, ClarificationQuestion, ReceiptDocument
+from app.json_utils import dumps as json_dumps
+from app.models import (
+    AgentReceiptRead,
+    AgentReceiptReviewRun,
+    AgentReceiptUserResponse,
+    AppUser,
+    ClarificationQuestion,
+    ReceiptDocument,
+    utc_now,
+)
+from app.services.agent_receipt_canonical_writer import (
+    CanonicalWriteLinkageError,
+    write_ai_proposal_to_canonical,
+)
 from app.services.clarifications import (
+    TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
     answer_question,
     ensure_receipt_review_questions,
     looks_like_telegram_context_answer,
@@ -24,14 +38,20 @@ from app.services.receipt_extraction import apply_receipt_extraction
 from app.services.review_sessions import get_or_create_review_session
 from app.services.storage import save_bytes
 from app.services.statement_import import import_diners_excel
+from app.services.telegram_keyboard_composer import parse_callback_data
 from app.services.telegram_receipt_reply import (
     maybe_create_telegram_receipt_ai_review,
     maybe_send_telegram_receipt_reply,
     receipt_business_context_question_keys,
+    send_inline_keyboard_proposal,
     should_include_receipt_business_context,
     should_send_ai_receipt_reply,
     should_send_telegram_receipt_followups,
+    should_use_inline_keyboard,
 )
+
+INLINE_KEYBOARD_TIMEOUT = timedelta(hours=24)
+INLINE_KEYBOARD_EDIT_REPLY_WINDOW = timedelta(minutes=60)
 
 logger = logging.getLogger(__name__)
 
@@ -205,9 +225,572 @@ def _latest_receipt_id_for_user(session: Session, user_id: int) -> int | None:
     ).first()
 
 
+def _pending_responses_for_user(
+    session: Session,
+    user_id: int,
+) -> list[AgentReceiptUserResponse]:
+    rows = session.exec(
+        select(AgentReceiptUserResponse, ReceiptDocument)
+        .join(
+            ReceiptDocument,
+            AgentReceiptUserResponse.receipt_document_id == ReceiptDocument.id,
+        )
+        .where(
+            ReceiptDocument.uploader_user_id == user_id,
+            AgentReceiptUserResponse.user_action == "pending",
+        )
+        .order_by(AgentReceiptUserResponse.id)
+    ).all()
+    return [response for response, _receipt in rows]
+
+
+def _recent_edited_response_for_user(
+    session: Session,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> AgentReceiptUserResponse | None:
+    """Return a recent inline-keyboard Edit response for this user, if any."""
+    cutoff = (now or utc_now()) - INLINE_KEYBOARD_EDIT_REPLY_WINDOW
+    rows = session.exec(
+        select(AgentReceiptUserResponse, ReceiptDocument)
+        .join(
+            ReceiptDocument,
+            AgentReceiptUserResponse.receipt_document_id == ReceiptDocument.id,
+        )
+        .where(
+            ReceiptDocument.uploader_user_id == user_id,
+            AgentReceiptUserResponse.user_action == "edited",
+        )
+        .order_by(
+            AgentReceiptUserResponse.user_action_at.desc(),
+            AgentReceiptUserResponse.id.desc(),
+        )
+    ).all()
+    for response, _receipt in rows:
+        action_at = response.user_action_at
+        if action_at is None:
+            continue
+        if action_at.tzinfo is None:
+            action_at = action_at.replace(tzinfo=timezone.utc)
+        if action_at >= cutoff:
+            return response
+    return None
+
+
+def _open_question_for_edited_response(
+    session: Session,
+    *,
+    user_id: int,
+    user_response: AgentReceiptUserResponse,
+) -> ClarificationQuestion | None:
+    context_keys = open_telegram_context_question_keys_for_receipt(
+        session,
+        user_id,
+        user_response.receipt_document_id,
+    )
+    if not context_keys:
+        return None
+    return next_open_question_for_receipt(
+        session,
+        user_id,
+        user_response.receipt_document_id,
+        include_business_context=True,
+        business_context_question_keys=context_keys,
+    )
+
+
+def _close_pending_response(
+    session: Session,
+    client: "TelegramClient",
+    *,
+    user_response: AgentReceiptUserResponse,
+    reason: str,
+    chat_id: int | None,
+) -> None:
+    """Auto-confirm a pending inline-keyboard proposal due to supersede or
+    timeout. Writes canonical with ``source_tag='auto_confirmed_default'``,
+    flips the response row, and edits the original keyboard message.
+    """
+    receipt = session.get(ReceiptDocument, user_response.receipt_document_id)
+    agent_read = session.get(AgentReceiptRead, user_response.agent_receipt_read_id)
+    if receipt is None or agent_read is None:
+        # Best-effort: mark closed without canonical write.
+        user_response.user_action = (
+            "auto_confirmed_timeout" if reason == "timeout" else "auto_confirmed_supersede"
+        )
+        user_response.user_action_at = utc_now()
+        session.add(user_response)
+        session.commit()
+        return
+
+    try:
+        written = write_ai_proposal_to_canonical(
+            session,
+            receipt=receipt,
+            agent_read=agent_read,
+            source_tag="auto_confirmed_default",
+            expected_review_run_id=user_response.agent_receipt_review_run_id,
+        )
+    except CanonicalWriteLinkageError as exc:
+        logger.error(
+            "canonical write linkage failed during auto-close response_id=%s "
+            "agent_read_id=%s receipt_id=%s: %s",
+            user_response.id,
+            agent_read.id,
+            receipt.id,
+            exc,
+        )
+        _mark_response_failed_validation(session, user_response)
+        return
+    user_response.user_action = (
+        "auto_confirmed_timeout" if reason == "timeout" else "auto_confirmed_supersede"
+    )
+    user_response.user_action_at = utc_now()
+    user_response.canonical_write_json = json_dumps(written, sort_keys=True)
+    session.add(user_response)
+    session.commit()
+
+    if chat_id is not None and user_response.keyboard_message_id is not None:
+        edit_text = (
+            "Auto-confirmed after 24h."
+            if reason == "timeout"
+            else "Auto-confirmed (you sent another receipt)."
+        )
+        try:
+            client.call(
+                "editMessageText",
+                {
+                    "chat_id": chat_id,
+                    "message_id": user_response.keyboard_message_id,
+                    "text": edit_text,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "inline keyboard auto-close: editMessageText failed for response_id=%s: %s",
+                user_response.id,
+                exc,
+            )
+
+
+def _mark_response_failed_validation(
+    session: Session,
+    user_response: AgentReceiptUserResponse,
+) -> None:
+    user_response.user_action = "failed_validation"
+    user_response.user_action_at = utc_now()
+    session.add(user_response)
+    session.commit()
+
+
+def _auto_close_pending_responses(
+    session: Session,
+    client: "TelegramClient",
+    *,
+    user_id: int,
+    telegram_user_id: int | None,
+    chat_id: int | None,
+    reason: str,
+    now: datetime | None = None,
+) -> int:
+    """Walk all pending responses for the user and close those that match
+    the given ``reason``.
+
+    - ``reason='supersede'``: closes ALL pending rows (caller invokes this
+      at the start of a new receipt upload, before opening a new keyboard).
+    - ``reason='timeout'``: closes only rows whose ``created_at`` is older
+      than :data:`INLINE_KEYBOARD_TIMEOUT`. Safe to call on every webhook
+      event (no-op when no rows are stale).
+    """
+    if reason not in {"supersede", "timeout"}:
+        raise ValueError(f"unknown _auto_close reason: {reason!r}")
+
+    pending = _pending_responses_for_user(session, user_id=user_id)
+    if not pending:
+        return 0
+
+    cutoff = (now or utc_now()) - INLINE_KEYBOARD_TIMEOUT
+    closed = 0
+    for response in pending:
+        if reason == "timeout":
+            response_created_at = response.created_at
+            if response_created_at is None:
+                continue
+            if response_created_at.tzinfo is None:
+                response_created_at = response_created_at.replace(tzinfo=timezone.utc)
+            if response_created_at > cutoff:
+                continue
+        if response.telegram_user_id is None:
+            logger.warning(
+                "inline keyboard auto-close: response_id=%s has null "
+                "telegram_user_id; marking failed_validation",
+                response.id,
+            )
+            _mark_response_failed_validation(session, response)
+            closed += 1
+            continue
+        if response.telegram_user_id != telegram_user_id:
+            logger.warning(
+                "inline keyboard auto-close: response_id=%s owned by "
+                "telegram_user_id=%s but current telegram_user_id=%s; "
+                "marking failed_validation",
+                response.id,
+                response.telegram_user_id,
+                telegram_user_id,
+            )
+            _mark_response_failed_validation(session, response)
+            closed += 1
+            continue
+        _close_pending_response(
+            session,
+            client,
+            user_response=response,
+            reason=reason,
+            chat_id=chat_id,
+        )
+        closed += 1
+    return closed
+
+
+def _resolve_chat_id_for_response(
+    session: Session, user_response: AgentReceiptUserResponse
+) -> int | None:
+    receipt = session.get(ReceiptDocument, user_response.receipt_document_id)
+    return receipt.telegram_chat_id if receipt is not None else None
+
+
+def _handle_callback_query(
+    session: Session,
+    client: "TelegramClient",
+    callback_query: dict[str, Any],
+) -> dict[str, Any]:
+    """Handle a Telegram inline-keyboard button tap.
+
+    Always answers the callback (dismissing the loading spinner). On
+    malformed data, missing response, or already-finalized response,
+    returns an ignored result without raising.
+    """
+    callback_id = callback_query.get("id")
+    user_payload = callback_query.get("from") or {}
+    if not user_payload:
+        _safe_answer_callback(client, callback_id)
+        return {"ok": False, "action": "ignored", "message": "callback missing user"}
+
+    if get_settings().allowed_telegram_user_ids and user_payload.get("id") not in get_settings().allowed_telegram_user_ids:
+        _safe_answer_callback(client, callback_id)
+        return {"ok": False, "action": "blocked", "message": "user not allowlisted"}
+
+    user = upsert_telegram_user(session, user_payload)
+    parsed = parse_callback_data(callback_query.get("data"))
+    message = callback_query.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+
+    if parsed is None:
+        logger.warning(
+            "inline keyboard: malformed callback_data data=%r user_id=%s",
+            callback_query.get("data"),
+            user.id,
+        )
+        _safe_answer_callback(client, callback_id)
+        return {"ok": True, "action": "callback_malformed_ignored"}
+
+    action, user_response_id = parsed
+    user_response = session.get(AgentReceiptUserResponse, user_response_id)
+    if user_response is None:
+        logger.warning(
+            "inline keyboard: callback for unknown response_id=%s user_id=%s",
+            user_response_id,
+            user.id,
+        )
+        _safe_answer_callback(client, callback_id)
+        return {"ok": True, "action": "callback_unknown_ignored"}
+
+    callback_telegram_user_id = user_payload.get("id")
+    if user_response.telegram_user_id != callback_telegram_user_id:
+        logger.warning(
+            "callback_query received from telegram_user_id=%s "
+            "for user_response.id=%s owned by telegram_user_id=%s; ignoring",
+            callback_telegram_user_id,
+            user_response.id,
+            user_response.telegram_user_id,
+        )
+        _safe_answer_callback(client, callback_id)
+        return {
+            "ok": True,
+            "action": "callback_owner_mismatch_ignored",
+            "user_response_id": user_response_id,
+        }
+
+    # Lazy timeout sweep on every callback event.
+    _auto_close_pending_responses(
+        session,
+        client,
+        user_id=user.id,
+        telegram_user_id=user.telegram_user_id,
+        chat_id=chat_id,
+        reason="timeout",
+    )
+    session.refresh(user_response)
+
+    if user_response.user_action != "pending":
+        # Idempotent: button tapped twice / Telegram retry.
+        _safe_answer_callback(client, callback_id)
+        return {"ok": True, "action": "callback_already_finalized", "user_response_id": user_response_id}
+
+    receipt = session.get(ReceiptDocument, user_response.receipt_document_id)
+    agent_read = session.get(AgentReceiptRead, user_response.agent_receipt_read_id)
+    if receipt is None or agent_read is None:
+        logger.warning(
+            "inline keyboard: missing receipt or agent_read for response_id=%s",
+            user_response_id,
+        )
+        _safe_answer_callback(client, callback_id)
+        return {"ok": False, "action": "callback_missing_state", "user_response_id": user_response_id}
+    if receipt.uploader_user_id != user.id:
+        logger.warning(
+            "callback_query received from telegram_user_id=%s user_id=%s "
+            "for user_response.id=%s receipt_id=%s owned by user_id=%s; ignoring",
+            callback_telegram_user_id,
+            user.id,
+            user_response.id,
+            receipt.id,
+            receipt.uploader_user_id,
+        )
+        _safe_answer_callback(client, callback_id)
+        return {
+            "ok": True,
+            "action": "callback_owner_mismatch_ignored",
+            "user_response_id": user_response_id,
+        }
+
+    if action == "confirm":
+        result = _handle_callback_confirm(
+            session, client,
+            user_response=user_response,
+            receipt=receipt,
+            agent_read=agent_read,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+    elif action == "edit":
+        result = _handle_callback_edit(
+            session, client,
+            user_response=user_response,
+            receipt=receipt,
+            agent_read=agent_read,
+            user=user,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+    else:  # action == "cancel"
+        result = _handle_callback_cancel(
+            session, client,
+            user_response=user_response,
+            receipt=receipt,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+    _safe_answer_callback(client, callback_id)
+    return result
+
+
+def _safe_answer_callback(client: "TelegramClient", callback_id: str | None) -> None:
+    if not callback_id or not client.enabled:
+        return
+    try:
+        client.call("answerCallbackQuery", {"callback_query_id": callback_id})
+    except Exception as exc:
+        logger.warning("answerCallbackQuery failed callback_id=%s: %s", callback_id, exc)
+
+
+def _handle_callback_confirm(
+    session: Session,
+    client: "TelegramClient",
+    *,
+    user_response: AgentReceiptUserResponse,
+    receipt: ReceiptDocument,
+    agent_read: AgentReceiptRead,
+    chat_id: int | None,
+    message_id: int | None,
+) -> dict[str, Any]:
+    try:
+        written = write_ai_proposal_to_canonical(
+            session,
+            receipt=receipt,
+            agent_read=agent_read,
+            source_tag="ai_advisory",
+            expected_review_run_id=user_response.agent_receipt_review_run_id,
+        )
+    except CanonicalWriteLinkageError as exc:
+        logger.error(
+            "canonical write linkage failed during confirm callback response_id=%s "
+            "agent_read_id=%s receipt_id=%s: %s",
+            user_response.id,
+            agent_read.id,
+            receipt.id,
+            exc,
+        )
+        _mark_response_failed_validation(session, user_response)
+        return {
+            "ok": False,
+            "action": "callback_failed_validation",
+            "user_response_id": user_response.id,
+        }
+    user_response.user_action = "confirmed"
+    user_response.user_action_at = utc_now()
+    user_response.canonical_write_json = json_dumps(written, sort_keys=True)
+    session.add(user_response)
+    session.commit()
+
+    summary_bits: list[str] = []
+    if receipt.report_bucket:
+        summary_bits.append(receipt.report_bucket)
+    if receipt.business_or_personal:
+        summary_bits.append(receipt.business_or_personal)
+    if receipt.attendees:
+        summary_bits.append(receipt.attendees)
+    summary = " / ".join(summary_bits) if summary_bits else "the AI proposal"
+    edit_text = f"✅ Confirmed. Categorized as {summary}."
+
+    if chat_id is not None and message_id is not None:
+        try:
+            client.call(
+                "editMessageText",
+                {"chat_id": chat_id, "message_id": message_id, "text": edit_text},
+            )
+        except Exception as exc:
+            logger.warning(
+                "inline keyboard confirm: editMessageText failed: %s", exc
+            )
+
+    return {
+        "ok": True,
+        "action": "callback_confirmed",
+        "user_response_id": user_response.id,
+        "receipt_id": receipt.id,
+    }
+
+
+def _handle_callback_edit(
+    session: Session,
+    client: "TelegramClient",
+    *,
+    user_response: AgentReceiptUserResponse,
+    receipt: ReceiptDocument,
+    agent_read: AgentReceiptRead,
+    user: AppUser,
+    chat_id: int | None,
+    message_id: int | None,
+) -> dict[str, Any]:
+    user_response.user_action = "edited"
+    user_response.user_action_at = utc_now()
+    session.add(user_response)
+    session.commit()
+
+    ai_review: dict[str, Any] | None = None
+    try:
+        parsed_read_json = json.loads(agent_read.read_json or "{}")
+        if isinstance(parsed_read_json, dict):
+            ai_review = parsed_read_json
+    except json.JSONDecodeError:
+        logger.warning(
+            "inline keyboard edit: invalid agent_read.read_json for response_id=%s",
+            user_response.id,
+        )
+    business_context_question_keys = receipt_business_context_question_keys(
+        receipt,
+        ai_review=ai_review,
+    )
+    question_key = (
+        business_context_question_keys[0]
+        if business_context_question_keys
+        else TELEGRAM_MARKET_CONTEXT_QUESTION_KEY
+    )
+    ensure_receipt_review_questions(
+        session,
+        receipt,
+        user.id,
+        include_business_context=True,
+        business_context_question_keys=(question_key,),
+        include_business_personal=False,
+    )
+
+    edit_text = "✏️ Got it — please type the correction."
+    if chat_id is not None and message_id is not None:
+        try:
+            client.call(
+                "editMessageText",
+                {"chat_id": chat_id, "message_id": message_id, "text": edit_text},
+            )
+        except Exception as exc:
+            logger.warning(
+                "inline keyboard edit: editMessageText failed: %s", exc
+            )
+    if chat_id is not None:
+        client.send_message(
+            chat_id,
+            "Reply with the corrected classification (e.g. business, customer dinner with Hakan).",
+        )
+
+    return {
+        "ok": True,
+        "action": "callback_edit_requested",
+        "user_response_id": user_response.id,
+        "receipt_id": receipt.id,
+    }
+
+
+def _handle_callback_cancel(
+    session: Session,
+    client: "TelegramClient",
+    *,
+    user_response: AgentReceiptUserResponse,
+    receipt: ReceiptDocument,
+    chat_id: int | None,
+    message_id: int | None,
+) -> dict[str, Any]:
+    receipt.status = "cancelled"
+    receipt.updated_at = utc_now()
+    session.add(receipt)
+
+    user_response.user_action = "cancelled"
+    user_response.user_action_at = utc_now()
+    session.add(user_response)
+    session.commit()
+
+    edit_text = "❌ Cancelled. Re-send the receipt to retry."
+    if chat_id is not None and message_id is not None:
+        try:
+            client.call(
+                "editMessageText",
+                {"chat_id": chat_id, "message_id": message_id, "text": edit_text},
+            )
+        except Exception as exc:
+            logger.warning(
+                "inline keyboard cancel: editMessageText failed: %s", exc
+            )
+
+    return {
+        "ok": True,
+        "action": "callback_cancelled",
+        "user_response_id": user_response.id,
+        "receipt_id": receipt.id,
+    }
+
+
 def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     settings = get_settings()
     client = TelegramClient(settings.telegram_bot_token)
+
+    # F-AI-Stage1 sub-PR 3: callback_query is dispatched first because
+    # button taps don't carry a ``message`` field.
+    callback_query = update.get("callback_query")
+    if callback_query:
+        return _handle_callback_query(session, client, callback_query)
+
     message = update.get("message") or update.get("edited_message") or {}
     if not message:
         return {"ok": True, "action": "ignored", "message": "No message payload"}
@@ -223,38 +806,75 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "action": "blocked", "message": "Telegram user is not allowlisted"}
 
     user = upsert_telegram_user(session, user_payload)
+
+    # Lazy timeout sweep on every webhook event.
+    _auto_close_pending_responses(
+        session,
+        client,
+        user_id=user.id,
+        telegram_user_id=user.telegram_user_id,
+        chat_id=chat_id,
+        reason="timeout",
+    )
     ai_receipt_reply_allowed = should_send_ai_receipt_reply(settings, user.telegram_user_id)
     ai_receipt_followups_allowed = should_send_telegram_receipt_followups(settings, user.telegram_user_id)
 
     text = (message.get("text") or "").strip()
     if text:
         if ai_receipt_reply_allowed and ai_receipt_followups_allowed:
-            latest_receipt_id = _latest_receipt_id_for_user(session, user.id)
-            latest_receipt = session.get(ReceiptDocument, latest_receipt_id) if latest_receipt_id is not None else None
-            active_context_question_keys = open_telegram_context_question_keys_for_receipt(
-                session,
-                user.id,
-                latest_receipt_id,
-            )
-            business_context_question_keys = active_context_question_keys or (
-                receipt_business_context_question_keys(latest_receipt)
-                if latest_receipt is not None
-                else ()
-            )
-            include_business_context = bool(active_context_question_keys) or (
-                should_include_receipt_business_context(latest_receipt)
-                if latest_receipt is not None
-                else False
-            )
-            open_question = next_open_question_for_receipt(
-                session,
-                user.id,
-                latest_receipt_id,
-                include_business_context=include_business_context,
-                business_context_question_keys=business_context_question_keys,
-            )
-            if open_question is None and looks_like_telegram_context_answer(text):
-                open_question = next_open_telegram_context_question_for_user(session, user.id)
+            edited_response = _recent_edited_response_for_user(session, user.id)
+            if edited_response is not None:
+                open_question = _open_question_for_edited_response(
+                    session,
+                    user_id=user.id,
+                    user_response=edited_response,
+                )
+                if open_question is None:
+                    logger.warning(
+                        "inline keyboard edit: missing seeded clarification question "
+                        "for response_id=%s receipt_id=%s user_id=%s",
+                        edited_response.id,
+                        edited_response.receipt_document_id,
+                        user.id,
+                    )
+                    client.send_message(
+                        chat_id,
+                        "Reply with the correction for this receipt, for example: business, customer dinner with Hakan.",
+                    )
+                    return {
+                        "ok": True,
+                        "action": "edit_reply_missing_question_prompted",
+                        "user_id": user.id,
+                        "user_response_id": edited_response.id,
+                        "receipt_id": edited_response.receipt_document_id,
+                    }
+            else:
+                latest_receipt_id = _latest_receipt_id_for_user(session, user.id)
+                latest_receipt = session.get(ReceiptDocument, latest_receipt_id) if latest_receipt_id is not None else None
+                active_context_question_keys = open_telegram_context_question_keys_for_receipt(
+                    session,
+                    user.id,
+                    latest_receipt_id,
+                )
+                business_context_question_keys = active_context_question_keys or (
+                    receipt_business_context_question_keys(latest_receipt)
+                    if latest_receipt is not None
+                    else ()
+                )
+                include_business_context = bool(active_context_question_keys) or (
+                    should_include_receipt_business_context(latest_receipt)
+                    if latest_receipt is not None
+                    else False
+                )
+                open_question = next_open_question_for_receipt(
+                    session,
+                    user.id,
+                    latest_receipt_id,
+                    include_business_context=include_business_context,
+                    business_context_question_keys=business_context_question_keys,
+                )
+                if open_question is None and looks_like_telegram_context_answer(text):
+                    open_question = next_open_telegram_context_question_for_user(session, user.id)
         elif ai_receipt_reply_allowed:
             open_question = next_open_question_for_user(session, user.id, include_business_context=False)
         else:
@@ -479,6 +1099,37 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
         _send_receipt_progress_ack(client, chat_id, receipt.id)
 
     extraction = apply_receipt_extraction(session, receipt)
+
+    # F-AI-Stage1 sub-PR 3: when the inline-keyboard flag is on for this
+    # user, supersede any pending old keyboard, then run the new flow and
+    # short-circuit the legacy clarification-question + reply sequence.
+    if should_use_inline_keyboard(settings, user.telegram_user_id):
+        _auto_close_pending_responses(
+            session,
+            client,
+            user_id=user.id,
+            telegram_user_id=user.telegram_user_id,
+            chat_id=chat_id,
+            reason="supersede",
+        )
+        keyboard_sent = send_inline_keyboard_proposal(
+            session,
+            client,
+            settings=settings,
+            receipt=receipt,
+            user_id=user.id,
+            telegram_user_id=user.telegram_user_id,
+            chat_id=chat_id,
+        )
+        if keyboard_sent:
+            return {
+                "ok": True,
+                "action": "receipt_keyboard_sent",
+                "receipt_id": receipt.id,
+                "user_id": user.id,
+            }
+        # Safety net: keyboard send failed → fall through to legacy reply.
+
     ai_review = (
         maybe_create_telegram_receipt_ai_review(session, settings=settings, receipt=receipt)
         if ai_receipt_reply_allowed

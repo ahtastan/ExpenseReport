@@ -1,13 +1,33 @@
+import json
 import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from app.config import get_settings
-from app.models import AppUser, ClarificationQuestion, ReceiptDocument
+from app.models import (
+    AgentReceiptUserResponse,
+    AppUser,
+    ClarificationQuestion,
+    ReceiptDocument,
+)
 
+# F-AI-Stage1 sub-PR 3: this module continues to handle the legacy
+# clarification-question follow-up flow ("Was this business or personal?
+# Reply with..."). When the inline-keyboard flag is on for a user, the
+# Telegram receipt-upload path short-circuits this module entirely
+# (telegram.handle_update sends the keyboard instead and returns early
+# before ensure_receipt_review_questions runs). The constants and
+# question texts below are still used as the FALLBACK path: flag-off
+# users, non-allowlisted users, and any keyboard-flow failure that
+# falls back to legacy. They are also still used when the user taps
+# Edit on the keyboard — the bot then asks for a free-text correction
+# and routes the reply through ``answer_question`` below, which adds
+# ``*_source='telegram_user'`` source tags for the inline-keyboard
+# audit trail.
 _AMOUNT_QUANT = Decimal("0.0001")
 logger = logging.getLogger(__name__)
 TELEGRAM_MEAL_CONTEXT_QUESTION_KEY = "telegram_meal_context"
@@ -510,6 +530,26 @@ def looks_like_telegram_context_answer(answer_text: str) -> bool:
     return "business" in text or "personal" in text
 
 
+def _active_edited_user_response(
+    session: Session, receipt_id: int | None
+) -> AgentReceiptUserResponse | None:
+    """F-AI-Stage1 sub-PR 3: return the most recent ``edited`` keyboard
+    response for this receipt, if any. Used to attach source tags +
+    audit trail when the user replies with a correction after tapping
+    Edit on the inline keyboard.
+    """
+    if receipt_id is None:
+        return None
+    return session.exec(
+        select(AgentReceiptUserResponse)
+        .where(
+            AgentReceiptUserResponse.receipt_document_id == receipt_id,
+            AgentReceiptUserResponse.user_action == "edited",
+        )
+        .order_by(AgentReceiptUserResponse.id.desc())
+    ).first()
+
+
 def answer_question(session: Session, question: ClarificationQuestion, answer: str) -> list[ClarificationQuestion]:
     answer_text = answer.strip()
     if question.question_key in {"receipt_date", "receipt_date_retry"} and _looks_like_non_answer(answer_text):
@@ -546,6 +586,22 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
     receipt = None
     if question.receipt_document_id:
         receipt = session.get(ReceiptDocument, question.receipt_document_id)
+
+    # F-AI-Stage1 sub-PR 3: snapshot canonical values BEFORE the parser
+    # runs so we can detect which fields the answer changed and tag them
+    # with ``*_source='telegram_user'`` if an ``edited`` keyboard
+    # response is in flight for this receipt.
+    edited_response = _active_edited_user_response(
+        session, question.receipt_document_id
+    )
+    pre_answer_values: dict[str, Any] = {}
+    if edited_response is not None and receipt is not None:
+        pre_answer_values = {
+            "business_or_personal": receipt.business_or_personal,
+            "report_bucket": receipt.report_bucket,
+            "business_reason": receipt.business_reason,
+            "attendees": receipt.attendees,
+        }
 
     if receipt and question.question_key == "business_or_personal":
         lowered = answer.lower()
@@ -743,6 +799,47 @@ def answer_question(session: Session, question: ClarificationQuestion, answer: s
         receipt.needs_clarification = still_missing or needs_business_context or bool(new_questions)
         receipt.updated_at = datetime.now(timezone.utc)
         session.add(receipt)
+
+    # F-AI-Stage1 sub-PR 3: source-tag canonical writes that resolved an
+    # inline-keyboard ``edited`` state. Once the edit answer is accepted
+    # without a retry question, the user reply becomes the source for the
+    # receipt's classification context and the response moves to a terminal
+    # state so later text is not treated as part of the same Edit flow.
+    if edited_response is not None and receipt is not None:
+        canonical_fields: dict[str, Any] = {
+            "business_or_personal": receipt.business_or_personal,
+            "report_bucket": receipt.report_bucket,
+            "business_reason": receipt.business_reason,
+            "attendees": receipt.attendees,
+        }
+        changed_fields = {
+            key: value
+            for key, value in canonical_fields.items()
+            if value != pre_answer_values[key]
+        }
+        if not new_questions:
+            if "business_or_personal" in changed_fields:
+                receipt.category_source = "telegram_user"
+            if "report_bucket" in changed_fields:
+                receipt.bucket_source = "telegram_user"
+            if "business_reason" in changed_fields:
+                receipt.business_reason_source = "telegram_user"
+            if "attendees" in changed_fields:
+                receipt.attendees_source = "telegram_user"
+            if changed_fields:
+                session.add(receipt)
+            edited_response.user_action = "confirmed"
+            edited_response.user_action_at = datetime.now(timezone.utc)
+        edited_response.free_text_reply = answer_text
+        edited_response.canonical_write_json = json.dumps(
+            {
+                "source_tag": "telegram_user",
+                "fields": canonical_fields,
+                "changed_fields": changed_fields,
+            },
+            sort_keys=True,
+        )
+        session.add(edited_response)
 
     session.commit()
     for new_question in new_questions:

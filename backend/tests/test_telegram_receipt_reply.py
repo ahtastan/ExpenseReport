@@ -1987,3 +1987,46 @@ def test_tests_do_not_import_telegram_network_or_live_model_modules_when_gate_di
     assert "openai" not in newly_loaded
     assert "anthropic" not in newly_loaded
     assert "deepseek" not in newly_loaded
+
+
+# ─── F-AI-Stage1 sub-PR 3: flag-off regression guard ────────────────────────
+
+
+def test_should_use_inline_keyboard_off_by_default():
+    """With ``ai_telegram_inline_keyboard_enabled=False`` (the project
+    default), :func:`should_use_inline_keyboard` returns False even when
+    every other AI flag is on and the user is in the allowlist. Pins
+    that the new keyboard flow does not activate without explicit
+    operator opt-in.
+    """
+    from types import SimpleNamespace
+
+    from app.services.telegram_receipt_reply import should_use_inline_keyboard
+
+    settings_off = SimpleNamespace(
+        ai_telegram_reply_enabled=True,
+        ai_telegram_live_model_enabled=True,
+        ai_telegram_reply_allowlist={8038997793},
+        ai_telegram_inline_keyboard_enabled=False,
+    )
+    assert should_use_inline_keyboard(settings_off, 8038997793) is False
+
+    settings_on = SimpleNamespace(
+        ai_telegram_reply_enabled=True,
+        ai_telegram_live_model_enabled=True,
+        ai_telegram_reply_allowlist={8038997793},
+        ai_telegram_inline_keyboard_enabled=True,
+    )
+    assert should_use_inline_keyboard(settings_on, 8038997793) is True
+    # Non-allowlisted user, flag on → still False.
+    assert should_use_inline_keyboard(settings_on, 1) is False
+    # No telegram user id → False.
+    assert should_use_inline_keyboard(settings_on, None) is False
+    # Live-model disabled → False (the keyboard requires a live proposal).
+    settings_no_live = SimpleNamespace(
+        ai_telegram_reply_enabled=True,
+        ai_telegram_live_model_enabled=False,
+        ai_telegram_reply_allowlist={8038997793},
+        ai_telegram_inline_keyboard_enabled=True,
+    )
+    assert should_use_inline_keyboard(settings_no_live, 8038997793) is False

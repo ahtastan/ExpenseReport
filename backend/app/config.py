@@ -22,6 +22,12 @@ class Settings(BaseModel):
     ai_telegram_reply_enabled: bool = False
     ai_telegram_reply_allowlist: set[int] = Field(default_factory=set)
     ai_telegram_live_model_enabled: bool = False
+    # F-AI-Stage1 sub-PR 3: when True AND user is in
+    # ``ai_telegram_reply_allowlist``, the receipt-upload path replaces the
+    # clarification-question follow-up flow with a three-button inline
+    # keyboard (Confirm / Edit / Cancel). Default False — flag-off path is
+    # byte-equivalent to the existing legacy behavior.
+    ai_telegram_inline_keyboard_enabled: bool = False
 
 
 def _default_storage_root() -> Path:
@@ -73,4 +79,5 @@ def get_settings() -> Settings:
         ai_telegram_reply_enabled=_parse_bool(os.getenv("AI_TELEGRAM_REPLY_ENABLED")),
         ai_telegram_reply_allowlist=_parse_user_ids(os.getenv("AI_TELEGRAM_REPLY_ALLOWLIST")),
         ai_telegram_live_model_enabled=_parse_bool(os.getenv("AI_TELEGRAM_LIVE_MODEL_ENABLED")),
+        ai_telegram_inline_keyboard_enabled=_parse_bool(os.getenv("AI_TELEGRAM_INLINE_KEYBOARD_ENABLED")),
     )

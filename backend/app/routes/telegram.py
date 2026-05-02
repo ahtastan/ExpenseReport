@@ -25,6 +25,14 @@ async def telegram_webhook(
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
     session: Session = Depends(get_session),
 ):
+    """Telegram-side webhook entry point.
+
+    Accepts both ``message`` and ``callback_query`` payloads — the latter
+    is sent when a user taps an inline-keyboard button (F-AI-Stage1
+    sub-PR 3). Telegram includes the same secret token on both event
+    kinds, so the auth check above covers them; ``handle_update``
+    dispatches on the payload shape internally.
+    """
     settings = get_settings()
     if not settings.telegram_webhook_secret:
         raise HTTPException(status_code=503, detail="Telegram webhook is unavailable")

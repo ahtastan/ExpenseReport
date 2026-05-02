@@ -66,6 +66,27 @@ def live_agent_receipt_model_name() -> str:
     )
 
 
+def call_live_model_with_image(
+    *,
+    receipt: ReceiptDocument,
+    prompt_text: str,
+    model_name: str | None = None,
+) -> str:
+    """Generic image+text OpenAI call shared by the second-read and
+    F-AI-Stage1 inline-keyboard run kinds. Returns the raw text response.
+
+    Callers build whatever prompt they need and pass the result; no
+    prompt-shape knowledge is baked in here. The live-provider config
+    check still applies.
+    """
+    ensure_live_provider_configured()
+    return _call_openai_live_receipt_review(
+        receipt=receipt,
+        prompt_text=prompt_text,
+        model_name=model_name or live_agent_receipt_model_name(),
+    )
+
+
 def call_live_agent_receipt_review(
     *,
     receipt: ReceiptDocument,

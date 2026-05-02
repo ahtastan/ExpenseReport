@@ -15,11 +15,22 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
-from app.models import ReceiptDocument
+from app.models import (
+    AgentReceiptRead,
+    AgentReceiptReviewRun,
+    AgentReceiptUserResponse,
+    ReceiptDocument,
+    utc_now,
+)
 from app.services.merchant_buckets import suggest_bucket
 from app.services import agent_receipt_live_provider
+from app.services.agent_receipt_context import build_context_window
+from app.services.agent_receipt_reviewer import (
+    build_inline_keyboard_review_prompt,
+    parse_inline_keyboard_response,
+)
 from app.services.clarifications import (
     TELEGRAM_MARKET_CONTEXT_QUESTION_KEY,
     TELEGRAM_MEAL_CONTEXT_QUESTION_KEY,
@@ -32,6 +43,7 @@ from app.services.agent_receipt_review_persistence import (
     latest_ai_review_for_receipt,
     write_mock_agent_receipt_review,
 )
+from app.services.telegram_keyboard_composer import build_inline_keyboard_reply
 
 logger = logging.getLogger(__name__)
 
@@ -701,3 +713,170 @@ def _optional_bool(value: Any) -> bool | None:
     if text in {"0", "false", "no", "n", "off"}:
         return False
     return None
+
+
+# ─── F-AI-Stage1 sub-PR 3: inline-keyboard dispatch ─────────────────────────
+
+
+def should_use_inline_keyboard(settings: Any, telegram_user_id: int | None) -> bool:
+    """Return True iff the new keyboard flow should replace the legacy reply
+    for this user/event.
+
+    Gate: ``ai_telegram_inline_keyboard_enabled`` flag is True AND the user
+    is in ``ai_telegram_reply_allowlist`` AND
+    ``ai_telegram_live_model_enabled`` is True (the keyboard requires a
+    live AI proposal to populate its body).
+    """
+    if telegram_user_id is None:
+        return False
+    if not getattr(settings, "ai_telegram_inline_keyboard_enabled", False):
+        return False
+    if not getattr(settings, "ai_telegram_live_model_enabled", False):
+        return False
+    allowlist = set(getattr(settings, "ai_telegram_reply_allowlist", set()) or set())
+    return telegram_user_id in allowlist
+
+
+def send_inline_keyboard_proposal(
+    session: Session,
+    client: Any,
+    *,
+    settings: Any,
+    receipt: ReceiptDocument,
+    user_id: int,
+    telegram_user_id: int | None,
+    chat_id: int,
+) -> bool:
+    """Run the inline-keyboard flow for a single receipt upload.
+
+    Returns ``True`` when the keyboard message landed on Telegram and a
+    pending ``AgentReceiptUserResponse`` row was persisted. Returns
+    ``False`` on any failure — caller falls back to the legacy text reply
+    so the user always gets some response.
+    """
+    canonical = build_canonical_receipt_snapshot(receipt)
+    try:
+        context_window = build_context_window(session, user_id=user_id)
+    except Exception as exc:
+        logger.warning(
+            "inline keyboard: context build failed receipt_id=%s user_id=%s: %s",
+            receipt.id,
+            user_id,
+            exc,
+        )
+        return False
+
+    try:
+        agent_receipt_live_provider.ensure_live_provider_configured()
+        prompt_text = build_inline_keyboard_review_prompt(canonical, context_window)
+        raw_response = agent_receipt_live_provider.call_live_model_with_image(
+            receipt=receipt,
+            prompt_text=prompt_text,
+        )
+    except agent_receipt_live_provider.LiveAgentReceiptProviderError as exc:
+        logger.warning(
+            "inline keyboard: live provider unavailable for receipt_id=%s: %s",
+            receipt.id,
+            exc,
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "inline keyboard: live model call failed for receipt_id=%s: %s",
+            receipt.id,
+            exc,
+        )
+        return False
+
+    suggestion = parse_inline_keyboard_response(raw_response)
+    if suggestion is None:
+        logger.warning(
+            "inline keyboard: model response unparseable for receipt_id=%s", receipt.id
+        )
+        return False
+
+    try:
+        outcome = write_mock_agent_receipt_review(
+            session,
+            receipt=receipt,
+            agent_json_text=raw_response,
+            run_kind="receipt_inline_keyboard",
+            run_source="telegram_receipt_inline_keyboard",
+            store_raw_model_json=False,
+            store_prompt_text=False,
+            prompt_text_override=prompt_text,
+            model_provider="openai",
+            model_name=agent_receipt_live_provider.live_agent_receipt_model_name(),
+            suggested_business_or_personal=suggestion.business_or_personal,
+            suggested_report_bucket=suggestion.report_bucket,
+            suggested_attendees=suggestion.attendees,
+            suggested_customer=suggestion.customer,
+            suggested_business_reason=suggestion.business_reason,
+            suggested_confidence_overall=suggestion.confidence_overall,
+            context_window=context_window,
+        )
+    except Exception as exc:
+        logger.warning(
+            "inline keyboard: persistence failed for receipt_id=%s: %s",
+            receipt.id,
+            exc,
+        )
+        session.rollback()
+        return False
+
+    if outcome.run.status != "completed":
+        logger.warning(
+            "inline keyboard: run did not complete for receipt_id=%s status=%s",
+            receipt.id,
+            outcome.run.status,
+        )
+        session.commit()
+        return False
+
+    agent_read = session.exec(
+        select(AgentReceiptRead).where(AgentReceiptRead.run_id == outcome.run.id)
+    ).first()
+    if agent_read is None:
+        logger.warning(
+            "inline keyboard: agent_read row missing for run_id=%s", outcome.run.id
+        )
+        session.commit()
+        return False
+
+    user_response = AgentReceiptUserResponse(
+        receipt_document_id=receipt.id or 0,
+        agent_receipt_review_run_id=outcome.run.id or 0,
+        agent_receipt_read_id=agent_read.id or 0,
+        telegram_user_id=telegram_user_id,
+        keyboard_message_id=None,
+        user_action="pending",
+    )
+    session.add(user_response)
+    session.commit()
+    session.refresh(user_response)
+
+    payload = build_inline_keyboard_reply(receipt, agent_read, user_response.id or 0)
+    try:
+        api_response = client.call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": payload["text"],
+                "reply_markup": json.dumps(payload["reply_markup"]),
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "inline keyboard: sendMessage failed for receipt_id=%s: %s",
+            receipt.id,
+            exc,
+        )
+        return False
+
+    message_id = (api_response or {}).get("result", {}).get("message_id")
+    if isinstance(message_id, int):
+        user_response.keyboard_message_id = message_id
+        session.add(user_response)
+        session.commit()
+
+    return True

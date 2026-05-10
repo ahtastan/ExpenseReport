@@ -1881,13 +1881,13 @@ def _handle_awaiting_text_reply(
         # the next photo / PDF still routes here.
         cleaned = text.strip().lower()
         if cleaned == "/cancel":
-            attachment_count = session.exec(
+            existing_attachments = session.exec(
                 select(ReceiptAttachment).where(
                     ReceiptAttachment.receipt_document_id == receipt.id,
                     ReceiptAttachment.kind == "fatura",
                 )
             ).all()
-            if attachment_count:
+            if existing_attachments:
                 # User already uploaded at least one fatura page; keep
                 # ``attached`` and just close the state.
                 user_response.user_action = "fatura_attached"

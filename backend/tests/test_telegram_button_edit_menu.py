@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from sqlmodel import Session, select
@@ -18,6 +19,7 @@ from app.models import (
     AgentReceiptUserResponse,
     AppUser,
     ClarificationQuestion,
+    ReceiptAttachment,
     ReceiptDocument,
 )
 from app.services.telegram import handle_update
@@ -1571,3 +1573,716 @@ def test_meal_attendees_gate_payload_has_skip_button():
     assert any("Skip" in lbl for lbl in labels)
     # Sole button on the gate keyboard.
     assert sum(len(row) for row in rows) == 1
+
+
+# ─── F-AI-Stage1 sub-PR 8 phase 1: hotel-fatura attachment ──────────────────
+
+
+HOTEL_BUCKET = "Hotel/Lodging/Laundry"
+
+
+def _photo_message(
+    *, telegram_user_id: int = 8038997793, file_unique_id: str = "fatura-1"
+) -> dict[str, Any]:
+    return {
+        "message": {
+            "message_id": 9100,
+            "from": {"id": telegram_user_id, "first_name": "Hakan"},
+            "chat": {"id": 42},
+            "photo": [
+                {
+                    "file_id": "AgACA-fatura-photo",
+                    "file_unique_id": file_unique_id,
+                    "file_size": 22222,
+                    "width": 800,
+                    "height": 1200,
+                }
+            ],
+        }
+    }
+
+
+def _document_message(
+    *,
+    telegram_user_id: int = 8038997793,
+    file_unique_id: str = "fatura-pdf-1",
+    file_name: str = "fatura_invoice.pdf",
+    mime_type: str = "application/pdf",
+) -> dict[str, Any]:
+    return {
+        "message": {
+            "message_id": 9101,
+            "from": {"id": telegram_user_id, "first_name": "Hakan"},
+            "chat": {"id": 42},
+            "document": {
+                "file_id": "BQACA-fatura-pdf",
+                "file_unique_id": file_unique_id,
+                "file_name": file_name,
+                "mime_type": mime_type,
+                "file_size": 33333,
+            },
+        }
+    }
+
+
+class _FakeClientWithDownload(_FakeClient):
+    """Variant of _FakeClient that pretends file downloads succeed —
+    needed for the fatura attachment path which calls
+    ``client.download_file``."""
+
+    downloaded_root = Path("/tmp/fatura-test-fake")
+
+    def download_file(self, file_id, user_id, fallback_name):
+        self.downloaded_root.mkdir(parents=True, exist_ok=True)
+        path = self.downloaded_root / f"{user_id}_{file_id}_{fallback_name}"
+        path.write_bytes(b"fake-fatura-bytes")
+        return path
+
+
+def _patch_telegram_client_with_download(client: _FakeClientWithDownload):
+    import app.services.telegram as telegram_module
+
+    original = telegram_module.TelegramClient
+    telegram_module.TelegramClient = lambda *_a, **_k: client  # type: ignore[assignment]
+    return telegram_module, original
+
+
+def _seed_hotel_pending_response(session: Session) -> dict[str, int]:
+    return _seed_pending_response(
+        session,
+        suggested_report_bucket=HOTEL_BUCKET,
+        suggested_business_reason="Hotel for site visit",
+        suggested_attendees=["Hakan"],
+    )
+
+
+def test_hotel_confirm_sends_fatura_prompt(isolated_db, monkeypatch):
+    """After Confirm on a hotel receipt, the bot sends a separate
+    sendMessage with the 3-button fatura prompt and the user_response
+    moves to ``awaiting_fatura_choice``."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            r = handle_update(session, _callback("confirm", ids["response_id"]))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_confirmed"
+    assert r["fatura_prompt_sent"] is True
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert receipt.report_bucket == HOTEL_BUCKET
+    assert response.user_action == "awaiting_fatura_choice"
+    sends = [
+        call for call in client.calls
+        if call[0] == "sendMessage" and "fatura" in call[1].get("text", "").lower()
+    ]
+    assert len(sends) == 1
+    markup_str = sends[0][1]["reply_markup"]
+    labels = _button_labels(markup_str)
+    assert any("Şimdi" in lbl for lbl in labels)
+    assert any("Sonra" in lbl for lbl in labels)
+    assert any("Yok" in lbl for lbl in labels)
+
+
+def test_non_hotel_confirm_no_fatura_prompt(isolated_db, monkeypatch):
+    """Taxi / fuel / meal / telephone receipts must NOT trigger the
+    fatura follow-up — non-hotel flows stay bit-for-bit identical."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(
+            session,
+            suggested_report_bucket="Taxi/Parking/Tolls/Uber",
+        )
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            r = handle_update(session, _callback("confirm", ids["response_id"]))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_confirmed"
+    assert r["fatura_prompt_sent"] is False
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert response.user_action == "confirmed"
+    assert not any(
+        "fatura" in call[1].get("text", "").lower()
+        for call in client.calls
+        if call[0] == "sendMessage"
+    )
+
+
+def test_fatura_later_button_marks_status_pending(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            r = handle_update(
+                session, _menu_callback("fatura", "later", ids["response_id"])
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_menu_fatura_deferred"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+        attachments = session.exec(
+            select(ReceiptAttachment).where(
+                ReceiptAttachment.receipt_document_id == ids["receipt_id"]
+            )
+        ).all()
+    assert receipt.fatura_status == "pending"
+    assert response.user_action == "fatura_deferred"
+    assert attachments == []
+
+
+def test_fatura_none_button_marks_status_not_available(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            r = handle_update(
+                session, _menu_callback("fatura", "none", ids["response_id"])
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_menu_fatura_not_available"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+        attachments = session.exec(
+            select(ReceiptAttachment).where(
+                ReceiptAttachment.receipt_document_id == ids["receipt_id"]
+            )
+        ).all()
+    assert receipt.fatura_status == "not_available"
+    assert response.user_action == "fatura_unavailable"
+    assert attachments == []
+
+
+def test_fatura_now_button_transitions_to_awaiting_upload(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            r = handle_update(
+                session, _menu_callback("fatura", "now", ids["response_id"])
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_menu_fatura_awaiting_upload"
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert response.user_action == "awaiting_fatura_upload"
+
+
+def test_fatura_photo_persists_attachment(isolated_db, monkeypatch):
+    """A photo received while the user is in awaiting_fatura_upload
+    creates a ReceiptAttachment(kind='fatura', source='telegram_photo')
+    and marks fatura_status='attached'."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClientWithDownload()
+    telegram_module, original = _patch_telegram_client_with_download(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            handle_update(
+                session, _menu_callback("fatura", "now", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            r = handle_update(session, _photo_message(file_unique_id="page-1"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "fatura_upload_persisted"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+        attachments = session.exec(
+            select(ReceiptAttachment).where(
+                ReceiptAttachment.receipt_document_id == ids["receipt_id"]
+            )
+        ).all()
+    assert receipt.fatura_status == "attached"
+    assert len(attachments) == 1
+    assert attachments[0].kind == "fatura"
+    assert attachments[0].source == "telegram_photo"
+    assert attachments[0].telegram_file_unique_id == "page-1"
+    # State stays awaiting so additional pages can land back-to-back.
+    assert response.user_action == "awaiting_fatura_upload"
+
+
+def test_fatura_document_pdf_persists_attachment(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClientWithDownload()
+    telegram_module, original = _patch_telegram_client_with_download(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            handle_update(
+                session, _menu_callback("fatura", "now", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            r = handle_update(session, _document_message(file_unique_id="pdf-1"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "fatura_upload_persisted"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        attachments = session.exec(
+            select(ReceiptAttachment).where(
+                ReceiptAttachment.receipt_document_id == ids["receipt_id"]
+            )
+        ).all()
+    assert receipt.fatura_status == "attached"
+    assert len(attachments) == 1
+    assert attachments[0].source == "telegram_document"
+    assert attachments[0].mime_type == "application/pdf"
+
+
+def test_fatura_text_during_awaiting_state_reminds_and_keeps_state(
+    isolated_db, monkeypatch
+):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            handle_update(
+                session, _menu_callback("fatura", "now", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            r = handle_update(session, _text("here is a note"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "awaiting_fatura_upload_text_reminder"
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert response.user_action == "awaiting_fatura_upload"
+    # Reminder sent.
+    assert any(
+        "fotoğraf" in m.lower() or "foto" in m.lower() or "pdf" in m.lower()
+        for _chat, m in client.send_messages
+    )
+
+
+def test_fatura_cancel_with_no_attachment_marks_pending(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            handle_update(
+                session, _menu_callback("fatura", "now", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            r = handle_update(session, _text("/cancel"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "awaiting_fatura_upload_cancelled"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert receipt.fatura_status == "pending"
+    assert response.user_action == "fatura_deferred"
+
+
+def test_fatura_cancel_after_attachment_keeps_attached(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClientWithDownload()
+    telegram_module, original = _patch_telegram_client_with_download(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            handle_update(
+                session, _menu_callback("fatura", "now", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            handle_update(session, _photo_message(file_unique_id="p1"))
+        with Session(isolated_db) as session:
+            r = handle_update(session, _text("/cancel"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "awaiting_fatura_upload_cancelled"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    # Already attached — /cancel must not regress this to 'pending'.
+    assert receipt.fatura_status == "attached"
+    assert response.user_action == "fatura_attached"
+
+
+def test_fatura_multiple_pages_persist_separately(isolated_db, monkeypatch):
+    """Front and back of a fatura sent back-to-back land as two
+    ReceiptAttachment rows. fatura_status stays 'attached' across both."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClientWithDownload()
+    telegram_module, original = _patch_telegram_client_with_download(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            handle_update(
+                session, _menu_callback("fatura", "now", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            handle_update(session, _photo_message(file_unique_id="page-1"))
+        with Session(isolated_db) as session:
+            handle_update(session, _photo_message(file_unique_id="page-2"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        attachments = session.exec(
+            select(ReceiptAttachment)
+            .where(ReceiptAttachment.receipt_document_id == ids["receipt_id"])
+            .order_by(ReceiptAttachment.id)
+        ).all()
+    assert receipt.fatura_status == "attached"
+    assert len(attachments) == 2
+    assert attachments[0].telegram_file_unique_id == "page-1"
+    assert attachments[1].telegram_file_unique_id == "page-2"
+
+
+def test_fatura_dedup_skips_duplicate_file_unique_id(isolated_db, monkeypatch):
+    """Telegram retry of the same file_unique_id must not create two
+    ReceiptAttachment rows."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClientWithDownload()
+    telegram_module, original = _patch_telegram_client_with_download(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            handle_update(
+                session, _menu_callback("fatura", "now", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            handle_update(session, _photo_message(file_unique_id="dup"))
+        with Session(isolated_db) as session:
+            r = handle_update(session, _photo_message(file_unique_id="dup"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "fatura_upload_deduped"
+    with Session(isolated_db) as session:
+        attachments = session.exec(
+            select(ReceiptAttachment).where(
+                ReceiptAttachment.receipt_document_id == ids["receipt_id"]
+            )
+        ).all()
+    assert len(attachments) == 1
+
+
+def test_edit_menu_shows_fatura_button_only_for_hotel(isolated_db, monkeypatch):
+    """Hotel receipts surface 📎 Fatura in the Edit menu; non-hotel
+    receipts do not."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        hotel_ids = _seed_hotel_pending_response(session)
+        # Set the canonical receipt's bucket explicitly so the Edit-menu
+        # caller (which reads receipt.report_bucket) sees Hotel BEFORE
+        # any AI-driven canonical write happens.
+        receipt = session.get(ReceiptDocument, hotel_ids["receipt_id"])
+        receipt.report_bucket = HOTEL_BUCKET
+        session.add(receipt)
+        session.commit()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", hotel_ids["response_id"]))
+    finally:
+        telegram_module.TelegramClient = original
+
+    last = _last_edit_text(client)
+    labels = _button_labels(last["reply_markup"])
+    assert any("Fatura" in lbl for lbl in labels)
+
+
+def test_edit_menu_hides_fatura_button_for_non_hotel(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(
+            session, suggested_report_bucket="Taxi/Parking/Tolls/Uber"
+        )
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        receipt.report_bucket = "Taxi/Parking/Tolls/Uber"
+        session.add(receipt)
+        session.commit()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+    finally:
+        telegram_module.TelegramClient = original
+
+    last = _last_edit_text(client)
+    labels = _button_labels(last["reply_markup"])
+    assert not any("Fatura" in lbl for lbl in labels)
+
+
+def test_edit_menu_fatura_choice_enters_awaiting_upload(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        receipt.report_bucket = HOTEL_BUCKET
+        session.add(receipt)
+        session.commit()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+            r = handle_update(
+                session, _menu_callback("edit", "fatura", ids["response_id"])
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_menu_edit_fatura_awaiting_upload"
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert response.user_action == "awaiting_fatura_upload"
+
+
+def test_edit_menu_fatura_choice_blocked_on_non_hotel(isolated_db, monkeypatch):
+    """Defensive: even if a stale callback for ``fatura`` arrives on a
+    non-hotel receipt (e.g., user changed Category before tapping the
+    button), the handler refuses and doesn't transition state."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(
+            session, suggested_report_bucket="Taxi/Parking/Tolls/Uber"
+        )
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        receipt.report_bucket = "Taxi/Parking/Tolls/Uber"
+        session.add(receipt)
+        session.commit()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+            r = handle_update(
+                session, _menu_callback("edit", "fatura", ids["response_id"])
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_menu_edit_fatura_not_hotel"
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert response.user_action != "awaiting_fatura_upload"
+
+
+def test_fatura_callback_after_fatura_resolved_is_ignored(isolated_db, monkeypatch):
+    """Once the user has resolved the fatura prompt (e.g. clicked Sonra),
+    a stale tap on a different button must not re-fire — the response
+    is no longer in the fatura sub-flow's allowed state set."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            handle_update(
+                session, _menu_callback("fatura", "later", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            r = handle_update(
+                session, _menu_callback("fatura", "none", ids["response_id"])
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_fatura_already_resolved"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+    # Status from the original 'later' tap is preserved — second tap is a no-op.
+    assert receipt.fatura_status == "pending"
+
+
+def test_fatura_text_during_choice_state_reshows_prompt(isolated_db, monkeypatch):
+    """Text typed while the 3-button fatura prompt is up (state=
+    awaiting_fatura_choice) re-shows the buttons rather than letting
+    the reply leak into the legacy clarifications dispatcher. Pinned
+    after the partial telegram-flow review."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            r = handle_update(session, _text("yes please"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "awaiting_fatura_choice_text_reprompt"
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert response.user_action == "awaiting_fatura_choice"
+    # Re-shown 3-button keyboard.
+    sends = [
+        call for call in client.calls
+        if call[0] == "sendMessage" and "reply_markup" in call[1]
+    ]
+    assert sends, "expected a sendMessage with the fatura buttons re-shown"
+    labels = _button_labels(sends[-1][1]["reply_markup"])
+    assert any("Şimdi" in lbl for lbl in labels)
+    assert any("Sonra" in lbl for lbl in labels)
+    assert any("Yok" in lbl for lbl in labels)
+
+
+def test_fatura_prompt_skipped_when_already_attached(isolated_db, monkeypatch):
+    """If a hotel receipt already carries fatura_status='attached' on a
+    re-confirm flow, the prompt does not fire again."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        receipt.fatura_status = "attached"
+        session.add(receipt)
+        session.commit()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            r = handle_update(session, _callback("confirm", ids["response_id"]))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["fatura_prompt_sent"] is False
+
+
+def test_fk_cascade_deletes_attachments_with_receipt(isolated_db):
+    """ON DELETE CASCADE on ReceiptAttachment.receipt_document_id:
+    deleting a parent ReceiptDocument deletes its fatura attachments.
+
+    Uses a minimal isolated receipt (no Run / AgentRead / UserResponse
+    seeded) so this test pins the attachment-side cascade only — other
+    FK chains in the schema have their own (non-cascade) semantics that
+    aren't this PR's concern.
+    """
+    with Session(isolated_db) as session:
+        receipt = ReceiptDocument(
+            source="telegram",
+            status="received",
+            content_type="photo",
+            extracted_supplier="Hilton Test",
+            extracted_date=date(2026, 5, 1),
+            extracted_local_amount=Decimal("4200.00"),
+            extracted_currency="TRY",
+            report_bucket=HOTEL_BUCKET,
+        )
+        session.add(receipt)
+        session.commit()
+        session.refresh(receipt)
+        receipt_id = receipt.id
+
+        attachment = ReceiptAttachment(
+            receipt_document_id=receipt_id,
+            kind="fatura",
+            source="telegram_photo",
+            storage_path="/tmp/x.jpg",
+            content_type="photo",
+        )
+        session.add(attachment)
+        session.commit()
+        attachment_id = attachment.id
+
+    # SQLite enforces ON DELETE CASCADE only when ``PRAGMA foreign_keys=ON``;
+    # the live engine sets it via a connect listener but the in-memory
+    # test fixture might not.
+    from sqlalchemy import text
+    with isolated_db.connect() as conn:
+        conn.execute(text("PRAGMA foreign_keys=ON"))
+        conn.execute(
+            text("DELETE FROM receiptdocument WHERE id=:rid"),
+            {"rid": receipt_id},
+        )
+        conn.commit()
+
+    with Session(isolated_db) as session:
+        survivor = session.exec(
+            select(ReceiptAttachment).where(ReceiptAttachment.id == attachment_id)
+        ).first()
+    assert survivor is None, "FK cascade should have removed the attachment row"

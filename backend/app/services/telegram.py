@@ -17,6 +17,7 @@ from app.models import (
     AgentReceiptUserResponse,
     AppUser,
     ClarificationQuestion,
+    ReceiptAttachment,
     ReceiptDocument,
     utc_now,
 )
@@ -39,9 +40,12 @@ from app.services.review_sessions import get_or_create_review_session
 from app.services.storage import save_bytes
 from app.services.statement_import import import_diners_excel
 from app.services.telegram_keyboard_composer import (
+    FATURA_PROMPT_TEXT,
+    HOTEL_BUCKET_FOR_FATURA,
     build_category_tier1_markup,
     build_category_tier2_markup,
     build_edit_menu_markup,
+    build_fatura_prompt_markup,
     build_inline_keyboard_reply,
     build_receipt_menu_markup,
     build_skip_reason_attendees_markup,
@@ -304,7 +308,59 @@ _AWAITING_STATES: tuple[str, ...] = (
     "awaiting_business_reason_followup",
     "awaiting_attendees_only",
     "awaiting_business_reason_only",
+    "awaiting_fatura_upload",
+    "awaiting_fatura_choice",
 )
+
+
+# Sub-PR 8 phase 1: hotel-fatura post-Confirm sub-flow. The user_response
+# transitions through these states AFTER Confirm has already finalized the
+# canonical write. Standard {confirm, cancel, edit, menu} callback gating
+# treats anything outside _NON_FINAL_STATES as already-finalized, so the
+# fatura sub-flow has its own state list and the callback dispatcher routes
+# scope='fatura' callbacks via this set instead.
+_FATURA_SUB_FLOW_STATES: frozenset[str] = frozenset({
+    "awaiting_fatura_choice",
+    "awaiting_fatura_upload",
+})
+
+
+def _should_offer_fatura_in_edit_menu(receipt: ReceiptDocument | None) -> bool:
+    """Whether the top-level Edit menu should surface the 📎 Fatura
+    button. Hotel/Lodging/Laundry only — non-hotel receipts must keep
+    their pre-PR-8 menu identical."""
+    if receipt is None:
+        return False
+    return receipt.report_bucket == HOTEL_BUCKET_FOR_FATURA
+
+
+def _fatura_awaiting_response_for_user(
+    session: Session,
+    user_id: int,
+) -> AgentReceiptUserResponse | None:
+    """Return the most recent user_response for this user that is in
+    ``awaiting_fatura_upload`` state. Used by the photo / document
+    handler to route incoming files to ReceiptAttachment instead of
+    creating a new primary receipt."""
+    rows = session.exec(
+        select(AgentReceiptUserResponse, ReceiptDocument)
+        .join(
+            ReceiptDocument,
+            AgentReceiptUserResponse.receipt_document_id == ReceiptDocument.id,
+        )
+        .where(
+            ReceiptDocument.uploader_user_id == user_id,
+            AgentReceiptUserResponse.user_action == "awaiting_fatura_upload",
+        )
+        .order_by(
+            AgentReceiptUserResponse.user_action_at.desc(),
+            AgentReceiptUserResponse.id.desc(),
+        )
+    ).all()
+    if not rows:
+        return None
+    response, _receipt = rows[0]
+    return response
 
 
 def _awaiting_response_for_user(
@@ -618,7 +674,20 @@ def _handle_callback_query(
         "awaiting_attendees_only",
         "awaiting_business_reason_only",
     }
-    if action in {"confirm", "cancel", "edit", "menu"}:
+    # Sub-PR 8 phase 1: scope='fatura' callbacks live in the post-Confirm
+    # sub-flow and use _FATURA_SUB_FLOW_STATES instead of _NON_FINAL_STATES.
+    # This keeps the original Confirm/Cancel/Edit gate strict (prevents
+    # re-confirming a finalized response) while allowing the hotel-only
+    # fatura buttons to fire after Confirm.
+    if action == "menu" and menu_scope == "fatura":
+        if user_response.user_action not in _FATURA_SUB_FLOW_STATES:
+            _safe_answer_callback(client, callback_id)
+            return {
+                "ok": True,
+                "action": "callback_fatura_already_resolved",
+                "user_response_id": user_response_id,
+            }
+    elif action in {"confirm", "cancel", "edit", "menu"}:
         if user_response.user_action not in _NON_FINAL_STATES:
             _safe_answer_callback(client, callback_id)
             return {
@@ -753,6 +822,7 @@ def _handle_callback_confirm(
     user_response.canonical_write_json = json_dumps(written, sort_keys=True)
     session.add(user_response)
     session.commit()
+    session.refresh(receipt)
 
     summary_bits: list[str] = []
     if receipt.report_bucket:
@@ -775,12 +845,77 @@ def _handle_callback_confirm(
                 "inline keyboard confirm: editMessageText failed: %s", exc
             )
 
+    fatura_prompt_sent = _maybe_send_fatura_prompt(
+        session,
+        client,
+        receipt=receipt,
+        user_response=user_response,
+        chat_id=chat_id,
+    )
+
     return {
         "ok": True,
         "action": "callback_confirmed",
         "user_response_id": user_response.id,
         "receipt_id": receipt.id,
+        "fatura_prompt_sent": fatura_prompt_sent,
     }
+
+
+def _maybe_send_fatura_prompt(
+    session: Session,
+    client: "TelegramClient",
+    *,
+    receipt: ReceiptDocument,
+    user_response: AgentReceiptUserResponse,
+    chat_id: int | None,
+) -> bool:
+    """Sub-PR 8 phase 1: when a Confirmed receipt is in the hotel bucket
+    and doesn't already carry a resolved fatura status, send the
+    3-button follow-up prompt and transition the user_response into
+    ``awaiting_fatura_choice`` so subsequent scope='fatura' callbacks
+    pass the post-Confirm gate.
+
+    Returns ``True`` iff the prompt was actually sent.
+    """
+    if receipt.report_bucket != HOTEL_BUCKET_FOR_FATURA:
+        return False
+    # Don't re-prompt if the user already answered this receipt's fatura
+    # follow-up on a prior confirmation pass.
+    if receipt.fatura_status in {"attached", "not_available"}:
+        return False
+    if chat_id is None:
+        return False
+    markup = build_fatura_prompt_markup(user_response.id or 0)
+    try:
+        api_response = client.call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": FATURA_PROMPT_TEXT,
+                "reply_markup": json_dumps(markup, sort_keys=True),
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "fatura prompt: sendMessage failed receipt_id=%s response_id=%s: %s",
+            receipt.id,
+            user_response.id,
+            exc,
+        )
+        return False
+    user_response.user_action = "awaiting_fatura_choice"
+    user_response.user_action_at = utc_now()
+    fatura_message_id = (api_response or {}).get("result", {}).get("message_id")
+    if isinstance(fatura_message_id, int):
+        # Re-purpose keyboard_message_id to track the fatura prompt so the
+        # callback handler can edit it in place. The original Confirm-
+        # keyboard message_id is fine to overwrite — that message was
+        # already finalized to "✅ Confirmed." text.
+        user_response.keyboard_message_id = fatura_message_id
+    session.add(user_response)
+    session.commit()
+    return True
 
 
 def _handle_callback_edit(
@@ -809,7 +944,9 @@ def _handle_callback_edit(
 
     include_type = _user_in_keyboard_allowlist(settings, user.telegram_user_id)
     markup = build_edit_menu_markup(
-        user_response.id, include_type_button=include_type
+        user_response.id,
+        include_type_button=include_type,
+        include_fatura_button=_should_offer_fatura_in_edit_menu(receipt),
     )
     edit_text = "What would you like to edit?"
     _edit_message_with_markup(
@@ -979,6 +1116,16 @@ def _handle_menu_callback(
             chat_id=chat_id,
             message_id=message_id,
         )
+    if scope == "fatura":
+        return _handle_menu_fatura(
+            session, client,
+            settings=settings,
+            choice=choice,
+            user_response=user_response,
+            receipt=receipt,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
     # parse_menu_callback_data already restricted scope; defensive default
     logger.warning("inline keyboard menu: unknown scope=%r", scope)
     return {"ok": False, "action": "callback_menu_unknown_scope"}
@@ -1083,6 +1230,44 @@ def _handle_menu_edit(
             log_context=f"response_id={user_response.id}/edit:reason",
         )
         return {"ok": True, "action": "callback_menu_edit_reason_prompted"}
+    if choice == "fatura":
+        # Sub-PR 8 phase 1: hotel-only Edit > Fatura entry. Defensively
+        # gate on bucket so a stale callback (user mistakenly sees the
+        # button after a Category Edit moved them off Hotel) still does
+        # the right thing.
+        if not _should_offer_fatura_in_edit_menu(receipt):
+            logger.warning(
+                "inline keyboard menu edit: fatura tapped on non-hotel "
+                "receipt_id=%s bucket=%r",
+                receipt.id,
+                receipt.report_bucket,
+            )
+            return {
+                "ok": False,
+                "action": "callback_menu_edit_fatura_not_hotel",
+            }
+        user_response.user_action = "awaiting_fatura_upload"
+        user_response.user_action_at = utc_now()
+        session.add(user_response)
+        session.commit()
+        _edit_message_with_markup(
+            client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=(
+                "📎 Send the fatura photo or PDF.\n"
+                "Multiple pages? Send each one separately — they'll all attach "
+                "to this hotel receipt.\n"
+                "When you're done, just stop sending. Use /cancel to skip."
+            ),
+            reply_markup=None,
+            log_context=f"response_id={user_response.id}/edit:fatura",
+        )
+        return {
+            "ok": True,
+            "action": "callback_menu_edit_fatura_awaiting_upload",
+            "receipt_id": receipt.id,
+        }
     if choice == "type":
         if not _user_in_keyboard_allowlist(settings, user.telegram_user_id):
             logger.warning(
@@ -1134,7 +1319,9 @@ def _handle_menu_receipt(
         # Back to the top-level Edit menu.
         include_type = _user_in_keyboard_allowlist(settings, user.telegram_user_id)
         markup = build_edit_menu_markup(
-            user_response.id, include_type_button=include_type
+            user_response.id,
+            include_type_button=include_type,
+            include_fatura_button=_should_offer_fatura_in_edit_menu(receipt),
         )
         _edit_message_with_markup(
             client,
@@ -1195,7 +1382,9 @@ def _handle_menu_cat1(
     if choice == "back":
         include_type = _user_in_keyboard_allowlist(settings, user.telegram_user_id)
         markup = build_edit_menu_markup(
-            user_response.id, include_type_button=include_type
+            user_response.id,
+            include_type_button=include_type,
+            include_fatura_button=_should_offer_fatura_in_edit_menu(receipt),
         )
         _edit_message_with_markup(
             client,
@@ -1373,7 +1562,9 @@ def _handle_menu_type(
 
     if choice == "back":
         markup = build_edit_menu_markup(
-            user_response.id, include_type_button=True
+            user_response.id,
+            include_type_button=True,
+            include_fatura_button=_should_offer_fatura_in_edit_menu(receipt),
         )
         _edit_message_with_markup(
             client,
@@ -1660,6 +1851,74 @@ def _handle_awaiting_text_reply(
             field_name="business_reason",
         )
 
+    if state == "awaiting_fatura_choice":
+        # Sub-PR 8 phase 1: text typed while the 3-button fatura prompt is
+        # showing. Re-show the prompt instead of letting the message
+        # fall through to the legacy clarifications path (which would
+        # answer an unrelated open question, if any).
+        markup = build_fatura_prompt_markup(user_response.id or 0)
+        _send_message_with_markup(
+            client,
+            chat_id=chat_id,
+            text=(
+                "Lütfen aşağıdaki butonlardan birini seç: 📎 Şimdi yükle "
+                "/ ⏰ Sonra / ❌ Yok."
+            ),
+            reply_markup=markup,
+        )
+        return {
+            "ok": True,
+            "action": "awaiting_fatura_choice_text_reprompt",
+            "receipt_id": receipt.id,
+        }
+
+    if state == "awaiting_fatura_upload":
+        # Sub-PR 8 phase 1: a non-photo text message during the fatura
+        # upload state. ``/cancel`` clears the state and falls back to
+        # ``fatura_status='pending'`` (only when no attachment landed in
+        # this session — preserve any attachments the user already
+        # uploaded). Any other text re-prompts and KEEPS the state so
+        # the next photo / PDF still routes here.
+        cleaned = text.strip().lower()
+        if cleaned == "/cancel":
+            existing_attachments = session.exec(
+                select(ReceiptAttachment).where(
+                    ReceiptAttachment.receipt_document_id == receipt.id,
+                    ReceiptAttachment.kind == "fatura",
+                )
+            ).all()
+            if existing_attachments:
+                # User already uploaded at least one fatura page; keep
+                # ``attached`` and just close the state.
+                user_response.user_action = "fatura_attached"
+                ack = "📎 Fatura on file. Closing this thread."
+            else:
+                if receipt.fatura_status is None:
+                    receipt.fatura_status = "pending"
+                    receipt.updated_at = utc_now()
+                    session.add(receipt)
+                user_response.user_action = "fatura_deferred"
+                ack = "⏰ Tamam, rapor öncesi tekrar soracağım."
+            user_response.user_action_at = utc_now()
+            session.add(user_response)
+            session.commit()
+            client.send_message(chat_id, ack)
+            return {
+                "ok": True,
+                "action": "awaiting_fatura_upload_cancelled",
+                "receipt_id": receipt.id,
+            }
+        client.send_message(
+            chat_id,
+            "Lütfen fatura'nın foto'sunu veya PDF'ini gönder. "
+            "Çıkmak için /cancel.",
+        )
+        return {
+            "ok": True,
+            "action": "awaiting_fatura_upload_text_reminder",
+            "receipt_id": receipt.id,
+        }
+
     logger.warning(
         "awaiting text reply: unknown state=%r response_id=%s",
         state,
@@ -1688,7 +1947,12 @@ def _post_field_edit_return_to_menu(
 
     client.send_message(chat_id, ack_text)
     include_type = _user_in_keyboard_allowlist(settings, user.telegram_user_id)
-    markup = build_edit_menu_markup(user_response.id, include_type_button=include_type)
+    receipt = session.get(ReceiptDocument, user_response.receipt_document_id)
+    markup = build_edit_menu_markup(
+        user_response.id,
+        include_type_button=include_type,
+        include_fatura_button=_should_offer_fatura_in_edit_menu(receipt),
+    )
     _send_message_with_markup(
         client,
         chat_id=chat_id,
@@ -1759,6 +2023,231 @@ def _handle_menu_skip_reason_attendees(
         "ok": True,
         "action": "callback_menu_skip_ra_done",
         "receipt_id": receipt.id,
+    }
+
+
+def _handle_menu_fatura(
+    session: Session,
+    client: "TelegramClient",
+    *,
+    settings: Any,
+    choice: str,
+    user_response: AgentReceiptUserResponse,
+    receipt: ReceiptDocument,
+    chat_id: int | None,
+    message_id: int | None,
+) -> dict[str, Any]:
+    """Sub-PR 8 phase 1: dispatch the post-Confirm fatura 3-button choice.
+
+    ``now``    → enter ``awaiting_fatura_upload`` and prompt the user to
+                 send the fatura photo / PDF (or /cancel).
+    ``later``  → mark ``fatura_status='pending'``, no attachment row.
+    ``none``   → mark ``fatura_status='not_available'``, no attachment row.
+    """
+    if choice == "now":
+        user_response.user_action = "awaiting_fatura_upload"
+        user_response.user_action_at = utc_now()
+        session.add(user_response)
+        session.commit()
+        _edit_message_with_markup(
+            client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=(
+                "📎 Send the fatura photo or PDF.\n"
+                "Multiple pages? Send each one separately — they'll all attach "
+                "to this hotel receipt.\n"
+                "When you're done, just stop sending. Use /cancel to skip."
+            ),
+            reply_markup=None,
+            log_context=f"response_id={user_response.id}/fatura:now",
+        )
+        return {
+            "ok": True,
+            "action": "callback_menu_fatura_awaiting_upload",
+            "receipt_id": receipt.id,
+        }
+    if choice == "later":
+        receipt.fatura_status = "pending"
+        receipt.updated_at = utc_now()
+        session.add(receipt)
+        user_response.user_action = "fatura_deferred"
+        user_response.user_action_at = utc_now()
+        session.add(user_response)
+        session.commit()
+        _edit_message_with_markup(
+            client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text="⏰ Tamam, rapor öncesi tekrar soracağım.",
+            reply_markup=None,
+            log_context=f"response_id={user_response.id}/fatura:later",
+        )
+        return {
+            "ok": True,
+            "action": "callback_menu_fatura_deferred",
+            "receipt_id": receipt.id,
+        }
+    if choice == "none":
+        receipt.fatura_status = "not_available"
+        receipt.updated_at = utc_now()
+        session.add(receipt)
+        user_response.user_action = "fatura_unavailable"
+        user_response.user_action_at = utc_now()
+        session.add(user_response)
+        session.commit()
+        _edit_message_with_markup(
+            client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text="❌ Tamam — fatura yok olarak işaretledim.",
+            reply_markup=None,
+            log_context=f"response_id={user_response.id}/fatura:none",
+        )
+        return {
+            "ok": True,
+            "action": "callback_menu_fatura_not_available",
+            "receipt_id": receipt.id,
+        }
+    logger.warning("inline keyboard menu fatura: unknown choice=%r", choice)
+    return {"ok": False, "action": "callback_menu_fatura_unknown_choice"}
+
+
+def _handle_fatura_attachment_upload(
+    session: Session,
+    client: "TelegramClient",
+    *,
+    user: AppUser,
+    user_response: AgentReceiptUserResponse,
+    photo: dict[str, Any] | None,
+    document: dict[str, Any] | None,
+    message: dict[str, Any],
+    chat_id: int | None,
+) -> dict[str, Any]:
+    """Sub-PR 8 phase 1: persist an incoming photo / PDF as a
+    ReceiptAttachment(kind='fatura') on the parent hotel receipt.
+
+    Keeps the user_response in ``awaiting_fatura_upload`` so subsequent
+    pages of the same fatura can be uploaded back-to-back. The user
+    closes the loop with ``/cancel`` (or by tapping Edit > Fatura on a
+    different receipt).
+    """
+    receipt = session.get(ReceiptDocument, user_response.receipt_document_id)
+    if receipt is None:
+        logger.warning(
+            "fatura upload: parent receipt missing for response_id=%s",
+            user_response.id,
+        )
+        if chat_id is not None:
+            client.send_message(
+                chat_id, "Sorry — I lost track of the hotel receipt. Try again."
+            )
+        return {"ok": False, "action": "fatura_upload_missing_receipt"}
+    if receipt.uploader_user_id != user.id:
+        # Defensive ownership check: the awaiting state should only ever
+        # be reachable by the same user who confirmed the receipt.
+        logger.warning(
+            "fatura upload: response_id=%s receipt owned by user_id=%s but "
+            "incoming photo from user_id=%s; refusing.",
+            user_response.id,
+            receipt.uploader_user_id,
+            user.id,
+        )
+        return {"ok": False, "action": "fatura_upload_owner_mismatch"}
+
+    file_payload = photo or document
+    assert file_payload is not None  # guarded by caller
+    attachment_source = "telegram_photo" if photo else "telegram_document"
+    file_id = file_payload.get("file_id")
+    file_unique_id = file_payload.get("file_unique_id")
+    fallback_name = (
+        file_payload.get("file_name")
+        or f"telegram_fatura_{message.get('message_id') or user_response.id}.jpg"
+    )
+
+    # Idempotent dedup: the same Telegram message can fire twice on retry
+    # — we don't want two attachment rows for the same fatura page.
+    if file_unique_id:
+        existing_attachment = session.exec(
+            select(ReceiptAttachment).where(
+                ReceiptAttachment.receipt_document_id == receipt.id,
+                ReceiptAttachment.telegram_file_unique_id == file_unique_id,
+            )
+        ).first()
+        if existing_attachment is not None:
+            logger.info(
+                "fatura upload: dedup hit on file_unique_id=%s receipt_id=%s",
+                file_unique_id,
+                receipt.id,
+            )
+            if chat_id is not None:
+                client.send_message(
+                    chat_id,
+                    "📎 Already attached — send the next page or /cancel.",
+                )
+            return {
+                "ok": True,
+                "action": "fatura_upload_deduped",
+                "receipt_id": receipt.id,
+                "attachment_id": existing_attachment.id,
+            }
+
+    storage_path: str | None = None
+    try:
+        downloaded = (
+            client.download_file(file_id, user.id, fallback_name)
+            if file_id
+            else None
+        )
+        if downloaded is not None:
+            storage_path = str(downloaded)
+            _log_stored_receipt_media(
+                downloaded,
+                content_type=("photo" if photo else "document"),
+                original_name=fallback_name,
+            )
+    except Exception as exc:
+        logger.warning(
+            "fatura upload: download failed file_id=%s receipt_id=%s: %s",
+            file_id,
+            receipt.id,
+            exc,
+        )
+        storage_path = None
+
+    attachment = ReceiptAttachment(
+        receipt_document_id=receipt.id or 0,
+        kind="fatura",
+        source=attachment_source,
+        storage_path=storage_path,
+        content_type=("photo" if photo else "document"),
+        mime_type=file_payload.get("mime_type"),
+        telegram_file_id=file_id,
+        telegram_file_unique_id=file_unique_id,
+    )
+    session.add(attachment)
+
+    receipt.fatura_status = "attached"
+    receipt.updated_at = utc_now()
+    session.add(receipt)
+
+    # State stays at ``awaiting_fatura_upload`` so subsequent pages
+    # accumulate. Ack the upload and the option to keep going.
+    user_response.user_action_at = utc_now()
+    session.add(user_response)
+    session.commit()
+    session.refresh(attachment)
+
+    if chat_id is not None:
+        client.send_message(
+            chat_id,
+            "✅ Fatura attached. Send another page or /cancel when done.",
+        )
+    return {
+        "ok": True,
+        "action": "fatura_upload_persisted",
+        "receipt_id": receipt.id,
+        "attachment_id": attachment.id,
     }
 
 
@@ -1969,6 +2458,25 @@ def handle_update(session: Session, update: dict[str, Any]) -> dict[str, Any]:
     if not photo and not document:
         client.send_message(chat_id, "I can currently capture receipt photos, receipt PDFs, and clarification replies.")
         return {"ok": True, "action": "unsupported_message", "user_id": user.id}
+
+    # Sub-PR 8 phase 1: when the user is in ``awaiting_fatura_upload`` for
+    # a hotel receipt, route incoming photos / receipt PDFs to the
+    # ReceiptAttachment table on the existing parent receipt rather than
+    # creating a new primary receipt. Statement uploads (XLSX) bypass this
+    # — they're handled below by the statement branch.
+    if photo or (document and not _document_is_statement(document)):
+        fatura_target = _fatura_awaiting_response_for_user(session, user.id)
+        if fatura_target is not None:
+            return _handle_fatura_attachment_upload(
+                session,
+                client,
+                user=user,
+                user_response=fatura_target,
+                photo=photo,
+                document=document,
+                message=message,
+                chat_id=chat_id,
+            )
 
     if document and _document_is_statement(document):
         file_id = document.get("file_id")

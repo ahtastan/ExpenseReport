@@ -716,8 +716,12 @@ def test_attendees_reason_text_reply_parsed_correctly(isolated_db, monkeypatch):
     assert response.user_action == "edited"
 
 
-def test_attendees_reason_text_reply_no_semicolon_reprompts(isolated_db, monkeypatch):
-    """Missing semicolon → reprompt and stay in awaiting_attendees_reason."""
+def test_attendees_reason_text_reply_no_semicolon_saves_attendees_and_followups(
+    isolated_db, monkeypatch
+):
+    """Greedy parse: a reply without ``;`` is treated as attendees only;
+    the response transitions to ``awaiting_business_reason_followup`` and
+    the bot asks for the business reason."""
     _enable_keyboard_env(monkeypatch)
     with Session(isolated_db) as session:
         ids = _seed_pending_response(session)
@@ -742,7 +746,53 @@ def test_attendees_reason_text_reply_no_semicolon_reprompts(isolated_db, monkeyp
                 _menu_callback("cat2", str(flat.index("Lunch")), ids["response_id"]),
             )
         with Session(isolated_db) as session:
-            r = handle_update(session, _text("Hakan and team lunch"))
+            r = handle_update(session, _text("Hakan and Burak"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "awaiting_attendees_reason_followup"
+    assert r["next_state"] == "awaiting_business_reason_followup"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert receipt.attendees == "Hakan and Burak"
+    assert receipt.attendees_source == "telegram_user"
+    # Reason still unset — waiting for the follow-up reply.
+    assert receipt.business_reason is None
+    assert response.user_action == "awaiting_business_reason_followup"
+    # Acknowledged attendees and asked for reason.
+    assert any("reason" in m.lower() for _chat, m in client.send_messages)
+
+
+def test_attendees_reason_text_reply_lone_semicolon_reprompts(isolated_db, monkeypatch):
+    """A reply that is just ``;`` (both sides empty) reprompts and stays
+    in ``awaiting_attendees_reason`` — the greedy parser only advances
+    when at least one of attendees / reason is non-empty."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+
+    from app.category_vocab import all_buckets, categories
+
+    flat = all_buckets()
+    cats = categories()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+            handle_update(session, _menu_callback("edit", "category", ids["response_id"]))
+            handle_update(
+                session,
+                _menu_callback("cat1", str(cats.index("Meals & Entertainment")), ids["response_id"]),
+            )
+            handle_update(
+                session,
+                _menu_callback("cat2", str(flat.index("Lunch")), ids["response_id"]),
+            )
+        with Session(isolated_db) as session:
+            r = handle_update(session, _text(";"))
     finally:
         telegram_module.TelegramClient = original
 
@@ -750,13 +800,9 @@ def test_attendees_reason_text_reply_no_semicolon_reprompts(isolated_db, monkeyp
     with Session(isolated_db) as session:
         receipt = session.get(ReceiptDocument, ids["receipt_id"])
         response = session.get(AgentReceiptUserResponse, ids["response_id"])
-    # Fields untouched.
     assert receipt.attendees is None
     assert receipt.business_reason is None
     assert response.user_action == "awaiting_attendees_reason"
-    # Format reminder sent.
-    assert any("attendees" in m.lower() and "reason" in m.lower()
-               for _chat, m in client.send_messages)
 
 
 def test_skip_reason_attendees_button_sets_needs_clarification(isolated_db, monkeypatch):
@@ -1130,3 +1176,398 @@ def test_back_navigation_from_top_edit_menu(isolated_db, monkeypatch):
     # The top-level keyboard text.
     labels = _button_labels(last["reply_markup"])
     assert any("Confirm" in lbl for lbl in labels)
+
+
+# ─── Edit menu Attendees / Reason buttons (F-AI-Stage1 sub-PR 6) ────────────
+
+
+def test_edit_menu_top_level_includes_attendees_and_reason_buttons(isolated_db, monkeypatch):
+    """The top-level Edit menu surfaces dedicated Attendees and Reason
+    buttons so already-confirmed receipts can be amended without going
+    through Category Tier 2."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+    finally:
+        telegram_module.TelegramClient = original
+
+    last = _last_edit_text(client)
+    labels = _button_labels(last["reply_markup"])
+    assert any("Attendees" in lbl for lbl in labels)
+    assert any("Reason" in lbl for lbl in labels)
+
+
+def test_edit_attendees_button_prompts_for_text_reply(isolated_db, monkeypatch):
+    """Tapping Edit > Attendees switches the response to
+    awaiting_attendees_only and prompts for free text."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+            r = handle_update(
+                session,
+                _menu_callback("edit", "attendees", ids["response_id"]),
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_menu_edit_attendees_prompted"
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert response.user_action == "awaiting_attendees_only"
+    last = _last_edit_text(client)
+    assert "attendees" in last["text"].lower()
+
+
+def test_edit_attendees_text_reply_persists_with_source_tag(isolated_db, monkeypatch):
+    """A free-text reply after Edit > Attendees writes
+    receipt.attendees + attendees_source='telegram_user' and re-shows the
+    Edit menu (consistent with Receipt-info > Supplier behavior)."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+            handle_update(
+                session, _menu_callback("edit", "attendees", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            r = handle_update(session, _text("Hakan + customer Ahmet"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "awaiting_text_field_saved"
+    assert r["field"] == "attendees"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert receipt.attendees == "Hakan + customer Ahmet"
+    assert receipt.attendees_source == "telegram_user"
+    assert response.user_action == "edited"
+    # Edit menu re-shown so the user can keep editing.
+    sent_texts = [body["text"] for _method, body in client.calls if _method == "sendMessage"]
+    assert any("would you like to edit" in t.lower() for t in sent_texts)
+
+
+def test_edit_reason_button_prompts_for_text_reply(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+            r = handle_update(
+                session, _menu_callback("edit", "reason", ids["response_id"])
+            )
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "callback_menu_edit_reason_prompted"
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert response.user_action == "awaiting_business_reason_only"
+    last = _last_edit_text(client)
+    assert "reason" in last["text"].lower()
+
+
+def test_edit_reason_text_reply_persists_with_source_tag(isolated_db, monkeypatch):
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+            handle_update(
+                session, _menu_callback("edit", "reason", ids["response_id"])
+            )
+        with Session(isolated_db) as session:
+            r = handle_update(session, _text("Customer dinner with Acme team"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "awaiting_text_field_saved"
+    assert r["field"] == "business_reason"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert receipt.business_reason == "Customer dinner with Acme team"
+    assert receipt.business_reason_source == "telegram_user"
+    assert response.user_action == "edited"
+
+
+def test_pre_confirm_gate_followup_advances_to_confirm_keyboard(isolated_db, monkeypatch):
+    """When the meal-context prompt receives attendees only, the bot
+    follows up for the reason; the second reply both saves the reason
+    and advances to the Confirm/Edit/Cancel keyboard."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_pending_response(session)
+
+    from app.category_vocab import all_buckets, categories
+
+    flat = all_buckets()
+    cats = categories()
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("edit", ids["response_id"]))
+            handle_update(session, _menu_callback("edit", "category", ids["response_id"]))
+            handle_update(
+                session,
+                _menu_callback("cat1", str(cats.index("Meals & Entertainment")), ids["response_id"]),
+            )
+            handle_update(
+                session,
+                _menu_callback("cat2", str(flat.index("Lunch")), ids["response_id"]),
+            )
+        # First reply: attendees only — no semicolon.
+        with Session(isolated_db) as session:
+            r1 = handle_update(session, _text("Hakan only"))
+        # Second reply: the business reason.
+        with Session(isolated_db) as session:
+            r2 = handle_update(session, _text("team lunch with EDT"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r1["action"] == "awaiting_attendees_reason_followup"
+    assert r2["action"] == "awaiting_business_reason_followup_saved"
+    with Session(isolated_db) as session:
+        receipt = session.get(ReceiptDocument, ids["receipt_id"])
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert receipt.attendees == "Hakan only"
+    assert receipt.attendees_source == "telegram_user"
+    assert receipt.business_reason == "team lunch with EDT"
+    assert receipt.business_reason_source == "telegram_user"
+    assert response.user_action == "edited"
+
+
+# ─── pre-confirm meal-attendees gate (F-AI-Stage1 sub-PR 6) ─────────────────
+
+
+def test_meal_attendees_gate_helper_triggers_for_meal_bucket():
+    """The gate helper returns True when the AI suggested a meal bucket
+    and the receipt does not already carry both attendees and reason."""
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        business_or_personal="Business",
+        attendees=None,
+        business_reason=None,
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Lunch",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is True
+
+
+def test_meal_attendees_gate_helper_skips_non_meal_bucket():
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        business_or_personal="Business",
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Taxi/Parking/Tolls/Uber",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is False
+
+
+def test_meal_attendees_gate_helper_skips_when_canonical_personal():
+    """Receipt-side short-circuit: when the canonical row is already
+    classified Personal, never ask attendees regardless of the AI's
+    suggestion."""
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        business_or_personal="Personal",
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        # AI still suggests Business + Lunch — gate must respect the
+        # canonical Personal classification regardless.
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Lunch",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is False
+
+
+def test_meal_attendees_gate_helper_skips_when_ai_suggests_personal():
+    """Suggestion-side short-circuit: when the AI proposed Personal, the
+    meal-bucket suggestion is moot and the gate must skip."""
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        # Canonical not yet decided.
+        business_or_personal=None,
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Personal",
+        suggested_report_bucket="Lunch",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is False
+
+
+def test_meal_attendees_gate_helper_fires_when_only_attendees_set():
+    """Pin the ``and`` semantics on the already-populated short-circuit:
+    if only one of attendees / business_reason is set, the gate still
+    fires to collect the other."""
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        business_or_personal="Business",
+        attendees="Hakan only",
+        business_reason=None,
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Dinner",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is True
+
+
+def test_meal_attendees_gate_helper_fires_when_only_business_reason_set():
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        business_or_personal="Business",
+        attendees=None,
+        business_reason="customer dinner",
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Dinner",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is True
+
+
+def test_meal_attendees_gate_helper_skips_when_both_fields_already_set():
+    """If the receipt already carries attendees + business_reason (e.g.
+    set on a previous interaction), don't reprompt."""
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        business_or_personal="Business",
+        attendees="Hakan only",
+        business_reason="team lunch",
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Dinner",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is False
+
+
+def test_meal_attendees_gate_helper_skips_when_no_bucket_suggested():
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        business_or_personal="Business",
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Business",
+        suggested_report_bucket=None,
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is False
+
+
+def test_meal_attendees_gate_payload_has_skip_button():
+    """The pre-confirm gate sends the same Skip-for-now button as the
+    post-Edit-bucket-pick prompt so users can defer attendees/reason."""
+    from app.services.telegram_receipt_reply import _build_meal_attendees_gate_payload
+
+    receipt = ReceiptDocument(source="telegram", status="received", content_type="photo")
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Dinner",
+    )
+    payload = _build_meal_attendees_gate_payload(receipt, agent_read, user_response_id=42)
+    assert "Dinner" in payload["text"]
+    rows = payload["reply_markup"]["inline_keyboard"]
+    labels = [btn.get("text", "") for row in rows for btn in row]
+    assert any("Skip" in lbl for lbl in labels)
+    # Sole button on the gate keyboard.
+    assert sum(len(row) for row in rows) == 1

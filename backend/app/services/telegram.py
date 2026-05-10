@@ -53,6 +53,8 @@ from app.services.telegram_edit_parsers import (
     parse_amount_reply,
     parse_attendees_reason_reply,
     parse_date_reply,
+    parse_meal_context_reply,
+    parse_single_field_reply,
     parse_supplier_reply,
 )
 from app.services.telegram_receipt_reply import (
@@ -299,6 +301,9 @@ _AWAITING_STATES: tuple[str, ...] = (
     "awaiting_date",
     "awaiting_amount",
     "awaiting_attendees_reason",
+    "awaiting_business_reason_followup",
+    "awaiting_attendees_only",
+    "awaiting_business_reason_only",
 )
 
 
@@ -609,6 +614,9 @@ def _handle_callback_query(
         "awaiting_date",
         "awaiting_amount",
         "awaiting_attendees_reason",
+        "awaiting_business_reason_followup",
+        "awaiting_attendees_only",
+        "awaiting_business_reason_only",
     }
     if action in {"confirm", "cancel", "edit", "menu"}:
         if user_response.user_action not in _NON_FINAL_STATES:
@@ -1035,6 +1043,46 @@ def _handle_menu_edit(
             log_context=f"response_id={user_response.id}/edit:category",
         )
         return {"ok": True, "action": "callback_menu_cat1_shown"}
+    if choice == "attendees":
+        user_response.user_action = "awaiting_attendees_only"
+        user_response.user_action_at = utc_now()
+        session.add(user_response)
+        session.commit()
+        _edit_message_with_markup(
+            client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=(
+                "Type the attendees.\n\n"
+                "Examples:\n"
+                "• Hakan only\n"
+                "• Hakan + customer Ahmet Yılmaz\n"
+                "• Burak, Ayşe, Mehmet"
+            ),
+            reply_markup=None,
+            log_context=f"response_id={user_response.id}/edit:attendees",
+        )
+        return {"ok": True, "action": "callback_menu_edit_attendees_prompted"}
+    if choice == "reason":
+        user_response.user_action = "awaiting_business_reason_only"
+        user_response.user_action_at = utc_now()
+        session.add(user_response)
+        session.commit()
+        _edit_message_with_markup(
+            client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=(
+                "Type the business reason.\n\n"
+                "Examples:\n"
+                "• Customer dinner — Acme team\n"
+                "• Team lunch\n"
+                "• Hotel for Istanbul site visit"
+            ),
+            reply_markup=None,
+            log_context=f"response_id={user_response.id}/edit:reason",
+        )
+        return {"ok": True, "action": "callback_menu_edit_reason_prompted"}
     if choice == "type":
         if not _user_in_keyboard_allowlist(settings, user.telegram_user_id):
             logger.warning(
@@ -1477,29 +1525,85 @@ def _handle_awaiting_text_reply(
         )
 
     if state == "awaiting_attendees_reason":
-        parsed_ra = parse_attendees_reason_reply(text)
-        if parsed_ra is None:
+        attendees, reason = parse_meal_context_reply(text)
+        if attendees is None and reason is None:
             client.send_message(
                 chat_id,
-                "Couldn't read that — please use format <attendees>; <reason>. "
-                "Example: Hakan only; team lunch",
+                "Couldn't read that. Please type the attendees and the business "
+                "reason. Use ; to give both at once: Hakan only; team lunch",
             )
             return {"ok": True, "action": "awaiting_attendees_reason_reprompt"}
-        attendees, reason = parsed_ra
-        receipt.attendees = attendees
-        receipt.attendees_source = "telegram_user"
+        if attendees:
+            receipt.attendees = attendees
+            receipt.attendees_source = "telegram_user"
+        if reason:
+            receipt.business_reason = reason
+            receipt.business_reason_source = "telegram_user"
+        receipt.updated_at = utc_now()
+        session.add(receipt)
+        # Commit before deciding the next step so receipt.attendees /
+        # business_reason reflect the post-save state, not the values
+        # parsed from this single reply (the receipt may already carry a
+        # field saved on a prior round of the same meal-context prompt).
+        session.commit()
+        session.refresh(receipt)
+
+        if receipt.attendees and receipt.business_reason:
+            agent_read = session.get(AgentReceiptRead, user_response.agent_receipt_read_id)
+            user_response.user_action = "edited"
+            user_response.user_action_at = utc_now()
+            session.add(user_response)
+            session.commit()
+            client.send_message(chat_id, "✅ Attendees and reason saved.")
+            if agent_read is not None and receipt.telegram_chat_id is not None:
+                payload = build_inline_keyboard_reply(receipt, agent_read, user_response.id)
+                _send_message_with_markup(
+                    client,
+                    chat_id=chat_id,
+                    text=payload["text"],
+                    reply_markup=payload["reply_markup"],
+                )
+            return {"ok": True, "action": "awaiting_attendees_reason_saved"}
+
+        if receipt.attendees and not receipt.business_reason:
+            user_response.user_action = "awaiting_business_reason_followup"
+            ack = "✅ Attendees saved. What was the business reason?"
+        else:
+            user_response.user_action = "awaiting_attendees_reason"
+            ack = (
+                "✅ Reason saved. Who was with you? Reply with names, "
+                "or 'Hakan only' for a solo meal."
+            )
+        user_response.user_action_at = utc_now()
+        session.add(user_response)
+        session.commit()
+        client.send_message(chat_id, ack)
+        return {
+            "ok": True,
+            "action": "awaiting_attendees_reason_followup",
+            "next_state": user_response.user_action,
+        }
+
+    if state == "awaiting_business_reason_followup":
+        reason = parse_single_field_reply(text)
+        if reason is None:
+            client.send_message(
+                chat_id,
+                "Couldn't read that — please type the business reason. "
+                "Example: customer dinner with Acme team.",
+            )
+            return {"ok": True, "action": "awaiting_business_reason_followup_reprompt"}
         receipt.business_reason = reason
         receipt.business_reason_source = "telegram_user"
         receipt.updated_at = utc_now()
         session.add(receipt)
-        # Return to top-level Confirm/Edit/Cancel keyboard since the user
-        # just completed a Meals categorization workflow.
+
         agent_read = session.get(AgentReceiptRead, user_response.agent_receipt_read_id)
         user_response.user_action = "edited"
         user_response.user_action_at = utc_now()
         session.add(user_response)
         session.commit()
-        client.send_message(chat_id, "✅ Attendees and reason saved.")
+        client.send_message(chat_id, "✅ Reason saved.")
         if agent_read is not None and receipt.telegram_chat_id is not None:
             payload = build_inline_keyboard_reply(receipt, agent_read, user_response.id)
             _send_message_with_markup(
@@ -1508,7 +1612,53 @@ def _handle_awaiting_text_reply(
                 text=payload["text"],
                 reply_markup=payload["reply_markup"],
             )
-        return {"ok": True, "action": "awaiting_attendees_reason_saved"}
+        return {"ok": True, "action": "awaiting_business_reason_followup_saved"}
+
+    if state == "awaiting_attendees_only":
+        attendees = parse_single_field_reply(text)
+        if attendees is None:
+            client.send_message(
+                chat_id,
+                "Couldn't read that — please type the attendees. "
+                "Example: Hakan only, or Hakan + customer Ahmet Yılmaz.",
+            )
+            return {"ok": True, "action": "awaiting_attendees_only_reprompt"}
+        receipt.attendees = attendees
+        receipt.attendees_source = "telegram_user"
+        receipt.updated_at = utc_now()
+        session.add(receipt)
+        return _post_field_edit_return_to_menu(
+            session, client,
+            settings=settings,
+            user=user,
+            user_response=user_response,
+            chat_id=chat_id,
+            ack_text=f"✅ Attendees updated to: {attendees}",
+            field_name="attendees",
+        )
+
+    if state == "awaiting_business_reason_only":
+        reason = parse_single_field_reply(text)
+        if reason is None:
+            client.send_message(
+                chat_id,
+                "Couldn't read that — please type the business reason. "
+                "Example: customer dinner with Acme team.",
+            )
+            return {"ok": True, "action": "awaiting_business_reason_only_reprompt"}
+        receipt.business_reason = reason
+        receipt.business_reason_source = "telegram_user"
+        receipt.updated_at = utc_now()
+        session.add(receipt)
+        return _post_field_edit_return_to_menu(
+            session, client,
+            settings=settings,
+            user=user,
+            user_response=user_response,
+            chat_id=chat_id,
+            ack_text=f"✅ Business reason updated.",
+            field_name="business_reason",
+        )
 
     logger.warning(
         "awaiting text reply: unknown state=%r response_id=%s",

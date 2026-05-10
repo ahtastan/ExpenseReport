@@ -202,6 +202,12 @@ class AgentReceiptUserResponse(SQLModel, table=True):
     # PR4 button-driven Edit menu interim states (additive, no schema change):
     # 'awaiting_supplier' | 'awaiting_date' | 'awaiting_amount' |
     # 'awaiting_attendees_reason'
+    # Sub-PR 6 meal-attendees-gate interim states (additive):
+    # 'awaiting_business_reason_followup' (set after the greedy parser
+    #  matched only attendees on the pre-confirm meal prompt; bot is
+    #  collecting the missing business_reason) |
+    # 'awaiting_attendees_only' (Edit > Attendees free-text prompt) |
+    # 'awaiting_business_reason_only' (Edit > Reason free-text prompt)
 
     user_action_at: datetime | None = Field(default=None, index=True)
     free_text_reply: str | None = Field(default=None, sa_column=Column(Text))

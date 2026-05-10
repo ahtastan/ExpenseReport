@@ -715,6 +715,78 @@ def test_post_validation_negative_amount_returns_unchanged():
     assert reason is None
 
 
+def test_post_validation_snacks_grade_amount_at_dinner_hour_stays_snacks():
+    """Negative-fire on the time-only rule: a snacks-grade amount (e.g.
+    a 200 TRY evening coffee) at dinner hour must stay Meals/Snacks.
+    The dinner-hour bump fires only when amount is at least lunch-grade
+    — otherwise an evening coffee run would be miscategorized."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="20:30"),
+        local_amount=Decimal("200"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Meals/Snacks"
+    assert reason is None
+
+
+def test_post_validation_snacks_grade_amount_in_lunch_hour_stays_snacks():
+    """Symmetric negative-fire: a snacks-grade amount in lunch hour
+    stays Snacks. Amount alone disqualifies a Lunch bucket bump."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="12:30"),
+        local_amount=Decimal("180"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Meals/Snacks"
+    assert reason is None
+
+
+# ─── _parse_hhmm direct unit tests ──────────────────────────────────────────
+
+
+def test_parse_hhmm_accepts_compact_hhmm_form():
+    """Direct unit test for the compact ``HHMM`` regex branch — the
+    integration tests all pass ``HH:MM``, so this pins the second
+    pattern explicitly."""
+    from datetime import time as _time
+
+    from app.services.agent_receipt_reviewer import _parse_hhmm
+
+    assert _parse_hhmm("1849") == _time(18, 49)
+    assert _parse_hhmm("0930") == _time(9, 30)
+    assert _parse_hhmm("0000") == _time(0, 0)
+
+
+def test_parse_hhmm_accepts_seconds_form():
+    """``HH:MM:SS`` is tolerated; we only consume hour + minute."""
+    from datetime import time as _time
+
+    from app.services.agent_receipt_reviewer import _parse_hhmm
+
+    assert _parse_hhmm("18:49:23") == _time(18, 49)
+
+
+def test_parse_hhmm_rejects_invalid_clock_values():
+    """24:00 / 25:00 / 09:60 are not valid 24-hour clock times."""
+    from app.services.agent_receipt_reviewer import _parse_hhmm
+
+    assert _parse_hhmm("24:00") is None
+    assert _parse_hhmm("25:30") is None
+    assert _parse_hhmm("09:60") is None
+    assert _parse_hhmm("9999") is None
+
+
+def test_parse_hhmm_rejects_garbage():
+    from app.services.agent_receipt_reviewer import _parse_hhmm
+
+    assert _parse_hhmm("morning") is None
+    assert _parse_hhmm("18.49") is None
+    assert _parse_hhmm("") is None
+    assert _parse_hhmm(None) is None
+    assert _parse_hhmm("   ") is None
+    assert _parse_hhmm(1849) is None  # type: ignore[arg-type]
+
+
 # ─── prompt + vocabulary ────────────────────────────────────────────────────
 
 

@@ -44,7 +44,7 @@ _BUSINESS_REASON_DISPLAY_LIMIT = 200
 # PR4: menu-navigation callback data.
 MENU_CALLBACK_DATA_PREFIX = "fai1m"
 MENU_SCOPES = ("edit", "rcpt", "cat1", "cat2", "type", "skip_ra")
-EDIT_MENU_CHOICES = ("receipt", "category", "type", "back")
+EDIT_MENU_CHOICES = ("receipt", "category", "attendees", "reason", "type", "back")
 RECEIPT_MENU_CHOICES = ("supplier", "date", "amount", "back")
 TYPE_MENU_CHOICES = ("personal", "back")
 
@@ -145,7 +145,8 @@ def build_edit_menu_markup(
     *,
     include_type_button: bool,
 ) -> dict[str, Any]:
-    """Top-level Edit menu: Receipt info / Category / Type (allowlist) / Back."""
+    """Top-level Edit menu: Receipt info / Category / Attendees / Reason /
+    Type (allowlist) / Back."""
     row1: list[dict[str, str]] = [
         {
             "text": "📝 Receipt info",
@@ -156,20 +157,31 @@ def build_edit_menu_markup(
             "callback_data": build_menu_callback_data("edit", "category", user_response_id),
         },
     ]
+    row2: list[dict[str, str]] = [
+        {
+            "text": "👥 Attendees",
+            "callback_data": build_menu_callback_data("edit", "attendees", user_response_id),
+        },
+        {
+            "text": "💬 Reason",
+            "callback_data": build_menu_callback_data("edit", "reason", user_response_id),
+        },
+    ]
+    row3: list[dict[str, str]] = []
     if include_type_button:
-        row1.append(
+        row3.append(
             {
                 "text": "🔄 Type",
                 "callback_data": build_menu_callback_data("edit", "type", user_response_id),
             }
         )
-    row2: list[dict[str, str]] = [
+    row3.append(
         {
             "text": "⬅ Back",
             "callback_data": build_menu_callback_data("edit", "back", user_response_id),
         }
-    ]
-    return {"inline_keyboard": [row1, row2]}
+    )
+    return {"inline_keyboard": [row1, row2, row3]}
 
 
 def build_receipt_menu_markup(user_response_id: int) -> dict[str, Any]:

@@ -15,6 +15,8 @@ from app.services.telegram_edit_parsers import (
     parse_amount_reply,
     parse_attendees_reason_reply,
     parse_date_reply,
+    parse_meal_context_reply,
+    parse_single_field_reply,
     parse_supplier_reply,
 )
 
@@ -167,3 +169,72 @@ def test_parsers_return_none_for_non_string(bad) -> None:
     assert parse_date_reply(bad) is None
     assert parse_amount_reply(bad) is None
     assert parse_attendees_reason_reply(bad) is None
+    assert parse_single_field_reply(bad) is None
+    assert parse_meal_context_reply(bad) == (None, None)
+
+
+# ─── meal-context greedy parser ──────────────────────────────────────────────
+
+
+def test_parse_meal_context_reply_with_semicolon_returns_both() -> None:
+    assert parse_meal_context_reply("Hakan only; team lunch") == ("Hakan only", "team lunch")
+
+
+def test_parse_meal_context_reply_without_semicolon_returns_attendees_only() -> None:
+    """Greedy fallback: when no ``;`` separator is present, the reply is
+    interpreted as attendees only (matching the prompt order). The caller
+    follows up for the business reason."""
+    attendees, reason = parse_meal_context_reply("Hakan and Burak")
+    assert attendees == "Hakan and Burak"
+    assert reason is None
+
+
+def test_parse_meal_context_reply_empty_returns_both_none() -> None:
+    assert parse_meal_context_reply("") == (None, None)
+    assert parse_meal_context_reply("   ") == (None, None)
+
+
+def test_parse_meal_context_reply_lone_semicolon_returns_both_none() -> None:
+    """Lone ``;`` (both sides empty) is the only ambiguous case — the
+    handler should reprompt rather than save an empty field."""
+    assert parse_meal_context_reply(";") == (None, None)
+
+
+def test_parse_meal_context_reply_attendees_with_empty_reason() -> None:
+    """``Hakan only;`` keeps attendees but flags reason as missing for
+    follow-up rather than rejecting outright (greedy)."""
+    attendees, reason = parse_meal_context_reply("Hakan only;")
+    assert attendees == "Hakan only"
+    assert reason is None
+
+
+def test_parse_meal_context_reply_empty_attendees_with_reason() -> None:
+    attendees, reason = parse_meal_context_reply("; customer dinner")
+    assert attendees is None
+    assert reason == "customer dinner"
+
+
+def test_parse_meal_context_reply_extra_semicolons_join_into_reason() -> None:
+    attendees, reason = parse_meal_context_reply("Hakan; lunch; with Acme")
+    assert attendees == "Hakan"
+    assert reason == "lunch; with Acme"
+
+
+# ─── single-field parser ─────────────────────────────────────────────────────
+
+
+def test_parse_single_field_reply_strips_whitespace() -> None:
+    assert parse_single_field_reply("  Hakan only  ") == "Hakan only"
+
+
+def test_parse_single_field_reply_rejects_empty() -> None:
+    assert parse_single_field_reply("") is None
+    assert parse_single_field_reply("   ") is None
+
+
+def test_parse_single_field_reply_keeps_internal_punctuation() -> None:
+    # Edit-menu single-field replies for attendees / reason often include
+    # commas and ``+`` separators; these must round-trip unchanged.
+    assert parse_single_field_reply("Hakan + customer Ahmet, Burak") == (
+        "Hakan + customer Ahmet, Burak"
+    )

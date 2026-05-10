@@ -43,7 +43,10 @@ from app.services.agent_receipt_review_persistence import (
     latest_ai_review_for_receipt,
     write_mock_agent_receipt_review,
 )
-from app.services.telegram_keyboard_composer import build_inline_keyboard_reply
+from app.services.telegram_keyboard_composer import (
+    build_inline_keyboard_reply,
+    build_skip_reason_attendees_markup,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -737,6 +740,58 @@ def should_use_inline_keyboard(settings: Any, telegram_user_id: int | None) -> b
     return telegram_user_id in allowlist
 
 
+def _should_gate_for_meal_attendees(
+    receipt: ReceiptDocument, agent_read: AgentReceiptRead
+) -> bool:
+    """Return True when the F-AI auto-suggest path must collect attendees +
+    business reason BEFORE surfacing Confirm/Edit/Cancel.
+
+    Triggers when (a) the AI's suggested bucket belongs to a meal-and-
+    entertainment category that EDT requires per-head tracking on, (b) the
+    receipt isn't already classified Personal, and (c) the canonical row
+    doesn't already carry both ``attendees`` and ``business_reason`` (e.g.
+    set on a prior session or from upload-time context).
+    """
+    from app.category_vocab import (
+        CATEGORIES_REQUIRING_REASON_AND_ATTENDEES,
+        category_for_bucket,
+    )
+
+    bucket = agent_read.suggested_report_bucket
+    if not bucket:
+        return False
+    parent = category_for_bucket(bucket)
+    if parent not in CATEGORIES_REQUIRING_REASON_AND_ATTENDEES:
+        return False
+    if receipt.business_or_personal == "Personal":
+        return False
+    if (agent_read.suggested_business_or_personal or "").lower() == "personal":
+        return False
+    if receipt.attendees and receipt.business_reason:
+        return False
+    return True
+
+
+def _build_meal_attendees_gate_payload(
+    receipt: ReceiptDocument,
+    agent_read: AgentReceiptRead,
+    user_response_id: int,
+) -> dict[str, Any]:
+    """Compose the pre-confirm meal-bucket prompt payload (text + Skip button).
+
+    Mirrors the post-Edit-bucket-pick prompt at the call site of the same
+    Skip-for-now button so the two paths look identical to the user."""
+    bucket = agent_read.suggested_report_bucket or "this meal"
+    text = (
+        f"Looks like a business meal ({bucket}). "
+        f"Who was with you, and what was the business reason?\n\n"
+        "Tip: send both at once with `;` — e.g. `Hakan only; team lunch`.\n"
+        "Or tap below to skip and decide later."
+    )
+    reply_markup = build_skip_reason_attendees_markup(user_response_id)
+    return {"text": text, "reply_markup": reply_markup}
+
+
 def send_inline_keyboard_proposal(
     session: Session,
     client: Any,
@@ -845,17 +900,28 @@ def send_inline_keyboard_proposal(
 
     # Flush the response row only to reserve the callback id. It is not
     # committed until Telegram confirms the keyboard was actually sent.
+    gate_for_meal_attendees = _should_gate_for_meal_attendees(receipt, agent_read)
+    initial_user_action = (
+        "awaiting_attendees_reason" if gate_for_meal_attendees else "pending"
+    )
     user_response = AgentReceiptUserResponse(
         receipt_document_id=receipt.id or 0,
         agent_receipt_review_run_id=outcome.run.id or 0,
         agent_receipt_read_id=agent_read.id or 0,
         telegram_user_id=telegram_user_id,
         keyboard_message_id=None,
-        user_action="pending",
+        user_action=initial_user_action,
     )
+    if gate_for_meal_attendees:
+        user_response.user_action_at = utc_now()
     session.add(user_response)
     session.flush()
-    payload = build_inline_keyboard_reply(receipt, agent_read, user_response.id or 0)
+    if gate_for_meal_attendees:
+        payload = _build_meal_attendees_gate_payload(
+            receipt, agent_read, user_response.id or 0
+        )
+    else:
+        payload = build_inline_keyboard_reply(receipt, agent_read, user_response.id or 0)
     try:
         api_response = client.call(
             "sendMessage",

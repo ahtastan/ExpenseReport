@@ -101,3 +101,40 @@ def parse_attendees_reason_reply(text: str) -> tuple[str, str] | None:
     if not attendees or not reason:
         return None
     return attendees, reason
+
+
+def parse_meal_context_reply(text: str) -> tuple[str | None, str | None]:
+    """Greedy variant of :func:`parse_attendees_reason_reply` for the
+    pre-confirm meal-bucket prompt.
+
+    Returns ``(attendees, reason)`` where either side may be ``None`` so
+    the caller can ask a follow-up for the missing field.
+
+    Behavior:
+
+    - With ``;``: both sides parsed; either may end up empty (``None``).
+    - Without ``;``: the entire text becomes ``attendees`` (matching the
+      prompt order "who was with you AND what was the business reason"),
+      and ``reason`` is ``None`` so the caller asks a follow-up.
+    - Empty / whitespace-only input: ``(None, None)``.
+    """
+    if not isinstance(text, str):
+        return None, None
+    cleaned = text.strip()
+    if not cleaned:
+        return None, None
+    if ";" in cleaned:
+        left, _, right = cleaned.partition(";")
+        attendees = left.strip() or None
+        reason = right.strip() or None
+        return attendees, reason
+    return cleaned, None
+
+
+def parse_single_field_reply(text: str) -> str | None:
+    """Plain text. Strip whitespace; reject empty. Used by the Edit menu
+    single-field attendees / business reason prompts."""
+    if not isinstance(text, str):
+        return None
+    cleaned = text.strip()
+    return cleaned or None

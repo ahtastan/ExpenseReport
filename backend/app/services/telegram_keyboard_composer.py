@@ -203,18 +203,18 @@ def build_edit_menu_markup(
 
 def build_fatura_prompt_markup(user_response_id: int) -> dict[str, Any]:
     """Three-button keyboard offered after a hotel receipt is Confirmed:
-    Şimdi yükle / Sonra / Yok."""
+    Upload now / Later / None."""
     row = [
         {
-            "text": "📎 Şimdi yükle",
+            "text": "📎 Upload now",
             "callback_data": build_menu_callback_data("fatura", "now", user_response_id),
         },
         {
-            "text": "⏰ Sonra",
+            "text": "⏰ Later",
             "callback_data": build_menu_callback_data("fatura", "later", user_response_id),
         },
         {
-            "text": "❌ Yok",
+            "text": "❌ None",
             "callback_data": build_menu_callback_data("fatura", "none", user_response_id),
         },
     ]
@@ -222,7 +222,8 @@ def build_fatura_prompt_markup(user_response_id: int) -> dict[str, Any]:
 
 
 FATURA_PROMPT_TEXT = (
-    "📄 Bu konaklama için fatura var mı? Carolyn detaylı tax invoice istiyor."
+    "📄 Do you have a fatura (tax invoice) for this stay? "
+    "Carolyn requests detailed invoices."
 )
 
 

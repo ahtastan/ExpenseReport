@@ -309,6 +309,7 @@ _AWAITING_STATES: tuple[str, ...] = (
     "awaiting_attendees_only",
     "awaiting_business_reason_only",
     "awaiting_fatura_upload",
+    "awaiting_fatura_choice",
 )
 
 
@@ -1849,6 +1850,27 @@ def _handle_awaiting_text_reply(
             ack_text=f"✅ Business reason updated.",
             field_name="business_reason",
         )
+
+    if state == "awaiting_fatura_choice":
+        # Sub-PR 8 phase 1: text typed while the 3-button fatura prompt is
+        # showing. Re-show the prompt instead of letting the message
+        # fall through to the legacy clarifications path (which would
+        # answer an unrelated open question, if any).
+        markup = build_fatura_prompt_markup(user_response.id or 0)
+        _send_message_with_markup(
+            client,
+            chat_id=chat_id,
+            text=(
+                "Lütfen aşağıdaki butonlardan birini seç: 📎 Şimdi yükle "
+                "/ ⏰ Sonra / ❌ Yok."
+            ),
+            reply_markup=markup,
+        )
+        return {
+            "ok": True,
+            "action": "awaiting_fatura_choice_text_reprompt",
+            "receipt_id": receipt.id,
+        }
 
     if state == "awaiting_fatura_upload":
         # Sub-PR 8 phase 1: a non-photo text message during the fatura

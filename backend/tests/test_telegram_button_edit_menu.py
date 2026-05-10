@@ -2176,6 +2176,41 @@ def test_fatura_callback_after_fatura_resolved_is_ignored(isolated_db, monkeypat
     assert receipt.fatura_status == "pending"
 
 
+def test_fatura_text_during_choice_state_reshows_prompt(isolated_db, monkeypatch):
+    """Text typed while the 3-button fatura prompt is up (state=
+    awaiting_fatura_choice) re-shows the buttons rather than letting
+    the reply leak into the legacy clarifications dispatcher. Pinned
+    after the partial telegram-flow review."""
+    _enable_keyboard_env(monkeypatch)
+    with Session(isolated_db) as session:
+        ids = _seed_hotel_pending_response(session)
+
+    client = _FakeClient()
+    telegram_module, original = _patch_telegram_client(client)
+    try:
+        with Session(isolated_db) as session:
+            handle_update(session, _callback("confirm", ids["response_id"]))
+        with Session(isolated_db) as session:
+            r = handle_update(session, _text("yes please"))
+    finally:
+        telegram_module.TelegramClient = original
+
+    assert r["action"] == "awaiting_fatura_choice_text_reprompt"
+    with Session(isolated_db) as session:
+        response = session.get(AgentReceiptUserResponse, ids["response_id"])
+    assert response.user_action == "awaiting_fatura_choice"
+    # Re-shown 3-button keyboard.
+    sends = [
+        call for call in client.calls
+        if call[0] == "sendMessage" and "reply_markup" in call[1]
+    ]
+    assert sends, "expected a sendMessage with the fatura buttons re-shown"
+    labels = _button_labels(sends[-1][1]["reply_markup"])
+    assert any("Şimdi" in lbl for lbl in labels)
+    assert any("Sonra" in lbl for lbl in labels)
+    assert any("Yok" in lbl for lbl in labels)
+
+
 def test_fatura_prompt_skipped_when_already_attached(isolated_db, monkeypatch):
     """If a hotel receipt already carries fatura_status='attached' on a
     re-confirm flow, the prompt does not fire again."""

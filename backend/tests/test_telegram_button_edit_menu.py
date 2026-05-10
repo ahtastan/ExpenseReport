@@ -1411,9 +1411,10 @@ def test_meal_attendees_gate_helper_skips_non_meal_bucket():
     assert _should_gate_for_meal_attendees(receipt, agent_read) is False
 
 
-def test_meal_attendees_gate_helper_skips_when_personal():
-    """Personal receipts never get the meal gate, even if the AI's
-    suggested bucket is in the Meals & Entertainment family."""
+def test_meal_attendees_gate_helper_skips_when_canonical_personal():
+    """Receipt-side short-circuit: when the canonical row is already
+    classified Personal, never ask attendees regardless of the AI's
+    suggestion."""
     from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
 
     receipt = ReceiptDocument(
@@ -1427,10 +1428,82 @@ def test_meal_attendees_gate_helper_skips_when_personal():
         receipt_document_id=0,
         read_schema_version="stage1",
         read_json="{}",
+        # AI still suggests Business + Lunch — gate must respect the
+        # canonical Personal classification regardless.
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Lunch",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is False
+
+
+def test_meal_attendees_gate_helper_skips_when_ai_suggests_personal():
+    """Suggestion-side short-circuit: when the AI proposed Personal, the
+    meal-bucket suggestion is moot and the gate must skip."""
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        # Canonical not yet decided.
+        business_or_personal=None,
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
         suggested_business_or_personal="Personal",
         suggested_report_bucket="Lunch",
     )
     assert _should_gate_for_meal_attendees(receipt, agent_read) is False
+
+
+def test_meal_attendees_gate_helper_fires_when_only_attendees_set():
+    """Pin the ``and`` semantics on the already-populated short-circuit:
+    if only one of attendees / business_reason is set, the gate still
+    fires to collect the other."""
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        business_or_personal="Business",
+        attendees="Hakan only",
+        business_reason=None,
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Dinner",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is True
+
+
+def test_meal_attendees_gate_helper_fires_when_only_business_reason_set():
+    from app.services.telegram_receipt_reply import _should_gate_for_meal_attendees
+
+    receipt = ReceiptDocument(
+        source="telegram",
+        status="received",
+        content_type="photo",
+        business_or_personal="Business",
+        attendees=None,
+        business_reason="customer dinner",
+    )
+    agent_read = AgentReceiptRead(
+        run_id=0,
+        receipt_document_id=0,
+        read_schema_version="stage1",
+        read_json="{}",
+        suggested_business_or_personal="Business",
+        suggested_report_bucket="Dinner",
+    )
+    assert _should_gate_for_meal_attendees(receipt, agent_read) is True
 
 
 def test_meal_attendees_gate_helper_skips_when_both_fields_already_set():

@@ -1861,8 +1861,8 @@ def _handle_awaiting_text_reply(
             client,
             chat_id=chat_id,
             text=(
-                "Lütfen aşağıdaki butonlardan birini seç: 📎 Şimdi yükle "
-                "/ ⏰ Sonra / ❌ Yok."
+                "Please tap one of the buttons: 📎 Upload now / "
+                "⏰ Later / ❌ None."
             ),
             reply_markup=markup,
         )
@@ -1898,7 +1898,7 @@ def _handle_awaiting_text_reply(
                     receipt.updated_at = utc_now()
                     session.add(receipt)
                 user_response.user_action = "fatura_deferred"
-                ack = "⏰ Tamam, rapor öncesi tekrar soracağım."
+                ack = "⏰ Got it, I'll ask again before the report."
             user_response.user_action_at = utc_now()
             session.add(user_response)
             session.commit()
@@ -1910,8 +1910,7 @@ def _handle_awaiting_text_reply(
             }
         client.send_message(
             chat_id,
-            "Lütfen fatura'nın foto'sunu veya PDF'ini gönder. "
-            "Çıkmak için /cancel.",
+            "Please send the fatura photo or PDF. Use /cancel to skip.",
         )
         return {
             "ok": True,
@@ -2079,7 +2078,7 @@ def _handle_menu_fatura(
             client,
             chat_id=chat_id,
             message_id=message_id,
-            text="⏰ Tamam, rapor öncesi tekrar soracağım.",
+            text="⏰ Got it, I'll ask again before the report.",
             reply_markup=None,
             log_context=f"response_id={user_response.id}/fatura:later",
         )
@@ -2100,7 +2099,7 @@ def _handle_menu_fatura(
             client,
             chat_id=chat_id,
             message_id=message_id,
-            text="❌ Tamam — fatura yok olarak işaretledim.",
+            text="❌ Got it — marked as no fatura available.",
             reply_markup=None,
             log_context=f"response_id={user_response.id}/fatura:none",
         )

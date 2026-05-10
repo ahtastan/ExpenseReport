@@ -1686,9 +1686,9 @@ def test_hotel_confirm_sends_fatura_prompt(isolated_db, monkeypatch):
     assert len(sends) == 1
     markup_str = sends[0][1]["reply_markup"]
     labels = _button_labels(markup_str)
-    assert any("Şimdi" in lbl for lbl in labels)
-    assert any("Sonra" in lbl for lbl in labels)
-    assert any("Yok" in lbl for lbl in labels)
+    assert any("Upload" in lbl for lbl in labels)
+    assert any("Later" in lbl for lbl in labels)
+    assert any("None" in lbl for lbl in labels)
 
 
 def test_non_hotel_confirm_no_fatura_prompt(isolated_db, monkeypatch):
@@ -1906,7 +1906,7 @@ def test_fatura_text_during_awaiting_state_reminds_and_keeps_state(
     assert response.user_action == "awaiting_fatura_upload"
     # Reminder sent.
     assert any(
-        "fotoğraf" in m.lower() or "foto" in m.lower() or "pdf" in m.lower()
+        "photo" in m.lower() or "pdf" in m.lower() or "please" in m.lower()
         for _chat, m in client.send_messages
     )
 
@@ -2146,7 +2146,7 @@ def test_edit_menu_fatura_choice_blocked_on_non_hotel(isolated_db, monkeypatch):
 
 
 def test_fatura_callback_after_fatura_resolved_is_ignored(isolated_db, monkeypatch):
-    """Once the user has resolved the fatura prompt (e.g. clicked Sonra),
+    """Once the user has resolved the fatura prompt (e.g. clicked Later),
     a stale tap on a different button must not re-fire — the response
     is no longer in the fatura sub-flow's allowed state set."""
     _enable_keyboard_env(monkeypatch)
@@ -2206,9 +2206,9 @@ def test_fatura_text_during_choice_state_reshows_prompt(isolated_db, monkeypatch
     ]
     assert sends, "expected a sendMessage with the fatura buttons re-shown"
     labels = _button_labels(sends[-1][1]["reply_markup"])
-    assert any("Şimdi" in lbl for lbl in labels)
-    assert any("Sonra" in lbl for lbl in labels)
-    assert any("Yok" in lbl for lbl in labels)
+    assert any("Upload" in lbl for lbl in labels)
+    assert any("Later" in lbl for lbl in labels)
+    assert any("None" in lbl for lbl in labels)
 
 
 def test_fatura_prompt_skipped_when_already_attached(isolated_db, monkeypatch):

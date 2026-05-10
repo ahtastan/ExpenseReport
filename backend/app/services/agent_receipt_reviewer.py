@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import unicodedata
-from dataclasses import dataclass, field
-from datetime import date
+from dataclasses import dataclass, field, replace
+from datetime import date, time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Mapping
 
@@ -454,6 +455,10 @@ class InlineKeyboardSuggestion:
     All fields default to None so a partial response (per spec — model may
     omit ``customer`` for example) still produces a valid object. Unknown
     keys in the raw response are dropped silently.
+
+    ``receipt_time`` is the printed time of the transaction (HH:MM,
+    24-hour) when visible on the receipt — used by the post-validation
+    bucket guard to anchor meal-bucket choices on time of day.
     """
 
     business_or_personal: str | None = None
@@ -462,6 +467,7 @@ class InlineKeyboardSuggestion:
     customer: str | None = None
     business_reason: str | None = None
     confidence_overall: float | None = None
+    receipt_time: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -471,22 +477,28 @@ class InlineKeyboardSuggestion:
             "customer": self.customer,
             "business_reason": self.business_reason,
             "confidence_overall": self.confidence_overall,
+            "receipt_time": self.receipt_time,
         }
 
 
 def inline_keyboard_bucket_vocabulary() -> list[str]:
     """Return the report_bucket values the suggester is allowed to propose.
 
-    Pulled from ``merchant_buckets._RULES`` so the AI's vocabulary stays
-    in sync with the deterministic suggester. The frontend's
-    ``REPORT_BUCKETS`` list is broader (covers all template rows including
-    ones the deterministic suggester never produces); the inline-keyboard
-    AI is constrained to the deterministic vocabulary here on purpose, so
-    operator review can rely on the same labels everywhere.
-    """
-    from app.services.merchant_buckets import _RULES  # local import: avoid load-order cycle
+    Returns the full canonical EDT bucket taxonomy from
+    ``app.category_vocab.all_buckets()``. The Edit menu's Tier 2 picker
+    already exposes this same set, so AI suggestions and operator picks
+    share one vocabulary across surfaces.
 
-    return sorted({rule.bucket for rule in _RULES})
+    Sub-PR 7 broadens this from the narrower ``merchant_buckets._RULES``
+    set (which omitted Lunch / Dinner / Breakfast) so the inline-keyboard
+    AI can suggest meal-time-anchored buckets. The deterministic
+    supplier-name suggester at ``merchant_buckets.suggest_bucket`` keeps
+    its narrower vocabulary — it never had Lunch/Dinner rules to begin
+    with.
+    """
+    from app.category_vocab import all_buckets  # local import: avoid load-order cycle
+
+    return sorted(set(all_buckets()))
 
 
 def build_inline_keyboard_review_prompt(
@@ -526,7 +538,8 @@ advisory; deterministic application code decides what to persist.
 If a classification is genuinely ambiguous, you may return null for the
 optional ``customer`` field; ``business_or_personal``, ``report_bucket``,
 ``attendees``, ``business_reason``, and ``confidence_overall`` should
-always be populated.
+always be populated. ``receipt_time`` should be the printed transaction
+time when visible on the receipt (HH:MM 24-hour) and null otherwise.
 
 Allowed values:
 - ``business_or_personal``: "Business" or "Personal"
@@ -535,6 +548,28 @@ Allowed values:
 - ``customer``: string or null
 - ``business_reason``: short string
 - ``confidence_overall``: float in [0, 1]
+- ``receipt_time``: string "HH:MM" 24-hour, or null
+
+Bucket-selection guidance for meal/entertainment receipts. These are
+prior anchors, not hard rules — supplier name, line items, and group
+size still matter. Apply them when the supplier signal alone is weak:
+
+- Amount bands (TRY): under 500 TL typically Meals/Snacks (coffee,
+  bakery, single-person snack); 500–2000 TL typically Lunch; 2000–5000
+  TL typically Dinner; over 5000 TL typically Dinner or Entertainment
+  (large group / customer dinner).
+- Amount bands (USD/EUR/GBP/CAD): under $15 → Snacks; $15–50 → Lunch;
+  over $50 → Dinner.
+- Time-of-day bias when the receipt prints a time:
+    * 11:30–14:30 → Lunch bias.
+    * 18:00–22:30 → Dinner bias.
+    * Outside meal hours with a small amount → Snacks/Coffee.
+- A "snacks-grade" amount (under 500 TL / $15) at any hour stays
+  Meals/Snacks; do not bump to Lunch/Dinner from time alone.
+
+When supplier evidence (named restaurant / customer-facing dinner venue)
+contradicts these anchors, prefer supplier evidence and explain in
+``business_reason``.
 
 CONTEXT (last N days, this user only):
 {context_json}
@@ -547,7 +582,8 @@ STATEMENT row context (context only):
 
 Propose a complete classification. Output JSON with keys: business_or_personal,
 report_bucket, attendees (list of strings), customer (string or null),
-business_reason (string), confidence_overall (float 0–1).
+business_reason (string), confidence_overall (float 0–1),
+receipt_time (string "HH:MM" or null).
 
 Strict JSON shape, no markdown or prose outside JSON:
 {{
@@ -556,7 +592,8 @@ Strict JSON shape, no markdown or prose outside JSON:
   "attendees": [],
   "customer": null,
   "business_reason": null,
-  "confidence_overall": null
+  "confidence_overall": null,
+  "receipt_time": null
 }}
 """
 
@@ -594,6 +631,7 @@ def parse_inline_keyboard_response(raw_text: str) -> InlineKeyboardSuggestion | 
         customer=_clean_optional_string(parsed.get("customer")),
         business_reason=_clean_optional_string(parsed.get("business_reason")),
         confidence_overall=_coerce_unit_float(parsed.get("confidence_overall")),
+        receipt_time=_clean_optional_string(parsed.get("receipt_time")),
     )
 
 
@@ -630,3 +668,198 @@ def _coerce_unit_float(value: Any) -> float | None:
     if result > 1.0:
         return 1.0
     return result
+
+
+# ─── F-AI-Stage1 sub-PR 7: deterministic bucket post-validation guard ──────
+#
+# Defense-in-depth: even with the price+time anchoring added to the inline-
+# keyboard prompt, the AI sometimes returns a snack-grade bucket on a
+# dinner-grade receipt. This pure-Python guard runs after the parse and
+# bumps a small set of structurally-counter-intuitive (bucket, amount, time)
+# combinations into the right meal slot. Bumps stay inside the existing EDT
+# meal-bucket vocabulary (Meals/Snacks, Breakfast, Lunch, Dinner) — no new
+# value is invented.
+#
+# The guard is a strict superset improvement: it can only move a meal-
+# family bucket sideways/up. Non-meal buckets (Taxi, Hotel, Fuel, etc.) and
+# already-Dinner / already-Entertainment suggestions are returned unchanged.
+
+_logger = logging.getLogger(__name__)
+
+# Local-currency amount bands in their own currency unit. The TRY band is
+# anchored to recent prod data (snacks 50–500 TL, lunches 500–2000 TL,
+# dinners 2000+ TL); the USD band is anchored to EDT Code of Conduct
+# per-head meal caps (~$30 lunch / $60 dinner) plus typical mid-market
+# city pricing. EUR/GBP/CAD reuse the USD band as a coarse approximation
+# until per-currency tuning is justified.
+_TRY_LUNCH_FLOOR = Decimal("500")
+_TRY_DINNER_FLOOR = Decimal("2000")
+_USD_LUNCH_FLOOR = Decimal("15")
+_USD_DINNER_FLOOR = Decimal("50")
+
+_USD_LIKE_CURRENCIES: frozenset[str] = frozenset({"USD", "EUR", "GBP", "CAD"})
+
+# Meal-hour windows. Keep these narrow so a 10:30 coffee or 16:00 dessert
+# doesn't get nudged out of Snacks.
+_LUNCH_HOUR_START = time(11, 30)
+_LUNCH_HOUR_END = time(14, 30)
+_DINNER_HOUR_START = time(18, 0)
+_DINNER_HOUR_END = time(22, 30)
+
+# Bucket families the guard touches. Anything outside this set is returned
+# unchanged so the guard can never accidentally bucket a hotel as Dinner.
+_MEAL_BUCKETS_BUMPABLE: frozenset[str] = frozenset({
+    "Meals/Snacks",
+    "Breakfast",
+    "Lunch",
+})
+
+
+def apply_bucket_post_validation(
+    suggestion: InlineKeyboardSuggestion,
+    *,
+    local_amount: Decimal | None,
+    local_currency: str | None,
+) -> tuple[InlineKeyboardSuggestion, str | None]:
+    """Return ``(maybe_bumped_suggestion, reason_or_none)``.
+
+    The guard fires only on meal-family buckets (Meals/Snacks, Breakfast,
+    Lunch). Dinner / Entertainment / non-meal buckets are returned
+    unchanged. When neither amount nor time gives a usable signal, the
+    suggestion is returned unchanged.
+
+    The returned ``reason`` is a short underscore-tag string suitable for
+    logging or telemetry (e.g. ``"snacks_dinner_grade_amount"``); ``None``
+    means "no bump fired".
+    """
+    if not isinstance(suggestion, InlineKeyboardSuggestion):
+        return suggestion, None
+    bucket = suggestion.report_bucket
+    if bucket not in _MEAL_BUCKETS_BUMPABLE:
+        return suggestion, None
+
+    grade = _amount_grade(local_amount, local_currency)
+    time_of_day = _parse_hhmm(suggestion.receipt_time)
+
+    target = bucket
+    reasons: list[str] = []
+
+    # Amount-driven bump on snack/breakfast buckets: the receipt's amount
+    # alone is sufficient to disqualify "Meals/Snacks".
+    if bucket in {"Meals/Snacks", "Breakfast"}:
+        if grade == "dinner":
+            target = "Dinner"
+            reasons.append("amount_dinner_grade")
+        elif grade == "lunch":
+            target = "Lunch"
+            reasons.append("amount_lunch_grade")
+
+    # Time-driven bump: a Lunch bucket past dinner-hour is structurally
+    # wrong.
+    if bucket == "Lunch" and time_of_day is not None and time_of_day >= _DINNER_HOUR_START:
+        target = "Dinner"
+        reasons.append("time_dinner_hour")
+
+    # Time-driven bump on Snacks: dinner-hour with anything but a coffee-
+    # grade amount → Dinner.
+    if (
+        bucket == "Meals/Snacks"
+        and time_of_day is not None
+        and time_of_day >= _DINNER_HOUR_START
+        and grade in {"lunch", "dinner"}
+    ):
+        target = "Dinner"
+        if "time_dinner_hour" not in reasons:
+            reasons.append("time_dinner_hour")
+
+    # Time-vs-amount disagreement on Lunch bucket: lunch-hour matches the
+    # bucket; do nothing. Outside both lunch and dinner windows, amount
+    # alone decides (already handled above).
+    if (
+        bucket in {"Meals/Snacks", "Breakfast"}
+        and target == "Lunch"
+        and time_of_day is not None
+        and time_of_day >= _DINNER_HOUR_START
+    ):
+        # We bumped to Lunch on amount, but the receipt prints a dinner
+        # hour — escalate to Dinner.
+        target = "Dinner"
+        if "time_dinner_hour" not in reasons:
+            reasons.append("time_dinner_hour")
+
+    if target == bucket:
+        return suggestion, None
+
+    reason = "+".join(reasons) if reasons else "post_validation_bump"
+    bumped = replace(suggestion, report_bucket=target)
+    _logger.info(
+        "bucket_post_validation: bumped %r → %r (amount=%s %s, time=%s, reason=%s)",
+        bucket,
+        target,
+        local_amount,
+        local_currency,
+        suggestion.receipt_time,
+        reason,
+    )
+    return bumped, reason
+
+
+def _amount_grade(
+    local_amount: Decimal | None, local_currency: str | None
+) -> str | None:
+    """Classify the receipt's local-currency amount into one of
+    ``snack`` / ``lunch`` / ``dinner``. Returns ``None`` when the amount
+    or currency is missing, or the currency is one we don't have a
+    calibrated band for."""
+    if local_amount is None:
+        return None
+    if not local_currency:
+        return None
+    cur = local_currency.upper()
+    try:
+        amt = Decimal(local_amount)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if amt < 0:
+        return None
+    if cur == "TRY":
+        if amt > _TRY_DINNER_FLOOR:
+            return "dinner"
+        if amt > _TRY_LUNCH_FLOOR:
+            return "lunch"
+        return "snack"
+    if cur in _USD_LIKE_CURRENCIES:
+        if amt > _USD_DINNER_FLOOR:
+            return "dinner"
+        if amt > _USD_LUNCH_FLOOR:
+            return "lunch"
+        return "snack"
+    return None
+
+
+_HHMM_PATTERN = re.compile(r"^(\d{1,2}):(\d{2})(?::\d{2})?$")
+_HHMM_COMPACT = re.compile(r"^(\d{2})(\d{2})$")
+
+
+def _parse_hhmm(value: str | None) -> time | None:
+    """Accept ``HH:MM`` / ``H:MM`` / ``HH:MM:SS`` / ``HHMM``. Returns
+    ``None`` for any input that doesn't pin to a valid 24-hour clock
+    time."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    m = _HHMM_PATTERN.match(cleaned)
+    if m is None:
+        m = _HHMM_COMPACT.match(cleaned)
+    if m is None:
+        return None
+    try:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return time(hh, mm)

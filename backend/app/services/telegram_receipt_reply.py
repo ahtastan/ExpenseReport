@@ -28,6 +28,7 @@ from app.services.merchant_buckets import suggest_bucket
 from app.services import agent_receipt_live_provider
 from app.services.agent_receipt_context import build_context_window
 from app.services.agent_receipt_reviewer import (
+    apply_bucket_post_validation,
     build_inline_keyboard_review_prompt,
     parse_inline_keyboard_response,
 )
@@ -849,6 +850,20 @@ def send_inline_keyboard_proposal(
             "inline keyboard: model response unparseable for receipt_id=%s", receipt.id
         )
         return False
+
+    suggestion, post_validation_reason = apply_bucket_post_validation(
+        suggestion,
+        local_amount=receipt.extracted_local_amount,
+        local_currency=receipt.extracted_currency,
+    )
+    if post_validation_reason is not None:
+        logger.info(
+            "inline keyboard: bucket post-validation bumped suggestion "
+            "receipt_id=%s reason=%s new_bucket=%s",
+            receipt.id,
+            post_validation_reason,
+            suggestion.report_bucket,
+        )
 
     try:
         outcome = write_mock_agent_receipt_review(

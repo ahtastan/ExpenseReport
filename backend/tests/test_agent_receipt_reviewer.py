@@ -205,6 +205,7 @@ from app.models import ReceiptDocument  # noqa: E402
 from app.services.agent_receipt_reviewer import (  # noqa: E402
     INLINE_KEYBOARD_PROMPT_VERSION,
     InlineKeyboardSuggestion,
+    apply_bucket_post_validation,
     build_inline_keyboard_review_prompt,
     inline_keyboard_bucket_vocabulary,
     parse_inline_keyboard_response,
@@ -492,3 +493,360 @@ def test_receipt_inline_keyboard_persists_context_window(isolated_db):
         assert persisted["recent_attendees"] == ctx["recent_attendees"]
         assert persisted["lookback_days"] == 2
         assert persisted["fetched_at"] == ctx["fetched_at"]
+
+
+# ─── F-AI-Stage1 sub-PR 7: bucket post-validation guard ────────────────────
+
+
+def _suggestion(
+    *,
+    bucket: str = "Meals/Snacks",
+    receipt_time: str | None = None,
+) -> InlineKeyboardSuggestion:
+    return InlineKeyboardSuggestion(
+        business_or_personal="Business",
+        report_bucket=bucket,
+        attendees=["Hakan only"],
+        customer=None,
+        business_reason="meal",
+        confidence_overall=0.7,
+        receipt_time=receipt_time,
+    )
+
+
+def test_post_validation_erina_case_bumps_snacks_to_dinner():
+    """ERINA evidence (live prod, post-PR-95): 7,570 TRY at 18:49, AI
+    suggests Meals/Snacks. The guard must bump to Dinner — both the
+    amount band (>2000 TRY) and the dinner-hour signal agree."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="18:49"),
+        local_amount=Decimal("7570"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Dinner"
+    assert reason is not None
+    assert "amount_dinner_grade" in reason
+
+
+def test_post_validation_small_snack_stays_snacks():
+    """50 TRY coffee at 14:30 with the AI saying Snacks: amount under
+    band floor → no bump, no false positives on coffee runs."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="14:30"),
+        local_amount=Decimal("50"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Meals/Snacks"
+    assert reason is None
+
+
+def test_post_validation_lunch_grade_amount_bumps_to_lunch():
+    """800 TRY at 13:00 with the AI saying Snacks: amount in lunch band
+    + lunch hour → Lunch."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="13:00"),
+        local_amount=Decimal("800"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Lunch"
+    assert reason == "amount_lunch_grade"
+
+
+def test_post_validation_dinner_grade_amount_bumps_to_dinner():
+    """3000 TRY at 20:00 with the AI saying Snacks: dinner band + dinner
+    hour. Both signals agree → Dinner with combined reason."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="20:00"),
+        local_amount=Decimal("3000"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Dinner"
+    assert reason is not None
+    assert "amount_dinner_grade" in reason
+
+
+def test_post_validation_usd_dinner_amount_bumps_to_dinner():
+    """$200 at 19:30 with the AI saying Snacks: USD>50 + dinner hour
+    → Dinner. ('Customer Entertainment' is not in the EDT taxonomy;
+    Dinner is the closest existing bucket per the user's instruction not
+    to invent vocab values.)"""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="19:30"),
+        local_amount=Decimal("200"),
+        local_currency="USD",
+    )
+    assert suggestion.report_bucket == "Dinner"
+    assert reason is not None
+    assert "amount_dinner_grade" in reason
+
+
+def test_post_validation_lunch_bucket_at_dinner_hour_bumps_to_dinner():
+    """AI suggests Lunch but the receipt prints 19:30 — structurally
+    counter-intuitive, bump to Dinner regardless of amount."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Lunch", receipt_time="19:30"),
+        local_amount=Decimal("800"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Dinner"
+    assert reason == "time_dinner_hour"
+
+
+def test_post_validation_null_amount_leaves_suggestion_unchanged():
+    """When the canonical receipt has no amount yet, the guard must not
+    crash and must not bump — fall back to the AI's raw suggestion."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="18:49"),
+        local_amount=None,
+        local_currency="TRY",
+    )
+    # Time alone with no amount won't bump (the time-only Snacks→Dinner
+    # rule requires amount-grade lunch/dinner).
+    assert suggestion.report_bucket == "Meals/Snacks"
+    assert reason is None
+
+
+def test_post_validation_null_time_with_dinner_amount_still_bumps_on_amount():
+    """Receipt has amount but no printed time. Amount alone is enough
+    to disqualify Snacks for a 7570 TRY receipt."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time=None),
+        local_amount=Decimal("7570"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Dinner"
+    assert reason == "amount_dinner_grade"
+
+
+def test_post_validation_both_null_returns_unchanged():
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time=None),
+        local_amount=None,
+        local_currency=None,
+    )
+    assert suggestion.report_bucket == "Meals/Snacks"
+    assert reason is None
+
+
+def test_post_validation_non_meal_bucket_never_touched():
+    """Hotel / Taxi / Fuel / Entertainment etc. are out of scope. The
+    guard is allowed to touch only the meal-bucket family — never bump
+    a non-meal bucket even if a meal-anchor signal happens to fire."""
+    for bucket in (
+        "Taxi/Parking/Tolls/Uber",
+        "Hotel/Lodging/Laundry",
+        "Auto Gasoline",
+        "Entertainment",
+        "Dinner",  # already Dinner — no double-bump
+        "Other",
+    ):
+        suggestion, reason = apply_bucket_post_validation(
+            _suggestion(bucket=bucket, receipt_time="20:00"),
+            local_amount=Decimal("9999"),
+            local_currency="TRY",
+        )
+        assert suggestion.report_bucket == bucket, (
+            f"Guard must not touch {bucket!r}"
+        )
+        assert reason is None
+
+
+def test_post_validation_breakfast_bucket_with_dinner_amount_bumps():
+    """Breakfast is the third bumpable bucket alongside Snacks. A
+    dinner-grade amount on a Breakfast bucket is structurally wrong."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Breakfast", receipt_time=None),
+        local_amount=Decimal("3500"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Dinner"
+    assert reason == "amount_dinner_grade"
+
+
+def test_post_validation_lunch_amount_at_dinner_hour_escalates_to_dinner():
+    """Snacks bucket + lunch-grade amount + dinner-hour time: the amount
+    alone would land Lunch, but the dinner-hour signal escalates it."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="20:30"),
+        local_amount=Decimal("1200"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Dinner"
+    assert reason is not None
+    # Both reasons combine: amount said Lunch, time pushed it to Dinner.
+    assert "amount_lunch_grade" in reason
+    assert "time_dinner_hour" in reason
+
+
+def test_post_validation_unknown_currency_returns_unchanged():
+    """JPY isn't in the calibrated band table; the guard returns the AI
+    suggestion untouched rather than guessing."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="20:00"),
+        local_amount=Decimal("50000"),  # ~$340 in JPY but we don't know
+        local_currency="JPY",
+    )
+    assert suggestion.report_bucket == "Meals/Snacks"
+    assert reason is None
+
+
+def test_post_validation_malformed_receipt_time_treated_as_missing():
+    """Garbage receipt_time strings must not crash; treat as missing
+    time and rely on amount-only signals."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="not a time"),
+        local_amount=Decimal("7570"),
+        local_currency="TRY",
+    )
+    # Amount alone still bumps to Dinner.
+    assert suggestion.report_bucket == "Dinner"
+    assert reason == "amount_dinner_grade"
+
+
+def test_post_validation_negative_amount_returns_unchanged():
+    """Defensive: a negative canonical amount (refund/data-quality
+    artifact) must not be classified by the band table."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="20:00"),
+        local_amount=Decimal("-100"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Meals/Snacks"
+    assert reason is None
+
+
+def test_post_validation_snacks_grade_amount_at_dinner_hour_stays_snacks():
+    """Negative-fire on the time-only rule: a snacks-grade amount (e.g.
+    a 200 TRY evening coffee) at dinner hour must stay Meals/Snacks.
+    The dinner-hour bump fires only when amount is at least lunch-grade
+    — otherwise an evening coffee run would be miscategorized."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="20:30"),
+        local_amount=Decimal("200"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Meals/Snacks"
+    assert reason is None
+
+
+def test_post_validation_snacks_grade_amount_in_lunch_hour_stays_snacks():
+    """Symmetric negative-fire: a snacks-grade amount in lunch hour
+    stays Snacks. Amount alone disqualifies a Lunch bucket bump."""
+    suggestion, reason = apply_bucket_post_validation(
+        _suggestion(bucket="Meals/Snacks", receipt_time="12:30"),
+        local_amount=Decimal("180"),
+        local_currency="TRY",
+    )
+    assert suggestion.report_bucket == "Meals/Snacks"
+    assert reason is None
+
+
+# ─── _parse_hhmm direct unit tests ──────────────────────────────────────────
+
+
+def test_parse_hhmm_accepts_compact_hhmm_form():
+    """Direct unit test for the compact ``HHMM`` regex branch — the
+    integration tests all pass ``HH:MM``, so this pins the second
+    pattern explicitly."""
+    from datetime import time as _time
+
+    from app.services.agent_receipt_reviewer import _parse_hhmm
+
+    assert _parse_hhmm("1849") == _time(18, 49)
+    assert _parse_hhmm("0930") == _time(9, 30)
+    assert _parse_hhmm("0000") == _time(0, 0)
+
+
+def test_parse_hhmm_accepts_seconds_form():
+    """``HH:MM:SS`` is tolerated; we only consume hour + minute."""
+    from datetime import time as _time
+
+    from app.services.agent_receipt_reviewer import _parse_hhmm
+
+    assert _parse_hhmm("18:49:23") == _time(18, 49)
+
+
+def test_parse_hhmm_rejects_invalid_clock_values():
+    """24:00 / 25:00 / 09:60 are not valid 24-hour clock times."""
+    from app.services.agent_receipt_reviewer import _parse_hhmm
+
+    assert _parse_hhmm("24:00") is None
+    assert _parse_hhmm("25:30") is None
+    assert _parse_hhmm("09:60") is None
+    assert _parse_hhmm("9999") is None
+
+
+def test_parse_hhmm_rejects_garbage():
+    from app.services.agent_receipt_reviewer import _parse_hhmm
+
+    assert _parse_hhmm("morning") is None
+    assert _parse_hhmm("18.49") is None
+    assert _parse_hhmm("") is None
+    assert _parse_hhmm(None) is None
+    assert _parse_hhmm("   ") is None
+    assert _parse_hhmm(1849) is None  # type: ignore[arg-type]
+
+
+# ─── prompt + vocabulary ────────────────────────────────────────────────────
+
+
+def test_inline_keyboard_vocabulary_includes_meal_time_buckets():
+    """sub-PR 7: the AI vocabulary now includes Lunch / Dinner /
+    Breakfast (existing EDT canonical buckets) so the AI can suggest
+    them directly without relying on the post-validation guard."""
+    vocab = inline_keyboard_bucket_vocabulary()
+    for required in ("Meals/Snacks", "Lunch", "Dinner", "Breakfast", "Entertainment"):
+        assert required in vocab, f"vocabulary missing canonical bucket {required!r}"
+
+
+def test_inline_keyboard_prompt_contains_price_and_time_anchors():
+    """The Layer 1 guidance must surface to the model — pin a few
+    representative anchor strings."""
+    canonical = _canonical_for_inline_keyboard()
+    context = _context_window()
+    prompt = build_inline_keyboard_review_prompt(canonical, context)
+    # Amount bands.
+    assert "TRY" in prompt and "Lunch" in prompt and "Dinner" in prompt
+    assert "500" in prompt and "2000" in prompt
+    assert "$15" in prompt and "$50" in prompt
+    # Time-of-day windows.
+    assert "11:30" in prompt
+    assert "18:00" in prompt
+    # receipt_time field is in the schema.
+    assert "receipt_time" in prompt
+
+
+def test_inline_keyboard_prompt_full_response_with_receipt_time_parses():
+    raw = json.dumps(
+        {
+            "business_or_personal": "Business",
+            "report_bucket": "Dinner",
+            "attendees": ["Hakan", "customer Ahmet"],
+            "customer": "Acme",
+            "business_reason": "Customer dinner",
+            "confidence_overall": 0.88,
+            "receipt_time": "20:15",
+        }
+    )
+    suggestion = parse_inline_keyboard_response(raw)
+    assert suggestion is not None
+    assert suggestion.report_bucket == "Dinner"
+    assert suggestion.receipt_time == "20:15"
+
+
+def test_inline_keyboard_prompt_response_without_receipt_time_still_parses():
+    """receipt_time is optional — older raw responses without it must
+    keep working."""
+    raw = json.dumps(
+        {
+            "business_or_personal": "Business",
+            "report_bucket": "Meals/Snacks",
+            "attendees": [],
+            "customer": None,
+            "business_reason": "Coffee",
+            "confidence_overall": 0.5,
+        }
+    )
+    suggestion = parse_inline_keyboard_response(raw)
+    assert suggestion is not None
+    assert suggestion.receipt_time is None

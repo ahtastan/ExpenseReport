@@ -1,7 +1,7 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import Column, Index, Numeric, Text, text
+from sqlalchemy import Column, ForeignKey, Index, Integer, Numeric, Text, text
 from sqlmodel import Field, SQLModel
 
 
@@ -64,11 +64,70 @@ class ReceiptDocument(SQLModel, table=True):
     # Allowed values for all four:
     # 'user' | 'telegram_user' | 'ai_advisory' | 'auto_confirmed_default' |
     # 'matching' | 'auto_suggester' | 'legacy_unknown'
+    # F-AI-Stage1 sub-PR 8 (fatura attachment phase 1):
+    # NULL on non-hotel receipts (not applicable). On hotel receipts:
+    #   'pending' = bot asked, user deferred or hasn't answered yet
+    #   'attached' = at least one ReceiptAttachment(kind='fatura') is on file
+    #   'not_available' = user explicitly said no fatura exists
+    fatura_status: str | None = Field(default=None, index=True)
     needs_clarification: bool = Field(default=True, index=True)
     # Attach a receipt to an expense report; NULL until M1 Day 4+ endpoint links it.
     expense_report_id: int | None = Field(
         default=None, foreign_key="expensereport.id", index=True
     )
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ReceiptAttachment(SQLModel, table=True):
+    """Supporting attachments (e.g. Türk-tax `fatura`) tied to a primary
+    ReceiptDocument.
+
+    F-AI-Stage1 sub-PR 8 phase 1 introduces this for the hotel-fatura
+    follow-up: when a hotel receipt is confirmed, the bot prompts for a
+    fatura, and uploaded photos / PDFs land here rather than as a new
+    primary receipt. Not used for non-hotel buckets in this phase.
+
+    FK cascade: ON DELETE CASCADE so deleting a primary ReceiptDocument
+    cleans up its attachments. SQLite enforces this only when
+    ``PRAGMA foreign_keys=ON`` (the production engine sets that on
+    connect); the column declares ``ondelete="CASCADE"`` so the same
+    behavior reaches PostgreSQL when the project migrates off SQLite.
+    """
+
+    __tablename__ = "receiptattachment"
+
+    id: int | None = Field(default=None, primary_key=True)
+    receipt_document_id: int = Field(
+        sa_column=Column(
+            "receipt_document_id",
+            Integer,
+            ForeignKey("receiptdocument.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    # `kind` is a small controlled vocabulary; current values are
+    # ``fatura`` (Türk tax invoice) and ``other`` (reserved). Not an enum
+    # at the DB layer for forward compatibility with future kinds.
+    kind: str = Field(index=True)
+
+    # `source` mirrors the F-AI-Stage1 source-tag vocabulary semantics —
+    # but for the attachment ingest path. Values:
+    # ``telegram_photo`` | ``telegram_document`` | ``telegram_user`` |
+    # ``web_upload``. Locked vocabulary; inventing a new value requires
+    # a doc + drift-detector update.
+    source: str = Field(index=True)
+
+    storage_path: str | None = None
+    content_type: str | None = None
+    mime_type: str | None = None
+    telegram_file_id: str | None = Field(default=None, index=True)
+    telegram_file_unique_id: str | None = Field(default=None, index=True)
+    # Reserved for a future light-OCR pass on the fatura. Phase 1 leaves
+    # this NULL.
+    ocr_json: str | None = Field(default=None, sa_column=Column(Text))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -208,6 +267,13 @@ class AgentReceiptUserResponse(SQLModel, table=True):
     #  collecting the missing business_reason) |
     # 'awaiting_attendees_only' (Edit > Attendees free-text prompt) |
     # 'awaiting_business_reason_only' (Edit > Reason free-text prompt)
+    # Sub-PR 8 phase 1 hotel-fatura post-Confirm sub-flow (additive):
+    # 'awaiting_fatura_choice' (3-button prompt sent, awaiting tap) |
+    # 'awaiting_fatura_upload' (user tapped 'Şimdi yükle' or Edit > Fatura;
+    #  next photo/PDF persists as ReceiptAttachment) |
+    # 'fatura_attached' (terminal — at least one fatura page on file) |
+    # 'fatura_deferred' (terminal — user said 'Sonra' or /cancel'd before uploading) |
+    # 'fatura_unavailable' (terminal — user said 'Yok')
 
     user_action_at: datetime | None = Field(default=None, index=True)
     free_text_reply: str | None = Field(default=None, sa_column=Column(Text))

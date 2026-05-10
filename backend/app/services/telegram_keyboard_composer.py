@@ -43,10 +43,13 @@ _BUSINESS_REASON_DISPLAY_LIMIT = 200
 
 # PR4: menu-navigation callback data.
 MENU_CALLBACK_DATA_PREFIX = "fai1m"
-MENU_SCOPES = ("edit", "rcpt", "cat1", "cat2", "type", "skip_ra")
-EDIT_MENU_CHOICES = ("receipt", "category", "attendees", "reason", "type", "back")
+MENU_SCOPES = ("edit", "rcpt", "cat1", "cat2", "type", "skip_ra", "fatura")
+EDIT_MENU_CHOICES = ("receipt", "category", "attendees", "reason", "fatura", "type", "back")
 RECEIPT_MENU_CHOICES = ("supplier", "date", "amount", "back")
 TYPE_MENU_CHOICES = ("personal", "back")
+# F-AI-Stage1 sub-PR 8 phase 1: post-Confirm hotel-only fatura follow-up.
+FATURA_MENU_CHOICES = ("now", "later", "none")
+HOTEL_BUCKET_FOR_FATURA = "Hotel/Lodging/Laundry"
 
 
 def build_inline_keyboard_reply(
@@ -144,9 +147,10 @@ def build_edit_menu_markup(
     user_response_id: int,
     *,
     include_type_button: bool,
+    include_fatura_button: bool = False,
 ) -> dict[str, Any]:
     """Top-level Edit menu: Receipt info / Category / Attendees / Reason /
-    Type (allowlist) / Back."""
+    Fatura (hotel only) / Type (allowlist) / Back."""
     row1: list[dict[str, str]] = [
         {
             "text": "📝 Receipt info",
@@ -167,21 +171,59 @@ def build_edit_menu_markup(
             "callback_data": build_menu_callback_data("edit", "reason", user_response_id),
         },
     ]
-    row3: list[dict[str, str]] = []
+    rows: list[list[dict[str, str]]] = [row1, row2]
+    if include_fatura_button:
+        rows.append(
+            [
+                {
+                    "text": "📎 Fatura",
+                    "callback_data": build_menu_callback_data(
+                        "edit", "fatura", user_response_id
+                    ),
+                }
+            ]
+        )
+    last_row: list[dict[str, str]] = []
     if include_type_button:
-        row3.append(
+        last_row.append(
             {
                 "text": "🔄 Type",
                 "callback_data": build_menu_callback_data("edit", "type", user_response_id),
             }
         )
-    row3.append(
+    last_row.append(
         {
             "text": "⬅ Back",
             "callback_data": build_menu_callback_data("edit", "back", user_response_id),
         }
     )
-    return {"inline_keyboard": [row1, row2, row3]}
+    rows.append(last_row)
+    return {"inline_keyboard": rows}
+
+
+def build_fatura_prompt_markup(user_response_id: int) -> dict[str, Any]:
+    """Three-button keyboard offered after a hotel receipt is Confirmed:
+    Şimdi yükle / Sonra / Yok."""
+    row = [
+        {
+            "text": "📎 Şimdi yükle",
+            "callback_data": build_menu_callback_data("fatura", "now", user_response_id),
+        },
+        {
+            "text": "⏰ Sonra",
+            "callback_data": build_menu_callback_data("fatura", "later", user_response_id),
+        },
+        {
+            "text": "❌ Yok",
+            "callback_data": build_menu_callback_data("fatura", "none", user_response_id),
+        },
+    ]
+    return {"inline_keyboard": [row]}
+
+
+FATURA_PROMPT_TEXT = (
+    "📄 Bu konaklama için fatura var mı? Carolyn detaylı tax invoice istiyor."
+)
 
 
 def build_receipt_menu_markup(user_response_id: int) -> dict[str, Any]:
